@@ -2,18 +2,23 @@ import errno
 import importlib.machinery
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
 from rsi import cli
-from rsi.check import CHECK_FILE, PROBE, _static_problems, gate, owner_fingerprints, program_fingerprints, run_check
+from rsi.check import (CHECK_FILE, PROBE, SHIPPED_SERVER, _command_layer, _Context, _edit_layer, _make_scratch,
+                       _remove_scratch, _Sockets, _static_problems, gate, owner_fingerprints, program_fingerprints,
+                       run_check)
 from rsi.codexrun import PROXY_VARIABLES, codex_version
-from rsi.compose import native_codex
+from rsi.compose import NETWORK_ON, SYSTEM_PATH, load_envelope, native_codex
 from rsi.labrun import run_task
 from rsi.meta import run_round
 from rsi.paths import Layout, Refused
@@ -26,6 +31,8 @@ WANTED = (('lab', 'read_records'), ('lab_net', 'local_tcp'), ('lab_net', 'local_
           ('meta', 'meta_agents_md_not_loaded'), ('lab', 'lab_agents_md_loaded'),
           ('trial_net', 'write_library'), ('meta', 'write_candidate'), ('lab', 'write_user_temp'),
           ('meta', 'zsh_heredoc'), ('lab', 'tool_server_wrapper'), ('lab_net', 'tool_server_wrapper'),
+          ('lab_net', 'literature_env'), ('lab_net', 'literature_library'), ('lab_net', 'literature_local_tcp'),
+          ('trial_net', 'literature_env'), ('trial_net', 'literature_library'), ('trial_net', 'literature_local_tcp'),
           ('lab', 'delete_existing_record'), ('meta', 'edit_dot_codex'), ('lab', 'edit_dot_codex'),
           ('lab', 'edit_dot_agents'), ('meta', 'edit_dot_agents'), ('lab', 'update_inside'), ('meta', 'delete_inside'),
           ('lab', 'read_control'), ('meta', 'read_control'), ('lab', 'read_meta'), ('trial_net', 'read_meta'),
@@ -34,7 +41,14 @@ WANTED = (('lab', 'read_records'), ('lab_net', 'local_tcp'), ('lab_net', 'local_
           ('lab', 'shell_write_inside'), ('lab', 'shell_write_records'), ('lab', 'shell_read_task_check'),
           ('lab', 'shell_read_owner'), ('lab', 'shell_allow_rule_outside'), ('lab', 'shell_rules_not_loaded'),
           ('meta', 'shell_write_inside'), ('meta', 'shell_write_work'), ('meta', 'shell_write_records'),
-          ('meta', 'shell_read_owner'), ('meta', 'shell_allow_rule_outside'), ('meta', 'shell_rules_not_loaded'))
+          ('meta', 'shell_read_owner'), ('meta', 'shell_allow_rule_outside'), ('meta', 'shell_rules_not_loaded'),
+          # without network: no proxy, no way out; the seed's networked tool server: its proxy, no local service
+          ('lab', 'proxy_variables'), ('lab', 'connect_out'), ('trial', 'proxy_variables'), ('trial', 'connect_out'),
+          ('meta', 'proxy_variables'), ('meta', 'connect_out'), ('lab', 'shell_proxy_variables'),
+          ('lab', 'shell_connect_out'), ('lab', 'shell_local_tcp'), ('meta', 'shell_proxy_variables'),
+          ('lab', 'tool_server_proxy'), ('lab', 'tool_server_local_tcp'), ('lab_net', 'literature_proxy_variables'),
+          ('lab_net', 'literature_read_task_check'), ('lab_net', 'literature_read_owner'),
+          ('trial_net', 'literature_read_task_check'), ('trial_net', 'literature_read_owner'))
 # Every create case tries mkdir, rename-to and a link, for each spelling (three letter cases; for .agents also .agentſ,
 # with a long s, which the file system takes for .agents), in every writable root of its profile: lab work/, library/,
 # env/; trial trial/; meta meta/, candidate/.
@@ -49,6 +63,20 @@ APPS_ON = 'approval_policy = "never"\n\n[features]\napps = true\nplugins = false
 
 def tree(folder: Path) -> set[str]:
     return {path.relative_to(folder).as_posix() for path in folder.rglob('*')}
+
+
+@contextmanager
+def check_context(root: Root):
+    """What run_check gives its layers, for one layer at a time: (context, scratch folder), removed afterwards."""
+    layout = root.layout
+    scratch, sockets = _make_scratch(layout), _Sockets()
+    try:
+        yield _Context(layout.root, native_codex(layout), shutil.which('python3', path=SYSTEM_PATH),
+                       load_envelope(layout.owner), f'RSI-CHECK-TOKEN-{secrets.token_hex(8)}', sockets,
+                       shutil.which('pdftotext', path=SYSTEM_PATH), [], []), scratch
+    finally:
+        sockets.remove()
+        _remove_scratch(layout, scratch)
 
 
 def scratch_left(root: Root) -> list[str]:
@@ -79,6 +107,8 @@ class Check(unittest.TestCase):
             names = {(r['profile'], r['name']) for r in report['results']}
             for wanted in WANTED:
                 self.assertIn(wanted, names)
+            self.assertFalse({('lab_net', 'proxy_variables'), ('trial_net', 'connect_out')} & names)
+            self.assertEqual(report['codex_program'], native_codex(root.layout))
             self.assertTrue(all(r['expected'] in ('allowed', 'blocked') for r in report['results']))
             for name, attempts in CREATE_ATTEMPTS.items():
                 for profile, count in attempts.items():
@@ -124,6 +154,22 @@ class Check(unittest.TestCase):
             self.assertIn(('lab', 'shell_read_owner', 'allowed'), observed)          # seen through `codex exec` too
             self.assertIsNotNone(gate(root.layout))
             self.assertEqual(scratch_left(root), [])
+
+    def test_the_network_cases_find_a_proxy_where_there_must_be_none_and_none_where_there_must_be_one(self):
+        """The cases of the configuration the seed ships cannot pass vacuously. Weakened: the Lab's commands get
+        network (and the `lab` profile a network table), and the seed's tool server loses its own."""
+        weakened = 'network = true\n' + SHIPPED_SERVER.replace('network = true', 'network = false')
+        with Root(passed_check=False) as root, check_context(root) as (context, scratch), \
+                mock.patch('rsi.check.SHIPPED_SERVER', weakened):
+            with mock.patch('rsi.compose.NETWORK_OFF', NETWORK_ON):
+                commands = {r['name']: r for r in _command_layer(context, scratch, 'lab')}
+            self.assertEqual(commands['proxy_variables']['observed'], 'allowed', commands['proxy_variables'])
+            self.assertFalse(commands['proxy_variables']['ok'])
+            edits = {r['name']: r for r in _edit_layer(context, scratch, 'lab')}
+            self.assertEqual(edits['shell_proxy_variables']['observed'], 'allowed', edits['shell_proxy_variables'])
+            self.assertEqual(edits['tool_server_proxy']['observed'], 'blocked', edits['tool_server_proxy'])
+            self.assertFalse(edits['shell_proxy_variables']['ok'] or edits['tool_server_proxy']['ok'])
+            self.assertEqual(edits['edit_inside']['observed'], 'allowed', edits['edit_inside'])    # the run worked
 
     def test_a_codex_inside_the_root_is_refused_before_any_case(self):
         with Root(passed_check=False) as root:
@@ -175,6 +221,29 @@ class Gate(unittest.TestCase):
             root.add_task('T1')
             with self.assertRaises(Refused): run_task(root.layout, 'T1')
             with self.assertRaises(Refused): run_round(root.layout, [])
+            self.assertEqual((root.records.calls(), root.model.requests), ([], []))
+
+    def test_gate_follows_the_codex_program(self):
+        with Root() as root:
+            root.add_task('T1')
+            path = root.layout.records / CHECK_FILE
+            text = path.read_text()
+            measured = json.loads(text)['codex_program']
+            self.assertEqual(measured, native_codex(root.layout))
+            self.assertIsNone(gate(root.layout))
+            for program in ('/elsewhere/bin/codex', None):          # another program, or a check that has none
+                data = json.loads(text); data['codex_program'] = program; path.write_text(json.dumps(data))
+                reason = gate(root.layout)
+                self.assertIn('Codex program', reason); self.assertIn('rsi check', reason)
+                with self.assertRaises(Refused): run_task(root.layout, 'T1')
+            path.write_text(text)
+            self.assertIsNone(gate(root.layout))
+            # A PATH that finds another install (here Homebrew's, when there is one): never the measured program.
+            if os.path.isfile('/opt/homebrew/bin/codex'):
+                os.environ.pop('RSI_CODEX', None)                   # Root restores the environment
+                os.environ['PATH'] = '/opt/homebrew/bin' + os.pathsep + os.environ['PATH']
+                if native_codex(root.layout) != measured:
+                    self.assertIn('rsi check', gate(root.layout))
             self.assertEqual((root.records.calls(), root.model.requests), ([], []))
 
     def test_no_check_a_failed_check_or_an_unreadable_one_stops_every_agent(self):
@@ -237,6 +306,13 @@ class Gate(unittest.TestCase):
             path.write_text(text)
             self.assertIsNone(gate(root.layout))
             self.assertEqual((root.records.calls(), root.model.requests), ([], []))
+
+
+class Shipped(unittest.TestCase):
+    def test_the_check_measures_the_tool_servers_the_seed_ships(self):
+        seed = Path(__file__).resolve().parents[1] / 'seed' / 'work' / 'codex' / 'settings.toml'
+        shipped = tomllib.loads(seed.read_text())['tool_servers']
+        self.assertEqual(tomllib.loads(SHIPPED_SERVER), {'tool_servers': shipped})
 
 
 class Static(unittest.TestCase):

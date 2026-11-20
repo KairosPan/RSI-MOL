@@ -9,7 +9,9 @@ from pathlib import Path
 from unittest import mock
 
 from rsi import init as init_module
+from rsi import literature_logs
 from rsi.codexrun import RECORD_FILES
+from rsi.compose import meta_config
 from rsi.init import init
 from rsi.labrun import run_task
 from rsi.limits import Limits, load_limits
@@ -26,6 +28,11 @@ SEED = Path(__file__).resolve().parents[1] / 'seed'
 TASKS = SEED.parents[1] / 'tasks'
 META_TEXT = SEED / 'owner' / 'meta' / 'AGENTS.md'
 WORK_FILES = ['AGENTS.md', 'codex/agents/literature.toml', 'codex/settings.toml', 'notes/README.md']
+LIT_FILES = ['tools/literature/' + name for name in
+             ('UPSTREAM.md', 'dispatch.py', 'runtime.py', 'server.py', 'transport.py')]
+UPSTREAM_MODULES = ('__init__', 'catalog', 'documents', 'parsers', 'poppler', 'projects', 'providers', 'remote',
+                    'sdk_tools', 'services', 'worker')
+LIT_FILES += ['tools/literature/rsi_literature/' + name + '.py' for name in UPSTREAM_MODULES]
 OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
 # What the English Lab seed calls the human owner and the Lab lead, and the files that name each (the instructions
 # and the role file speak of the lead; only the settings file speaks of the owner).
@@ -75,6 +82,8 @@ Rules:
 - State possible regressions and what you are unsure of. Do not claim a benefit.
 - You cannot read or change a task's check script, the budget limits, or the control program. Records are
   read-only.
+- `literature.jsonl` in a run record is the literature server's own call log. The Lab's commands can write to it,
+  so it is not proof that a call happened; compare it with the originals in `../library/` when it matters.
 - To give the Lab a new connector or plugin, to let it read or write files outside its workspace, or to raise a
   budget limit, write an application; the owner decides. Tool servers and command networking you may change
   directly in the settings.
@@ -125,7 +134,7 @@ class Seed(unittest.TestCase):
     def test_seed_workspace_has_no_problems(self):
         self.assertEqual(workspace_problems(SEED / 'work'), [])
         self.assertEqual(sorted(load_settings(SEED / 'work').roles), ['literature'])
-        self.assertEqual(files(SEED / 'work'), WORK_FILES)
+        self.assertEqual(files(SEED / 'work'), sorted(WORK_FILES + LIT_FILES))
 
     def test_grid_check(self):
         check, task = TASKS / 'grid' / 'check.py', load_task(TASKS, 'grid')
@@ -158,9 +167,10 @@ class Seed(unittest.TestCase):
         self.assertEqual(list(task.sections), list(SECTIONS)); self.assertTrue(all(task.sections.values()))
         self.assertEqual((task.check, task.inputs), (TASKS / 'grid' / 'check.py', None))
 
-    def test_the_settings_file_is_comments_only_and_its_examples_are_the_free_keys(self):
+    def test_the_settings_file_enables_literature_and_its_examples_are_the_free_keys(self):
         text = (SEED / 'work' / SETTINGS).read_text(encoding='utf-8')
-        self.assertEqual(tomllib.loads(text), {})
+        self.assertEqual(tomllib.loads(text), {'tool_servers': {'literature': {
+            'command': 'python3', 'args': ['-B', 'tools/literature/server.py'], 'network': True}}})
         self.assertEqual(load_settings(SEED / 'work').problems, [])
         examples = [match.group(1) for line in text.splitlines() if (match := EXAMPLE.fullmatch(line))]
         loose = [line for line in text.splitlines() if re.match(r'#\s*(\[|[a-z_]+\s*=)', line)
@@ -191,7 +201,13 @@ class Seed(unittest.TestCase):
         runs, candidate = meta_paths()
         self.assertIn(f'`{runs}`', observe_step(text)); self.assertIn(f'`{candidate}`', text)
         named = set(re.findall(r'`([\w.-]+\.(?:json|jsonl|txt|patch))`', text))
-        self.assertIn(CALL_FILE, named); self.assertLessEqual(named, {CALL_FILE, *RECORD_FILES, 'diff.patch'})
+        self.assertIn(CALL_FILE, named)
+        self.assertLessEqual(named, {CALL_FILE, *RECORD_FILES, 'diff.patch', literature_logs.LOG})
+        # The log's rule names the library as Meta reaches it from its working folder, which it may read.
+        library = os.path.relpath(Layout(Path('/RSI')).library, Layout(Path('/RSI')).meta) + '/'
+        self.assertIn(f'compare it with the originals in `{library}`', text)
+        self.assertEqual(meta_config(Layout(Path('/RSI')), {'features': {}}, {})['permissions']['meta']['filesystem']
+                         ['/RSI/library'], 'read')
 
     @needs_codex
     def test_what_meta_is_told_a_record_holds_is_in_a_lab_run_record(self):
@@ -245,8 +261,10 @@ class Seed(unittest.TestCase):
         self.assertIn('the owner decides', (SEED / 'work' / SETTINGS).read_text(encoding='utf-8'))
 
     def test_the_lab_seed_is_all_english(self):
-        """Every file of the Lab's seed workspace is plain ASCII: no Chinese, nor any other non-ASCII character."""
+        """MOL-authored seed files use ASCII. The pinned upstream reader contains Unicode for text normalization."""
         for name in files(SEED / 'work'):
+            if name.startswith('tools/literature/rsi_literature/'):
+                continue
             with self.subTest(name=name):
                 self.assertTrue((SEED / 'work' / name).read_bytes().isascii())
 
@@ -270,8 +288,9 @@ class Seed(unittest.TestCase):
         checkout = tmp / 'V0001'
         checkout.mkdir()
         store.checkout('V0001', checkout)
-        self.assertEqual(files(checkout), WORK_FILES); self.assertEqual(files(layout.work), WORK_FILES)
-        for name in WORK_FILES:
+        self.assertEqual(files(checkout), sorted(WORK_FILES + LIT_FILES))
+        self.assertEqual(files(layout.work), sorted(WORK_FILES + LIT_FILES))
+        for name in WORK_FILES + LIT_FILES:
             self.assertEqual((checkout / name).read_bytes(), (SEED / 'work' / name).read_bytes(), name)
         for name in OWNER_FILES:
             self.assertEqual((layout.owner / name).read_bytes(), (SEED / 'owner' / name).read_bytes(), name)

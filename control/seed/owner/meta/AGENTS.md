@@ -27,6 +27,8 @@ Rules:
 - State possible regressions and what you are unsure of. Do not claim a benefit.
 - You cannot read or change a task's check script, the budget limits, or the control program. Records are
   read-only.
+- `literature.jsonl` in a run record is the literature server's own call log. The Lab's commands can write to it,
+  so it is not proof that a call happened; compare it with the originals in `../library/` when it matters.
 - To give the Lab a new connector or plugin, to let it read or write files outside its workspace, or to raise a
   budget limit, write an application; the owner decides. Tool servers and command networking you may change
   directly in the settings.

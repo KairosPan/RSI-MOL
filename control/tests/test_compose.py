@@ -149,6 +149,9 @@ class ComposeTests(unittest.TestCase):
                                       'TMPDIR': str(self.layout.work / '.tmp'), 'PATH': WRAPPER_PATH})
         self.assertEqual(c['mcp_servers']['far'], {'url': 'https://e/mcp'})
         self.assertEqual(c['default_permissions'], 'lab')           # commands stay offline
+        # The server's proxy travels on its own wrapper; the Lab's own Codex keeps the feature off (as rsi check
+        # measures it) unless the Lab's commands have network.
+        self.assertNotIn('network_proxy', c['features'])
 
     def test_disable_and_roles(self):
         (self.layout.work / 'codex' / 'agents').mkdir(parents=True)
@@ -242,6 +245,31 @@ class ComposeTests(unittest.TestCase):
 
     def wrapper(self, text='[tool_servers.t]\ncommand = "c"\n'):
         return lab_config(self.layout, self.envelope, self.settings(text), trial=False, resolve=no_lookup)
+
+    def test_literature_reads_env_and_only_live_runs_write_the_library(self):
+        settings = self.settings('[tool_servers.literature]\ncommand = "python3"\nnetwork = true\n'
+                                 '[tool_servers.other]\ncommand = "python3"\nnetwork = true\n')
+        for trial in (False, True):
+            base = 'trial' if trial else 'lab'
+            profile = base + '_net'
+            config = lab_config(self.layout, self.envelope, settings, trial=trial, resolve=no_lookup)
+            self.assertEqual(config['default_permissions'], base)
+            for name in ('literature', 'other'):
+                args = config['mcp_servers'][name]['args']
+                self.assertEqual('SSL_CERT_FILE=/etc/ssl/cert.pem' in args[args.index('--') + 1:], name == 'literature')
+                wrapped = tomllib.loads(next(arg for arg in args if arg.startswith('permissions=')))['permissions']
+                self.assertEqual(args[args.index('-P') + 1], profile)
+                fs = wrapped[profile]['filesystem']
+                self.assertEqual(fs[str(self.layout.env)], 'read' if trial or name == 'literature' else 'write')
+                self.assertEqual(fs[str(self.layout.library)], 'read' if trial else 'write')
+                # Every other rule of every profile is the run's own.
+                for table in (wrapped, config['permissions']):
+                    for rules in table.values():
+                        rules['filesystem'].pop(str(self.layout.env))
+                self.assertEqual(wrapped, config['permissions'])
+                config = lab_config(self.layout, self.envelope, settings, trial=trial, resolve=no_lookup)
+            self.assertEqual(config['permissions'][profile]['filesystem'][str(self.layout.env)],
+                             'read' if trial else 'write')
 
     def test_the_wrapper_never_runs_from_the_agents_reach(self):
         planted = self.layout.env / 'bin'
