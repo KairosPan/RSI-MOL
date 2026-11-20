@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rsi.check import CHECK_FILE, owner_fingerprints
+from rsi.check import CHECK_FILE, owner_fingerprints, program_fingerprints
 from rsi.codexrun import codex_program, codex_version
 from rsi.mockmodel import ScriptedModel
 from rsi.paths import Layout
@@ -87,14 +87,15 @@ def _installed_codex(program: str) -> str | None:
 
 
 def write_passing_check(layout: Layout) -> None:
-    """records/check.json as a passed `rsi check` for the installed Codex and the owner files as they are now would
-    leave it (without its cases), so that the gate lets agents start; nothing when Codex reports no version."""
+    """records/check.json as a passed `rsi check` for the installed Codex, the owner files and the control program's
+    code as they are now would leave it (without its cases), so that the gate lets agents start; nothing when Codex
+    reports no version."""
     version = _installed_codex(codex_program())
     if version is not None:
         (layout.records / CHECK_FILE).write_text(json.dumps(
-            {'codex_version': version, 'owner_files': owner_fingerprints(layout), 'passed': True,
-             'at': '2026-01-01T00:00:00+00:00', 'results': [], 'problems': [], 'notes': [], 'info': []}),
-            encoding='utf-8')
+            {'codex_version': version, 'owner_files': owner_fingerprints(layout), 'program': program_fingerprints(),
+             'passed': True, 'at': '2026-01-01T00:00:00+00:00', 'results': [], 'problems': [], 'notes': [],
+             'info': []}), encoding='utf-8')
 
 
 class Root:

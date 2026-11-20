@@ -12,7 +12,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
-from rsi.check import CHECK_FILE, WORDS, run_check
+from rsi.check import CHECK_FILE, WORDS, check_state, run_check
 from rsi.init import init, locked, recover
 from rsi.labrun import run_task
 from rsi.limits import usage_by_class
@@ -30,7 +30,6 @@ APPLICATION_FILE = re.compile(r'A([0-9]{4,})\.json')
 CALL_KEYS = ('id', 'role', 'purpose', 'task', 'status', 'check')
 RELEASE_KEYS = ('version', 'kind', 'parent', 'target', 'round', 'author', 'time', 'evidence', 'benefit')
 APPLICATION_KEYS = ('id', 'round', 'call', 'what', 'why', 'records')
-CHECK_KEYS = ('codex_version', 'passed', 'at')
 YES_NO = {True: '是', False: '否'}
 STATUS_WORDS = {'started': '未结束', 'finished': '完成', 'failed': '失败', 'timed_out': '超时',
                 'interrupted': '中断', 'unreadable': '记录读不出来'}
@@ -292,16 +291,6 @@ def _pending(records: Path) -> list[dict]:
     return out
 
 
-def _check_state(records: Path) -> dict | None:
-    """The last `rsi check` as records/check.json tells it; None when there is none, not passed when unreadable."""
-    if not os.path.lexists(records / CHECK_FILE):
-        return None
-    data = _json_file(records / CHECK_FILE)
-    if not isinstance(data, dict):
-        data = {'passed': False}
-    return {key: data.get(key) for key in CHECK_KEYS}
-
-
 def _state(layout: Layout) -> tuple[dict, list[dict]]:
     """What `status --json` prints, and the newest five call records whole (for the text form)."""
     calls = Records(layout.records).calls() if layout.records.is_dir() else []
@@ -311,11 +300,12 @@ def _state(layout: Layout) -> tuple[dict, list[dict]]:
     return {'version': log[0]['version'] if log else None, 'versions': log[:5],
             'calls': [{key: call.get(key) for key in CALL_KEYS} for call in recent],
             'releases': _releases(layout.records, 3), 'applications': _pending(layout.records),
-            'usage': usage_by_class(calls), 'check': _check_state(layout.records)}, recent
+            'usage': usage_by_class(calls), 'check': check_state(layout)}, recent
 
 
 def status(layout: Layout) -> dict:
-    """What `status --json` prints. Reads records/ and the version store only; makes nothing."""
+    """What `status --json` prints. Reads records/ and the version store only, plus what the gate looks at (the owner
+    files, the program's code, `codex --version` in a throwaway home); makes nothing in the root."""
     return _state(layout)[0]
 
 
@@ -341,11 +331,13 @@ def _status(layout: Layout, as_json: bool) -> int:
         f'{safe(cls, ID_CHARS)} {totals["calls"]} 次，输入 {totals["input_tokens"]}、输出 {totals["output_tokens"]} token'
         + (f'（{totals["unknown_usage_calls"]} 次用量不明）' if totals['unknown_usage_calls'] else '')
         for cls, totals in state['usage'].items()))
-    check = state['check']
-    lines.append('隔离检查：' + ('还没有运行 rsi check' if check is None else
-                                f'Codex {safe(check.get("codex_version"), ID_CHARS)}，'
-                                f'{"通过" if check.get("passed") is True else "没通过"}'
-                                + (f'（{safe(check["at"], ID_CHARS)}）' if check.get('at') else '')))
+    check = state['check']                       # the gate's verdict, never check.json's word alone
+    if check is None:
+        lines.append('隔离检查：还没有运行 rsi check')
+    elif check['passed']:
+        lines.append(f'隔离检查：通过（Codex {safe(check["codex_version"], ID_CHARS)}，{safe(check["at"], ID_CHARS)}）')
+    else:
+        lines.append(f'隔离检查：没通过：{safe(check["reason"])}')
     _print(lines)
     return 0
 
