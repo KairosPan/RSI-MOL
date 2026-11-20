@@ -3,7 +3,8 @@
 Agents write work/ and trial/ by path, and a process an agent started may outlive its call, so the control program
 never reads, walks, changes or runs git on either folder in place. It builds the next workspace in staging/<label>/
 (no agent profile grants it), seals whatever sits at work/ (trial/) by renaming that entry inside the RSI root
-(rsi.workspace.seal), renames the staged folder in, and starts the call. After the call it seals the workspace again
+(rsi.workspace.seal), renames the staged folder in, and starts the call. A folder staged for work/ or trial/ first gets
+its skills/ copied to .agents/skills/, where Codex loads them (rsi.skills). After the call it seals the workspace again
 and does everything else on the sealed, static tree: collecting out/<id>/, the check, making it storable and the
 commit. A sealed tree is then removed; when something could not be versioned (or it cannot be removed) it is kept
 under sealed/<label>/ with a `sealed` note and a problem line of the call.
@@ -40,6 +41,7 @@ from rsi.paths import Layout, Refused, safe_id
 from rsi.records import Records
 from rsi.sessions import collect_sessions
 from rsi.settings import Settings, load_settings
+from rsi.skills import materialise
 from rsi.tasks import Task, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
 from rsi.versions import VersionStore
 from rsi.workspace import keep, open_folder, prepare_for_commit, remove, seal
@@ -48,6 +50,7 @@ MANUAL = 'manual or leftover'   # author of what is found in work/ before a run:
 PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
 PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
+LAB_WORKSPACES = ('work', 'trial')  # where a Lab Codex runs: moved in with the skills in .agents/skills/
 # What can go wrong with a sealed or staged folder, or with git on it (a time-out included).
 WORKSPACE_ERRORS = (OSError, subprocess.SubprocessError, RuntimeError, ValueError)
 
@@ -251,11 +254,17 @@ def _rename_in(staged: Path, root_fd: int, name: str) -> None:
 
 
 def _move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name: str, context: dict,
-             problems: list[str]) -> None:
+             problems: list[str], *, skill_lines: list[str] | None = None) -> None:
     """Seal whatever sits at <root>/<name> now, then rename the staged folder there. A found trial/ (an earlier
     trial's leftover) is removed; a found work/ is kept under sealed/, never versioned: it appeared after work/ was
-    sealed and committed. The staged folder is removed if this fails."""
+    sealed and committed. The staged folder is removed if this fails.
+
+    Before that, a folder staged for work/ or trial/ (where a Lab Codex runs; candidate/ is moved in elsewhere) gets
+    its skills/ copied to .agents/skills/ (rsi.skills.materialise); the lines of what was left out go to skill_lines,
+    or to problems when that is None."""
     try:
+        if name in LAB_WORKSPACES:
+            (problems if skill_lines is None else skill_lines).extend(materialise(staged))
         label = _stamp()
         entry = seal(root_fd, name, label)
         if entry is not None:
@@ -368,7 +377,7 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
         envelope = load_envelope(layout.owner)
         _own_interpreter(layout, task)
         codex = _codex_version()
-        notes = []
+        notes, skill_lines = [], []
         _take_work(layout, records, store, root_fd, calls, context, notes)
         try:
             with _refusing('版本库用不了'):
@@ -377,14 +386,14 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
                           'tree': store.tree_of(version_before)}
                 staged, settings = _stage(layout, store, version_before, task)
             with _refusing('准备好的工作区放不进 work/'):
-                _move_in(layout, records, root_fd, staged, 'work', context, notes)
+                _move_in(layout, records, root_fd, staged, 'work', context, notes, skill_lines=skill_lines)
         except Refused as refused:              # work/ is sealed by now: put main's head back for the owner
             raise Refused(f'{refused}{_restore_work(layout, records, store, root_fd, context)}') from None
         write_home_config(layout, envelope, settings, resolve=resolve)
         config, settings_problems = _compose(layout, envelope, settings, trial=False, resolve=resolve)
         fields = {**_common_fields(codex, settings, config, limits), 'purpose': 'task', 'cost_class': 'online',
                   'task': task.id, 'probe': None, 'round': None, 'workspace': 'work', **fields,
-                  'settings_problems': settings_problems}
+                  'settings_problems': settings_problems + skill_lines}
         run = _Run('work', task, task.id, prompt_for(task), config, limits.lab_seconds, fields, context, notes,
                    version_before)
     return _execute(layout, records, store, run)
@@ -419,14 +428,15 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
             head, work_settings = _stage(layout, store, store.head())      # for the owner's own Lab config:
             _discard(head)                                                  # read from main's head, not work/
             staged, settings = _stage(layout, store, commit_id, task)
-        notes = []
+        notes, skill_lines = [], []
         with _refusing('准备好的工作区放不进 trial/'):
-            _move_in(layout, records, root_fd, staged, 'trial', context, notes)
+            _move_in(layout, records, root_fd, staged, 'trial', context, notes, skill_lines=skill_lines)
         write_home_config(layout, envelope, work_settings, resolve=resolve)
         config, settings_problems = _compose(layout, envelope, settings, trial=True, resolve=resolve)
         fields = {**_common_fields(codex, settings, config, limits), 'purpose': 'trial', 'cost_class': 'meta',
                   'task': task_id, 'probe': probe, 'round': round_id, 'workspace': 'trial',
-                  'version_before': None, 'commit': commit_id, 'tree': tree, 'settings_problems': settings_problems}
+                  'version_before': None, 'commit': commit_id, 'tree': tree,
+                  'settings_problems': settings_problems + skill_lines}
         if task is not None:
             prompt, out_name = prompt_for(task), task.id
         else:
@@ -517,8 +527,9 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
         with _problem(problems, '没能写 diff.patch'):
             with open(call_dir / 'diff.patch', 'x', encoding='utf-8') as stream:
                 stream.write(diff)
-        with _problem(problems, 'work/ 没能换成最新版本'):
-            _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, problems)
+        with _problem(problems, 'work/ 没能换成最新版本'):        # its skill lines: the next run's settings problems
+            _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, problems,
+                     skill_lines=[])
 
 
 def _saver(store: VersionStore, run: _Run, call_id: str, end: dict):

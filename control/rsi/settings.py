@@ -345,8 +345,11 @@ def load_settings(workspace: Path) -> Settings:
 
 
 def workspace_problems(workspace: Path) -> list[str]:
-    """load_settings(workspace).problems, plus a line when the workspace holds a `.codex` entry."""
-    problems = load_settings(workspace).problems
+    """load_settings(workspace).problems, the lines of rsi.skills.scan (what of skills/ would not reach
+    .agents/skills/ when the workspace is staged for the Lab; nothing is copied here), plus a line when the workspace
+    holds a `.codex` entry."""
+    from rsi.skills import scan             # imported here: rsi.skills imports this module
+    problems = load_settings(workspace).problems + scan(workspace)[1]
     if os.path.lexists(workspace / '.codex'):
         problems.append('工作区里有 .codex')
     return problems

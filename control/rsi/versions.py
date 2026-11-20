@@ -48,7 +48,8 @@ def _any_case(name: str) -> str:
 
 
 class VersionStore:
-    EXCLUDED = ('.tmp/', 'out/', 'in/')       # never versioned, never removed by checkout
+    # Never versioned, never removed by checkout. .agents/ is built by the control program alone (rsi.skills).
+    EXCLUDED = ('.tmp/', 'out/', 'in/', '.agents/')
 
     def __init__(self, git_dir: Path) -> None:
         self.git_dir = Path(git_dir).resolve()

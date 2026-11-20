@@ -42,6 +42,26 @@ class Versions(unittest.TestCase):
         self.store.commit(self.a, 'init', 'one'); self.store.checkout('V0001', self.b)
         self.assertFalse((self.b / 'out').exists())
 
+    def test_agents_is_never_versioned_and_never_checked_out(self):
+        (self.a / 'f.txt').write_text('1')
+        without = self.store.tree_of_dir(self.a)
+        for name in ('.agents', '.Agents'):                        # any letter case, like .tmp
+            (self.a / name / 'skills' / 'x').mkdir(parents=True)
+            (self.a / name / 'skills' / 'x' / 'SKILL.md').write_text('s')
+            self.assertEqual(self.store.tree_of_dir(self.a), without, name)
+            shutil.rmtree(self.a / name)
+        (self.a / '.AGENTS').write_text('a file, not a folder')
+        self.assertEqual(self.store.tree_of_dir(self.a), without)
+        (self.a / '.AGENTS').unlink(); (self.a / '.agents' / 'skills').mkdir(parents=True)
+        (self.a / '.agents' / 'skills' / 'SKILL.md').write_text('s')
+        self.assertEqual(self.store.commit(self.a, 'init', 'one'), 'V0001')
+        self.assertEqual(self.store.tree_of('V0001'), without)
+        self.store.checkout('V0001', self.b)
+        self.assertEqual(os.listdir(self.b), ['f.txt'])
+        (self.a / 'sub' / '.agents').mkdir(parents=True); (self.a / 'sub' / '.agents' / 'k').write_text('k')
+        self.assertEqual(self.store.commit(self.a, 'x', 'two'), 'V0002')     # only the top-level entry is excluded
+        self.assertIn('b/sub/.agents/k', self.store.diff('V0001', 'V0002'))
+
     def test_snapshot_does_not_move_main(self):
         (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
         self.store.checkout('V0001', self.b)

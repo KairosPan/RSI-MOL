@@ -37,7 +37,7 @@ LINEAR_TRIES = 64               # name, name-2, ... tried in order, then RANDOM_
 RANDOM_TRIES = 16
 MAX_PASSES = 10_000             # passes of one removal; each takes MAX_DEPTH levels off the deepest folder
 SEALED = '.sealed-'             # <root>/.sealed-<name>-<label>: a sealed workspace
-EXCLUDED = tuple(entry.rstrip('/').lower() for entry in VersionStore.EXCLUDED)     # never versioned: .tmp, out, in
+EXCLUDED = tuple(entry.rstrip('/').lower() for entry in VersionStore.EXCLUDED)     # never versioned: .tmp, out, …
 KEPT = '.rsi-kept'
 LOCKS = stat.UF_IMMUTABLE | stat.UF_APPEND      # lock flags (uchg, uappnd): they stop renaming or removing an entry
 ACL_TYPE_EXTENDED = 0x00000100
@@ -429,8 +429,8 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
     not be moved out, or that could not be handled at all. When any entry is blocking, the tree must not be saved as
     a version: it may hold what the rules leave out. OSError if the tree itself is not a folder that can be opened.
 
-    The tree is walked without following links, at most MAX_DEPTH folders deep; its top-level .tmp, out and in
-    (never versioned) are not entered. Every entry is unlocked on the entry itself (lock flags cleared, a folder
+    The tree is walked without following links, at most MAX_DEPTH folders deep; its top-level .tmp, out, in and
+    .agents (never versioned) are not entered. Every entry is unlocked on the entry itself (lock flags cleared, a folder
     owner rwx, a regular file owner r, an ACL that refuses opening it cleared), except a file with other hard links.
     An entry git takes for `.git`, or a link git takes for `.gitmodules`, is renamed in place to `.git.rsi-kept`
     (`.gitmodules.rsi-kept`), -2, -3, ... when taken. Left out, i.e. renamed (never copied) to left_out/<n>-<name>

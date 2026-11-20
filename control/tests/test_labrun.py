@@ -510,5 +510,62 @@ class SealFirst(unittest.TestCase):
             self.assertFalse(os.path.lexists(root.layout.trial)); self.assertEqual(leftovers(root), [])
 
 
+def write_skill(workspace: Path, folder: str, name: str) -> None:
+    path = workspace / 'skills' / folder / 'SKILL.md'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'---\nname: {name}\ndescription: 演示用的技能 {name}\n---\n\n演示。\n', encoding='utf-8')
+
+
+def body(request: dict) -> str:
+    return json.dumps(request, ensure_ascii=False)
+
+
+@needs_codex
+class Skills(unittest.TestCase):
+    """Task 9b: the workspace's skills/ becomes .agents/skills/ wherever a Lab Codex runs, and is never versioned."""
+
+    def test_a_task_run_loads_the_versions_skills_and_the_lab_can_add_one(self):
+        with Root() as root:
+            root.add_task('T1'); write_skill(root.layout.work, 'demo', 'demo-skill-marker')
+            self.assertEqual(root.store.commit(root.layout.work, 'owner', 'a skill'), 'V0002')
+            new = '---\nname: new-skill-marker\ndescription: Lab 自己加的技能\n---\n\n新技能。\n'
+            root.model.push(add_file('skills/new/SKILL.md', new), say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertIn('demo-skill-marker', body(root.model.requests[0]))
+            self.assertNotIn('new-skill-marker', body(root.model.requests[0]))
+            self.assertEqual((call['status'], call['version_before'], call['version_after']),
+                             ('finished', 'V0002', 'V0003'))
+            diff = root.store.diff('V0002', 'V0003')
+            self.assertIn('b/skills/new/SKILL.md', diff); self.assertNotIn('.agents', diff)
+            self.assertEqual((call['settings_problems'], call['problems']), ([], []))
+            for folder in ('demo', 'new'):                                  # the re-staged work/
+                self.assertTrue((root.layout.work / '.agents' / 'skills' / folder / 'SKILL.md').is_file(), folder)
+            first = len(root.model.requests); root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertIn('new-skill-marker', body(root.model.requests[first]))
+            self.assertIn('demo-skill-marker', body(root.model.requests[first]))
+            self.assertEqual((call['version_before'], call['version_after'], root.store.head()),
+                             ('V0003', None, 'V0003'))                      # .agents never makes a version
+            self.assertEqual(leftovers(root), [])
+
+    def test_a_trial_loads_the_candidates_skills_not_heads(self):
+        with Root() as root:
+            write_skill(root.layout.work, 'demo', 'head-skill-marker')
+            self.assertEqual(root.store.commit(root.layout.work, 'owner', 'a skill'), 'V0002')
+            root.store.checkout('V0002', root.layout.candidate)
+            write_skill(root.layout.candidate, 'demo', 'candidate-skill-marker')
+            loose = root.layout.candidate / 'skills' / 'loose'                 # no SKILL.md: not a skill
+            loose.mkdir(); (loose / 'x.md').write_text('x')
+            commit = root.store.snapshot(root.layout.candidate, 'M0001', 't')
+            root.model.push(say('hi'))
+            call = run_trial(root.layout, commit=commit, round_id='M0001', probe='说一声你好')
+            self.assertEqual(call['status'], 'finished')
+            self.assertIn('candidate-skill-marker', body(root.model.requests[0]))
+            self.assertNotIn('head-skill-marker', body(root.model.requests[0]))
+            self.assertEqual([line.split('：')[0] for line in call['settings_problems']], ['skills/loose'])
+            self.assertEqual((call['tree_after'], call['problems']), (root.store.tree_of(commit), []))
+            self.assertFalse(os.path.lexists(root.layout.trial)); self.assertEqual(leftovers(root), [])
+
+
 if __name__ == '__main__':
     unittest.main()
