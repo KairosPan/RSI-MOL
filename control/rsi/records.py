@@ -2,11 +2,11 @@
 
 Only the control program writes here; the Meta agent reads it. Layout:
 
-    runs/R0001/            one folder per Codex call: call.json plus whatever the call left (prompt, events, ...)
-    rounds/M0001/          one folder per Meta round
-    applications/A0001/    one folder per application
-    <any>/<name>.json      written once by write_json
-    index.jsonl            one line per finished call, written file and note, oldest first
+    runs/R0001/              one folder per Codex call: call.json plus whatever the call left (prompt, events, ...)
+    rounds/M0001/            one folder per Meta round
+    applications/A0001.json  one file per application, created by write_json
+    <any>/<name>.json        written once by write_json
+    index.jsonl              one line per finished call, written file and note, oldest first
 
 No record file is ever overwritten. The one exception by design is a call's call.json, which is written exactly
 twice: by start_call (status `started`) and by finish_call (an end status, plus the sha256 of every file the call
@@ -82,18 +82,22 @@ class Records:
         self.root = root.resolve()
 
     def new_id(self, prefix: str) -> str:
-        """Reserve the next free id of a kind ('R' call, 'M' round, 'A' application) by creating its folder.
+        """The next free id of a kind: 'R' call, 'M' round, 'A' application.
 
-        The folder is created exclusively, so two processes never get the same id. A name of the kind with any
-        suffix (`A0001.json`) also counts as taken.
+        Any entry named for the kind, with or without a suffix (`A0001.json`), counts as taken. 'R' and 'M' reserve
+        the id by creating its folder exclusively, so two processes never get the same one. 'A' creates nothing: the
+        application is the single file applications/<id>.json, and write_json, which never overwrites, claims it.
         """
         if prefix not in KINDS:
             raise ValueError(f'不认识的记录编号前缀：{prefix!r}。只能是 R、M 或 A。')
         folder = self.root / KINDS[prefix]
-        folder.mkdir(exist_ok=True)
         pattern = re.compile(rf'{prefix}([0-9]{{4,}})(?:\..*)?')
-        taken = [int(match.group(1)) for name in os.listdir(folder) if (match := pattern.fullmatch(name))]
+        names = os.listdir(folder) if folder.is_dir() else []
+        taken = [int(match.group(1)) for name in names if (match := pattern.fullmatch(name))]
         number = max(taken, default=0) + 1
+        if prefix == 'A':
+            return f'{prefix}{number:04d}'
+        folder.mkdir(exist_ok=True)
         while True:
             name = f'{prefix}{number:04d}'
             try:

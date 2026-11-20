@@ -84,10 +84,6 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual(self.records.load_call(call)['files'], done['files'])
 
     def test_ids_are_reserved_and_calls_are_in_numeric_order(self):
-        applications = self.records.root / 'applications'
-        applications.mkdir(); (applications / 'A0001.json').write_text('{}')
-        self.assertEqual(self.records.new_id('A'), 'A0002')
-        self.assertTrue((applications / 'A0002').is_dir())
         for bad in ('X', 'V', '', 'RR'):
             with self.assertRaises(ValueError): self.records.new_id(bad)
         (self.records.root / 'runs' / 'R10000').mkdir(parents=True)
@@ -96,6 +92,17 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual(self.records.new_id('R'), 'R10001')         # reserved but not started: not a call yet
         self.assertEqual([c['id'] for c in self.records.calls()], ['R9999', 'R10000'])
         self.assertEqual({c['status'] for c in self.records.calls()}, {'started'})
+
+    def test_application_ids_are_claimed_by_their_file(self):
+        applications = self.records.root / 'applications'
+        self.assertEqual((self.records.new_id('A'), self.records.new_id('A')), ('A0001', 'A0001'))
+        self.assertFalse(applications.exists())                       # nothing is created for an application id
+        self.records.write_json('applications/A0001.json', {'request': 'x'})
+        self.assertEqual(self.records.new_id('A'), 'A0002')
+        with self.assertRaises(FileExistsError): self.records.write_json('applications/A0001.json', {'request': 'y'})
+        (applications / 'A0004').mkdir()                              # a leftover entry also counts as taken
+        self.assertEqual(self.records.new_id('A'), 'A0005')
+        self.assertEqual(sorted(path.name for path in applications.iterdir()), ['A0001.json', 'A0004'])
 
     def test_write_json_and_notes_are_indexed(self):
         path = self.records.write_json('rounds/M0001/decision-1.json', {'decision': 'no_change', '诊断': '无'})
