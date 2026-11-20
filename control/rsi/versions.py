@@ -55,7 +55,7 @@ class VersionStore:
         """Create the store if missing; idempotent. Its settings and info files are rewritten every time."""
         if not (self.git_dir / 'HEAD').is_file():
             self.git_dir.mkdir(parents=True, exist_ok=True)
-            self._git('init', '--quiet', '--bare', '--initial-branch=main', '--template=')
+            self._git('init', '--quiet', '--bare', '--initial-branch=main', '--object-format=sha1', '--template=')
         for key, value in STORE_CONFIG:
             self._git('config', key, value)
         (self.git_dir / 'info').mkdir(exist_ok=True)
@@ -118,14 +118,16 @@ class VersionStore:
     def checkout(self, name: str, folder: Path) -> None:
         """Make the folder exactly that content; the EXCLUDED entries are left alone.
 
-        Files are written from a fresh index (so nothing stale in the folder's index is trusted), then everything
-        else is removed, nested git repositories and files a .gitignore names included.
+        With an empty index everything else in the folder is untracked, so it is all removed first (nested git
+        repositories and files a .gitignore names included; links are removed, never followed), then the version is
+        written. Writing into an emptied folder gives every name the letter case of the version: on a
+        case-insensitive filesystem git would otherwise write into an existing folder whose name differs in case.
         """
         commit = self.resolve(name)
         folder = self._folder(folder)
         self._index(folder).unlink(missing_ok=True)
-        self._git('read-tree', '--reset', '-u', commit, folder=folder)
         self._git('clean', '-q', '-ffdx', *(f'--exclude={pattern}' for pattern in self._ignore), folder=folder)
+        self._git('read-tree', '--reset', '-u', commit, folder=folder)
 
     def diff(self, old: str, new: str, limit: int = 1_000_000) -> str:
         """`git diff` from one version or commit to another, cut after `limit` bytes of output (with a note)."""
@@ -173,23 +175,31 @@ class VersionStore:
                          stdin=message.encode(), author=author)
 
     def _stage(self, folder: Path) -> str:
-        """Bring the folder's index to the folder's content and return its tree id.
+        """Build the folder's index afresh from the folder's content and return its tree id.
 
-        --force makes a .gitignore in the folder ineffective; the excluded names are left out by pathspec instead.
+        A fresh index takes every name as it is on disk: on a case-insensitive filesystem git would otherwise keep
+        an old index entry through a case-only rename. --force makes a .gitignore in the folder ineffective; the
+        excluded names are left out by pathspec instead.
         """
         folder = self._folder(folder)
         self._refuse_git_entries(folder)
+        self._index(folder).unlink(missing_ok=True)
         self._git('add', '--all', '--force', '--', '.',
                   *(f':(top,exclude,icase){name}' for name in self._excluded), folder=folder)
         return self._out('write-tree', folder=folder)
 
     def _folder(self, folder: Path) -> Path:
-        """The folder, absolute and resolved; ValueError unless it is a real folder apart from the store."""
+        """The folder, absolute and resolved; ValueError unless it is a real folder apart from the store.
+
+        Overlap is judged by file identity, not by path text: a path may name the same folder in another letter case.
+        """
         folder = Path(folder)
         if folder.is_symlink() or not folder.is_dir():
             raise ValueError(f'不是文件夹（或是链接）：{folder}')
         real = folder.resolve()
-        if real == self.git_dir or real in self.git_dir.parents or self.git_dir in real.parents:
+        here, store = os.stat(real), os.stat(self.git_dir)
+        if any(os.path.samestat(here, os.stat(path)) for path in (self.git_dir, *self.git_dir.parents)) or \
+                any(os.path.samestat(os.stat(path), store) for path in real.parents):
             raise ValueError(f'文件夹和版本库互相包含：{folder}')
         return real
 

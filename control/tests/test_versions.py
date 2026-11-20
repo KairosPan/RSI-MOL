@@ -117,6 +117,49 @@ class Versions(unittest.TestCase):
                 self.store.commit(self.b, author, 'x')
         self.assertEqual(self.store.head(), 'V0001')
 
+    def test_a_case_only_rename_of_a_file_is_a_new_version(self):
+        (self.a / 'Model.py').write_text('1'); self.store.commit(self.a, 'init', 'one')
+        self.store.checkout('V0001', self.b)
+        (self.a / 'Model.py').rename(self.a / 'model.py')
+        self.assertEqual(self.store.commit(self.a, 'x', 'renamed'), 'V0002')
+        self.store.checkout('V0002', self.b)
+        self.assertEqual(os.listdir(self.b), ['model.py'])
+        self.assertEqual(self.store.tree_of_dir(self.b), self.store.tree_of('V0002'))
+
+    def test_a_case_only_rename_of_a_folder_is_a_new_version(self):
+        (self.a / 'Pkg').mkdir(); (self.a / 'Pkg' / 'm.py').write_text('m'); self.store.commit(self.a, 'init', 'one')
+        self.store.checkout('V0001', self.b)
+        (self.a / 'Pkg').rename(self.a / 'pkg')
+        self.assertEqual(self.store.commit(self.a, 'x', 'renamed'), 'V0002')
+        (self.a / 'pkg' / 'n.py').write_text('n'); self.assertEqual(self.store.commit(self.a, 'x', 'added'), 'V0003')
+        self.store.checkout('V0003', self.b)
+        self.assertEqual(sorted(str(p.relative_to(self.b)) for p in self.b.rglob('*')), ['pkg', 'pkg/m.py', 'pkg/n.py'])
+        self.assertEqual(self.store.tree_of_dir(self.b), self.store.tree_of('V0003'))
+
+    def test_a_case_variant_path_to_the_store_or_around_it_is_refused(self):
+        variant = self.tmp.parent / self.tmp.name.swapcase()
+        if not variant.exists():
+            self.skipTest('the filesystem is case-sensitive')
+        (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
+        for folder in (variant, variant / 'VERSIONS', variant / 'versions' / 'LAB.GIT',
+                       variant / 'Versions' / 'lab.git' / 'REFS'):
+            with self.assertRaises(ValueError):
+                self.store.checkout('V0001', folder)
+            with self.assertRaises(ValueError):
+                self.store.tree_of_dir(folder)
+        self.assertEqual(self.store.head(), 'V0001'); self.assertTrue((self.a / 'f.txt').is_file())
+
+    def test_checkout_over_a_folder_replaced_by_a_link_leaves_the_link_target_alone(self):
+        (self.a / 'd').mkdir(); (self.a / 'd' / 'f').write_text('1'); self.store.commit(self.a, 'init', 'one')
+        outside = self.tmp / 'outside'; outside.mkdir()
+        (outside / 'f').write_text('outside'); (outside / 'x').write_text('x')
+        self.store.checkout('V0001', self.b)
+        shutil.rmtree(self.b / 'd'); (self.b / 'd').symlink_to(outside)
+        self.store.checkout('V0001', self.b)
+        self.assertFalse((self.b / 'd').is_symlink()); self.assertEqual((self.b / 'd' / 'f').read_text(), '1')
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ['f', 'x'])
+        self.assertEqual((outside / 'f').read_text(), 'outside')
+
     def test_inherited_git_variables_and_the_owners_git_setup_are_ignored(self):
         home = self.tmp / 'home'; (home / 'hooks').mkdir(parents=True); (home / 'git').mkdir()
         hook = home / 'hooks' / 'reference-transaction'
