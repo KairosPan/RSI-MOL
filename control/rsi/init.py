@@ -1,0 +1,431 @@
+"""`rsi init` and `rsi recover`, and the lock that every command but `status` holds.
+
+init builds an RSI root, or completes one: it is safe to run again and never replaces what is there. It makes the
+folders, writes the owner's files that are missing (the envelope, imported once from the Lab home's config.toml, and
+the seed's limits and Meta files), creates the version store and, when the store has no version, makes V0001 from
+the seed in staging/ (author `init`). What already sat in work/ then is sealed, and on the sealed tree the seed files
+it lacks are added (nothing in it is replaced) before it is committed as `manual or leftover`, as before a task run;
+then main's head is staged and renamed in as work/. It creates env/ with `<python> -m venv` when env/ is missing,
+writes the Lab home's config.toml, and reports whether each Codex home is signed in.
+
+work/, meta/, library/ and env/ are agent-writable: init never reads, walks or runs git on them in place (the rule of
+rsi.labrun). It only looks at the entry itself in the root (lstat), creates a missing one, and seals work/ before
+handling what was in it. trial/ and candidate/ are made by the runs that use them.
+
+recover marks every call still `started` as `interrupted` (a call is never started again), stops the process group a
+call recorded when it is provably that call's, and moves what only an interrupted run leaves (entries of staging/
+and sealed entries in the root) under sealed/, never deleting or reading them.
+"""
+import fcntl
+import os
+import signal
+import shutil
+import subprocess
+import tomllib
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+
+from rsi.codexrun import codex_environment, codex_program
+from rsi.compose import ENVELOPE, TOOL_FOLDERS, load_envelope, write_home_config
+from rsi.labrun import (MANUAL, WORKSPACE_ERRORS, discard, move_in, now, refusing, restore_work, root_descriptor,
+                        settle, stage, stamp)
+from rsi.paths import Layout, Refused
+from rsi.records import STARTED, Records
+from rsi.settings import Settings
+from rsi.tomlout import render_file
+from rsi.versions import VersionStore
+from rsi.workspace import SEALED, keep, kind, open_folder, seal
+
+DEFAULT_PYTHON = '/opt/homebrew/bin/python3'
+BEFORE_RSI = 'config.toml.before-rsi'           # the Lab home's config.toml as it was before the first init
+IMPORTED = ('features', 'apps', 'plugins')      # tables of that file the envelope takes (and approval_policy)
+UNSAFE_IN_ROOT = '"[]*?\n\r'                    # Codex's own sandbox cannot confine a path with these
+OWNER_FOLDERS = ('owner', 'tasks', 'records', 'versions', 'staging', 'sealed', 'codex-home', 'codex-home-meta')
+AGENT_FOLDERS = ('meta', 'library')             # env/ is made by venv; work/ is renamed in; trial/, candidate/ later
+OWNER_SEED = (Path('limits.toml'), Path('meta', 'AGENTS.md'), Path('meta', 'settings.toml'))
+LOGIN_SECONDS = 60
+VENV_SECONDS = 600
+# A call's process group is signalled only when the process that leads it started within this many seconds of the
+# call's `started` time: a recorded pid may since have been reused by an unrelated process.
+SAME_PROCESS = (-2, 120)
+ENVELOPE_HEADER = ('# Lab 的对外范围。负责人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
+                   '# 取自当时的 codex-home/config.toml（原文件另存为 config.toml.before-rsi），[rsi] 是控制程序的设置。\n')
+
+
+@contextmanager
+def locked(layout: Layout):
+    """An exclusive flock on layout.lock, held until the block ends; Refused if another rsi holds it. The
+    descriptor is not inherited by the programs rsi starts, so a leftover process never keeps the lock."""
+    try:
+        fd = os.open(layout.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError as error:
+        raise Refused(f'锁文件 {layout.lock} 打不开（{error.strerror or error}）') from None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise Refused('另一个 rsi 正在运行，请等它结束再试') from None
+        yield
+    finally:
+        os.close(fd)
+
+
+# init
+
+def _report() -> dict:
+    return {'folders': [], 'files': [], 'envelope': None, 'first_version': None, 'version': None, 'work': None,
+            'env': None, 'signed_in': {}, 'problems': []}
+
+
+def _folders(layout: Layout, root_fd: int, report: dict) -> None:
+    """Create the missing folders of the root. One of the owner's that is a link or a file is refused; one an agent
+    writes that is not a folder is left as it is (the run that uses it seals it) and reported."""
+    for name in OWNER_FOLDERS + AGENT_FOLDERS:
+        found = kind(name, root_fd)
+        if found is None:
+            os.mkdir(name, 0o700 if name.startswith('codex-home') else 0o755, dir_fd=root_fd)
+            report['folders'].append(name)
+        elif found != 'folder' and name in OWNER_FOLDERS:
+            raise Refused(f'{layout.root / name} 不是文件夹（可能是符号链接）；控制程序不会跟着它走，请改成普通文件夹')
+        elif found != 'folder':
+            report['problems'].append(f'{name}/ 不是文件夹（可能是符号链接），没有动它')
+    meta = layout.owner / 'meta'
+    if meta.is_symlink() or (os.path.lexists(meta) and not meta.is_dir()):
+        raise Refused(f'{meta} 不是文件夹（可能是符号链接），请改成普通文件夹')
+    if not meta.exists():
+        meta.mkdir()
+        report['folders'].append('owner/meta')
+
+
+def _create(path: Path, data: bytes, mode: int = 0o644) -> None:
+    """A new file; FileExistsError if anything (a link too) has that name."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    with os.fdopen(fd, 'wb') as stream:
+        stream.write(data)
+
+
+def _envelope(layout: Layout, report: dict) -> None:
+    """owner/lab-envelope.toml when missing: approval_policy, features, apps and plugins of the Lab home's
+    config.toml (which is saved once, as config.toml.before-rsi), and [rsi] extra_read (the tool folders that
+    exist) and python. Nothing else of that file is taken: no projects, no tui, no model. No other file of a Codex
+    home is read."""
+    path = layout.owner / ENVELOPE
+    if os.path.lexists(path):
+        report['envelope'] = 'kept'
+        return
+    source, table = layout.lab_home / 'config.toml', {}
+    if os.path.lexists(source):
+        if source.is_symlink() or not source.is_file():
+            raise Refused(f'{source} 不是普通文件（可能是符号链接），没有导入；请改成普通文件，或自己先写好 {path}')
+        data = source.read_bytes()
+        try:
+            table = tomllib.loads(data.decode('utf-8'))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
+            raise Refused(f'{source} 不是合法的 TOML（{" ".join(str(error).split())}），没有导入；'
+                          f'请改好它，或自己先写好 {path}') from None
+        if not os.path.lexists(layout.lab_home / BEFORE_RSI):
+            _create(layout.lab_home / BEFORE_RSI, data, 0o600)
+    envelope = {'approval_policy': table.get('approval_policy', 'on-request')}
+    envelope.update({key: table[key] for key in IMPORTED if key in table})
+    envelope['rsi'] = {'extra_read': [folder for folder in TOOL_FOLDERS if os.path.exists(folder)],
+                       'python': DEFAULT_PYTHON}
+    try:
+        text = ENVELOPE_HEADER + render_file(envelope)
+    except (TypeError, ValueError) as error:
+        raise Refused(f'{source} 里有写不进 {ENVELOPE} 的值（{error}）；请自己先写好 {path}') from None
+    _create(path, text.encode('utf-8'))
+    report['envelope'] = 'imported' if table else 'default'
+    report['files'].append(f'owner/{ENVELOPE}')
+
+
+def _owner_seed(layout: Layout, seed: Path, report: dict) -> None:
+    """The owner's limits and Meta files from the seed, each only when missing."""
+    for relative in OWNER_SEED:
+        target = layout.owner / relative
+        if os.path.lexists(target):
+            continue
+        _create(target, (seed / 'owner' / relative).read_bytes())
+        report['files'].append(f'owner/{relative.as_posix()}')
+
+
+def _first_version(layout: Layout, store: VersionStore, seed: Path, report: dict) -> None:
+    """V0001 by `init`: the seed's work files, copied into staging/ and committed from there."""
+    layout.staging.mkdir(exist_ok=True)
+    folder = layout.staging / stamp()
+    try:
+        shutil.copytree(seed / 'work', folder, symlinks=True)
+        report['first_version'] = store.commit(folder, 'init', '初始版本（rsi init 用种子文件建立）')
+    finally:
+        discard(folder)
+
+
+def _add_seed_files(source: Path, tree: Path) -> list[str]:
+    """Copy each file of the seed's work/ into the sealed tree where nothing has its name; never replaces and never
+    follows a link (every folder is opened with O_NOFOLLOW relative to its parent). Lines for what was not added."""
+    lines = []
+    for path in sorted(source.rglob('*')):
+        if path.is_symlink() or not path.is_file():
+            continue
+        relative, fds = path.relative_to(source), []
+        try:
+            fds.append(open_folder(tree))
+            for part in relative.parts[:-1]:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=fds[-1])
+                except FileExistsError:
+                    pass
+                fds.append(open_folder(part, fds[-1]))
+            try:
+                fd = os.open(relative.parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644,
+                             dir_fd=fds[-1])
+            except FileExistsError:
+                continue                                    # what was there wins
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(path.read_bytes())
+        except OSError as error:
+            lines.append(f'种子文件 {relative.as_posix()} 没能补进 work/ 里原有的内容（{error.strerror or error}）')
+        finally:
+            for fd in reversed(fds):
+                os.close(fd)
+    return lines
+
+
+def _adopt_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, seed: Path, context: dict,
+                report: dict) -> None:
+    """What sat in work/ at the first init: sealed, then on the sealed tree the missing seed files are added and it
+    is committed as `manual or leftover` when it differs from V0001 (labrun's handling of a found work/). A link or
+    anything that cannot be versioned is kept under sealed/ with a note."""
+    label = stamp()
+    with refusing('work/ 封存不了，初始化没有完成（请检查 work/ 本身的标志和 ACL）'):
+        entry = seal(root_fd, 'work', label)
+    if entry is None:
+        return
+    problems = report['problems']
+
+    def save(tree: Path) -> None:
+        problems.extend(_add_seed_files(seed / 'work', tree))
+        store.commit(tree, MANUAL, '初始化时在 work/ 里发现的内容（人工放的，或以前的进程留下的），缺的种子文件已补上')
+
+    settle(layout, records, root_fd, entry, 'work', label, save, context, problems)
+
+
+def _work(layout: Layout, records: Records, store: VersionStore, root_fd: int, context: dict,
+          report: dict) -> Settings:
+    """main's head staged and renamed in as work/ when work/ is missing (an existing one is left alone: the next run
+    seals it); the settings of main's head either way, for the Lab home's config."""
+    with refusing('版本库用不了'):
+        staged, settings = stage(layout, store, store.head())
+    if kind('work', root_fd) is not None:
+        discard(staged)
+        report['work'] = 'kept'
+        return settings
+    with refusing('准备好的工作区放不进 work/'):
+        move_in(layout, records, root_fd, staged, 'work', context, report['problems'])
+    report['work'] = 'staged'
+    return settings
+
+
+def _inside(path: str, folder: Path) -> bool:
+    folder = os.path.realpath(folder)
+    return any(form == folder or form.startswith(folder + os.sep) for form in (os.path.abspath(path),
+                                                                              os.path.realpath(path)))
+
+
+def _env(layout: Layout, root_fd: int, envelope: dict, report: dict) -> None:
+    """env/ by `<python> -I -m venv` when the entry is missing; never read or walked otherwise."""
+    if kind('env', root_fd) is not None:
+        report['env'] = 'kept'
+        return
+    python, problems = envelope['rsi'].get('python', DEFAULT_PYTHON), report['problems']
+    report['env'] = 'skipped'
+    if not isinstance(python, str) or not os.path.isabs(python):
+        problems.append(f'owner/{ENVELOPE} 的 rsi.python 应是解释器的绝对路径，现在是 {python!r}；没有建 env/')
+        return
+    if _inside(python, layout.root):
+        problems.append(f'{python} 在 RSI 文件夹里，agent 改得到，不能用它建 env/')
+        return
+    if not (os.path.isfile(python) and os.access(python, os.X_OK)):
+        problems.append(f'没有找到 {python}，没有建 env/；装好它（或在 owner/{ENVELOPE} 的 rsi.python 写另一个解释器）'
+                        '以后再运行 rsi init')
+        return
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.startswith('PYTHON') and key != '__PYVENV_LAUNCHER__'}
+    try:
+        done = subprocess.run([python, '-I', '-m', 'venv', str(layout.env)], cwd='/', env=environment,
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=VENV_SECONDS)
+    except (OSError, subprocess.SubprocessError) as error:
+        problems.append(f'env/ 没能建好（{type(error).__name__}: {error}）；删掉 env/ 再运行 rsi init')
+        report['env'] = 'failed'
+        return
+    if done.returncode != 0:
+        detail = ' '.join(done.stderr.decode(errors='replace').split())[-300:]
+        problems.append(f'env/ 没能建好（{python} -m venv 退出码 {done.returncode}：{detail}）；删掉 env/ 再运行 rsi init')
+        report['env'] = 'failed'
+        return
+    report['env'] = 'created'
+
+
+def _kill_group(pid: int) -> None:
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def signed_in(home: Path) -> bool | None:
+    """Whether `codex login status`, run with CODEX_HOME=home, exits 0; None when it cannot be run or does not end.
+    Only the exit code is used: its output is discarded and no file of the home is read here."""
+    try:
+        process = subprocess.Popen([codex_program(), 'login', 'status'], stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                                   env=codex_environment(home, secrets=False))
+    except OSError:
+        return None
+    try:
+        code = process.wait(timeout=LOGIN_SECONDS)
+    except subprocess.TimeoutExpired:
+        code = None
+    finally:
+        _kill_group(process.pid)
+        process.wait()
+    return None if code is None else code == 0
+
+
+def init(layout: Layout, seed: Path) -> dict:
+    """Build or complete the RSI root at layout; what was made, and what was found, as a dict. Refused when the
+    root's path is one Codex's sandbox cannot confine, or something of the owner's is not what it must be."""
+    bad = sorted({char for char in str(layout.root) if char in UNSAFE_IN_ROOT})
+    if bad:
+        raise Refused(f'RSI 文件夹的路径 {str(layout.root)!r} 里有 {"".join(bad)!r}，Codex 的沙箱处理不了这样的路径；'
+                      '请换一个路径')
+    if layout.root.is_symlink() or not layout.root.is_dir():
+        raise Refused(f'{layout.root} 不是文件夹')
+    report, context = _report(), {'command': 'init'}
+    with root_descriptor(layout) as root_fd:
+        _folders(layout, root_fd, report)
+        _envelope(layout, report)
+        _owner_seed(layout, seed, report)
+        envelope = load_envelope(layout.owner)
+        records = Records(layout.records)
+        store = VersionStore(layout.versions)
+        with refusing('版本库建不起来'):
+            store.init()
+            first = store.head() is None
+            if first:
+                _first_version(layout, store, seed, report)
+        if first:
+            _adopt_work(layout, records, store, root_fd, seed, context, report)
+        settings = _work(layout, records, store, root_fd, context, report)
+        _env(layout, root_fd, envelope, report)
+        write_home_config(layout, envelope, settings)
+        report['version'] = store.head()
+    report['signed_in'] = {home.name: signed_in(home) for home in (layout.lab_home, layout.meta_home)}
+    return report
+
+
+# recover
+
+def _process_start(pid: int) -> datetime | None:
+    """When the process pid started (local time, to the second), from ps; None when that cannot be told."""
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=10, env={'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'}, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = ' '.join(done.stdout.split())
+    if done.returncode != 0 or not text:
+        return None
+    try:
+        return datetime.strptime(text, '%a %b %d %H:%M:%S %Y').astimezone()
+    except ValueError:
+        return None
+
+
+def _stop_group(call: dict) -> bool:
+    """SIGTERM the process group the call recorded (`pid`, which leads its own group), when that group is alive
+    and its leader started with the call; whether it was signalled. A pid that may have been reused is left alone."""
+    pid = call.get('pid')
+    if type(pid) is not int or pid <= 1 or pid in (os.getpid(), os.getpgrp()):
+        return False
+    try:
+        started = datetime.fromisoformat(call['started']).astimezone()
+        os.killpg(pid, 0)
+    except (KeyError, TypeError, ValueError, OSError):
+        return False
+    began = _process_start(pid)
+    if began is None or not SAME_PROCESS[0] <= (began - started).total_seconds() <= SAME_PROCESS[1]:
+        return False
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
+def _move_aside(layout: Layout, records: Records, dir_fd: int, name: str, path: Path, relative: Path, workspace: str,
+                label: str, lines: list[str]) -> None:
+    """Move one leftover entry to sealed/<label>/<relative> without reading it, with a `sealed` note."""
+    shown, where = f'{layout.sealed.name}/{label}/{relative.as_posix()}', path.relative_to(layout.root).as_posix()
+    reasons = ['中断的运行留下的；rsi recover 把它原样移到这里，没有读过，也没有存成版本']
+    try:
+        keep(dir_fd, name, str(path), layout.sealed / label / relative)
+    except OSError as error:
+        reasons.append(f'没能移走（{error.strerror or error}），还在 {where}')
+        records.note('sealed', {'workspace': workspace, 'path': where, 'reasons': reasons, 'command': 'recover'})
+        lines.append(f'{where} 没能移到 {layout.sealed.name}/（{error.strerror or error}），还在原处')
+        return
+    records.note('sealed', {'workspace': workspace, 'path': shown, 'reasons': reasons, 'command': 'recover'})
+    lines.append(f'{where} → {shown}')
+
+
+def _leftovers(layout: Layout, records: Records) -> list[str]:
+    """Move every entry of staging/ and every sealed entry of the root under sealed/recover-<stamp>/; then, if work/
+    is missing, stage main's head into it. One line for each thing done."""
+    lines, label = [], f'recover-{stamp()}'
+    with root_descriptor(layout) as root_fd:
+        if kind('staging', root_fd) == 'folder':
+            fd = open_folder('staging', root_fd)
+            try:
+                for name in sorted(os.listdir(fd)):
+                    _move_aside(layout, records, fd, name, layout.staging / name, Path('staging', name), 'staging',
+                                label, lines)
+            finally:
+                os.close(fd)
+        for name in sorted(os.listdir(root_fd)):
+            if name.startswith(SEALED):
+                workspace = name[len(SEALED):].split('-', 1)[0]
+                _move_aside(layout, records, root_fd, name, layout.root / name, Path(name[1:]), workspace, label,
+                            lines)
+        store = VersionStore(layout.versions)
+        if kind('work', root_fd) is None and (store.git_dir / 'HEAD').is_file():
+            try:
+                head = store.head()
+            except WORKSPACE_ERRORS as error:
+                lines.append(f'work/ 不在了，版本库也用不了（{type(error).__name__}: {error}）')
+                return lines
+            if head is not None:
+                failed = restore_work(layout, records, store, root_fd, {'command': 'recover'})
+                lines.append(f'work/ 不在了{failed}' if failed else f'work/ 不在了，已换成最新版本 {head}')
+    return lines
+
+
+def recover(layout: Layout, moved: list[str] | None = None) -> list[str]:
+    """Mark every `started` call `interrupted` (usage unknown) and return their ids; never starts a call. Also moves
+    what an interrupted run left under sealed/ (one line per thing done appended to moved, if given)."""
+    records = Records(layout.records)
+    changed = []
+    for call in records.calls():
+        if call.get('status') != STARTED:
+            continue
+        signalled = _stop_group(call)
+        try:
+            records.finish_call(call['id'], {'status': 'interrupted', 'ended': now(), 'usage': None})
+        except (KeyError, ValueError):
+            continue
+        records.note('recovered', {'call': call['id'], 'signalled': signalled})
+        changed.append(call['id'])
+    lines = _leftovers(layout, records)
+    if moved is not None:
+        moved.extend(lines)
+    return changed

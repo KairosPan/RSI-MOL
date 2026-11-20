@@ -501,8 +501,9 @@ def _saver(store: VersionStore, run: _Run, call_id: str, end: dict):
     return save
 
 
-# The same steps for the Meta round (rsi.meta), which refuses, stages, seals and renames in exactly as a Lab run
-# does. Thin wrappers that look the private helpers up when called, so a test that patches one reaches both.
+# The same steps for the Meta round (rsi.meta) and the commands (rsi.init), which refuse, stage, seal and rename in
+# exactly as a Lab run does. Thin wrappers that look the private helpers up when called, so a test that patches one
+# reaches both.
 
 def now() -> str:
     return _now()
@@ -560,6 +561,11 @@ def move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name: 
 def dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, reasons: list[str],
             context: dict, problems: list[str]) -> None:
     _dispose(layout, records, root_fd, entry, name, label, reasons, context, problems)
+
+
+def settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, save, context: dict,
+           problems: list[str]) -> None:
+    _settle(layout, records, root_fd, entry, name, label, save, context, problems)
 
 
 def take_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, calls: list[dict], context: dict,

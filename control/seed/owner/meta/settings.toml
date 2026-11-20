@@ -1,0 +1,3 @@
+# Meta Codex 的模型和推理强度（负责人的文件；不写就用 Codex 的默认值）。只能写这两个键，例如：
+# model = "<模型名>"
+# model_reasoning_effort = "high"
