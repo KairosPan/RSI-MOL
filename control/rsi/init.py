@@ -1,12 +1,14 @@
 """`rsi init` and `rsi recover`, and the lock that every command but `status` holds.
 
 init builds an RSI root, or completes one: it is safe to run again and never replaces what is there. It makes the
-folders, writes the owner's files that are missing (the envelope, imported once from the Lab home's config.toml, and
-the seed's limits and Meta files), creates the version store and, when the store has no version, makes V0001 from
-the seed in staging/ (author `init`). What already sat in work/ then is sealed, and on the sealed tree the seed files
-it lacks are added (nothing in it is replaced) before it is committed as `manual or leftover`, as before a task run;
-then main's head is staged and renamed in as work/. It creates env/ with `<python> -m venv` when env/ is missing,
-writes the Lab home's config.toml, and reports whether each Codex home is signed in.
+folders and, before anything can rewrite it, keeps the owner's own codex-home/config.toml as config.toml.before-rsi
+(once). It writes the owner's files that are missing (the envelope, imported from that kept copy, and the seed's
+limits and Meta files), creates the version store and, when the store has no version, seals what sits in work/,
+makes V0001 from the seed in staging/ (author `init`), and then adds to the sealed tree the seed files it lacks
+(nothing in it is replaced) before committing it as `manual or leftover`, as before a task run; then main's head is
+staged and renamed in as work/. It creates env/ with `<python> -m venv` when env/ is missing, writes the Lab home's
+config.toml (naming the top-level keys of the owner's original it does not carry over), and reports whether each
+Codex home is signed in.
 
 work/, meta/, library/ and env/ are agent-writable: init never reads, walks or runs git on them in place (the rule of
 rsi.labrun). It only looks at the entry itself in the root (lstat), creates a missing one, and seals work/ before
@@ -50,6 +52,7 @@ VENV_SECONDS = 600
 # A call's process group is signalled only when the process with the recorded pid started within this many seconds
 # of the recorded start time (process.json): the pid may since have been reused by an unrelated process.
 SAME_PROCESS_SECONDS = 2
+GENERATED = render_file({}).encode()          # the first line of every config.toml rsi writes
 ENVELOPE_HEADER = ('# Lab 的对外范围。负责人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
                    '# 取自当时的 codex-home/config.toml（原文件另存为 config.toml.before-rsi），[rsi] 是控制程序的设置。\n')
 
@@ -76,7 +79,7 @@ def locked(layout: Layout):
 
 def _report() -> dict:
     return {'folders': [], 'files': [], 'envelope': None, 'first_version': None, 'version': None, 'work': None,
-            'env': None, 'signed_in': {}, 'problems': []}
+            'env': None, 'signed_in': {}, 'original': None, 'problems': []}
 
 
 def _folders(layout: Layout, root_fd: int, report: dict) -> None:
@@ -106,27 +109,51 @@ def _create(path: Path, data: bytes, mode: int = 0o644) -> None:
         stream.write(data)
 
 
+def _keep_original(layout: Layout, report: dict) -> None:
+    """codex-home/config.toml copied to config.toml.before-rsi (mode 0600, created exclusively) when that copy is
+    missing, whether or not an envelope exists: init and every run rewrite config.toml, so the owner's own file is
+    kept before anything can. A config.toml rsi itself wrote is not the owner's and is not kept; a link is never
+    followed (rsi replaces the link itself, never the file it points to)."""
+    source, kept = layout.lab_home / 'config.toml', layout.lab_home / BEFORE_RSI
+    if os.path.lexists(kept) or not os.path.lexists(source):
+        return
+    if source.is_symlink() or not source.is_file():
+        report['problems'].append('codex-home/config.toml 不是普通文件（可能是符号链接），没有备份，也没有从它导入；'
+                                  '生成的配置只会替换这个链接本身，不会改它指向的文件')
+        return
+    data = source.read_bytes()
+    if data.startswith(GENERATED):
+        return
+    _create(kept, data, 0o600)
+    report['files'].append(f'codex-home/{BEFORE_RSI}')
+
+
+def _original(layout: Layout) -> tuple[dict | None, str | None]:
+    """The owner's original config (config.toml.before-rsi) as a table, and why it cannot be read; (None, None) when
+    there is none."""
+    kept = layout.lab_home / BEFORE_RSI
+    if not os.path.lexists(kept):
+        return None, None
+    if kept.is_symlink() or not kept.is_file():
+        return None, f'{kept} 不是普通文件（可能是符号链接）'
+    try:
+        return tomllib.loads(kept.read_bytes().decode('utf-8')), None
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
+        return None, f'{kept} 不是合法的 TOML（{" ".join(str(error).split())}）'
+
+
 def _envelope(layout: Layout, report: dict) -> None:
-    """owner/lab-envelope.toml when missing: approval_policy, features, apps and plugins of the Lab home's
-    config.toml (which is saved once, as config.toml.before-rsi), and [rsi] extra_read (the tool folders that
-    exist) and python. Nothing else of that file is taken: no projects, no tui, no model. No other file of a Codex
-    home is read."""
+    """owner/lab-envelope.toml when missing: approval_policy, features, apps and plugins of the owner's original
+    config (config.toml.before-rsi, never the config.toml rsi generates), and [rsi] extra_read (the tool folders
+    that exist) and python. Nothing else of that file is taken: no projects, no tui, no model."""
     path = layout.owner / ENVELOPE
     if os.path.lexists(path):
         report['envelope'] = 'kept'
         return
-    source, table = layout.lab_home / 'config.toml', {}
-    if os.path.lexists(source):
-        if source.is_symlink() or not source.is_file():
-            raise Refused(f'{source} 不是普通文件（可能是符号链接），没有导入；请改成普通文件，或自己先写好 {path}')
-        data = source.read_bytes()
-        try:
-            table = tomllib.loads(data.decode('utf-8'))
-        except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
-            raise Refused(f'{source} 不是合法的 TOML（{" ".join(str(error).split())}），没有导入；'
-                          f'请改好它，或自己先写好 {path}') from None
-        if not os.path.lexists(layout.lab_home / BEFORE_RSI):
-            _create(layout.lab_home / BEFORE_RSI, data, 0o600)
+    original, problem = _original(layout)
+    if problem is not None:
+        raise Refused(f'{problem}，没有导入；请改好它，或自己先写好 {path}')
+    source, table = layout.lab_home / BEFORE_RSI, original or {}
     envelope = {'approval_policy': table.get('approval_policy', 'on-request')}
     envelope.update({key: table[key] for key in IMPORTED if key in table})
     envelope['rsi'] = {'extra_read': [folder for folder in TOOL_FOLDERS if os.path.exists(folder)],
@@ -136,7 +163,7 @@ def _envelope(layout: Layout, report: dict) -> None:
     except (TypeError, ValueError) as error:
         raise Refused(f'{source} 里有写不进 {ENVELOPE} 的值（{error}）；请自己先写好 {path}') from None
     _create(path, text.encode('utf-8'))
-    report['envelope'] = 'imported' if table else 'default'
+    report['envelope'] = 'default' if original is None else 'imported'
     report['files'].append(f'owner/{ENVELOPE}')
 
 
@@ -192,14 +219,26 @@ def _add_seed_files(source: Path, tree: Path) -> list[str]:
     return lines
 
 
-def _adopt_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, seed: Path, context: dict,
-                report: dict) -> None:
-    """What sat in work/ at the first init: sealed, then on the sealed tree the missing seed files are added and it
-    is committed as `manual or leftover` when it differs from V0001 (labrun's handling of a found work/). A link or
-    anything that cannot be versioned is kept under sealed/ with a note."""
+def _first_versions(layout: Layout, records: Records, store: VersionStore, root_fd: int, seed: Path, context: dict,
+                    report: dict) -> None:
+    """The first init: what sits in work/ is sealed first (if that is refused, nothing has been committed and the
+    next init starts over), then V0001 is made from the seed (if that fails, the sealed entry is renamed back to
+    work/). Then the missing seed files are added on the sealed tree and it is committed as `manual or leftover` when
+    it differs from V0001 (labrun's handling of a found work/). A link or anything that cannot be versioned is kept
+    under sealed/ with a note."""
     label = stamp()
     with refusing('work/ 封存不了，初始化没有完成（请检查 work/ 本身的标志和 ACL）'):
         entry = seal(root_fd, 'work', label)
+    try:
+        with refusing('版本库存不了第一个版本'):
+            _first_version(layout, store, seed, report)
+    except BaseException:
+        if entry is not None:
+            try:
+                os.rename(entry, 'work', src_dir_fd=root_fd, dst_dir_fd=root_fd)
+            except OSError:
+                pass                                # it stays sealed in the root; rsi recover keeps it under sealed/
+        raise
     if entry is None:
         return
     problems = report['problems']
@@ -305,6 +344,7 @@ def init(layout: Layout, seed: Path) -> dict:
     report, context = _report(), {'command': 'init'}
     with root_descriptor(layout) as root_fd:
         _folders(layout, root_fd, report)
+        _keep_original(layout, report)
         _envelope(layout, report)
         _owner_seed(layout, seed, report)
         envelope = load_envelope(layout.owner)
@@ -313,14 +353,16 @@ def init(layout: Layout, seed: Path) -> dict:
         with refusing('版本库建不起来'):
             store.init()
             first = store.head() is None
-            if first:
-                _first_version(layout, store, seed, report)
         if first:
-            _adopt_work(layout, records, store, root_fd, seed, context, report)
+            _first_versions(layout, records, store, root_fd, seed, context, report)
         settings = _work(layout, records, store, root_fd, context, report)
         _env(layout, root_fd, envelope, report)
         write_home_config(layout, envelope, settings)
         report['version'] = store.head()
+        original, problem = _original(layout)
+        report['original'] = None if original is None and problem is None else {
+            'dropped': None if original is None else sorted(set(original) - {'approval_policy', *IMPORTED}),
+            'problem': problem}
     report['signed_in'] = {home.name: signed_in(home) for home in (layout.lab_home, layout.meta_home)}
     return report
 

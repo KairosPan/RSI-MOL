@@ -1,13 +1,15 @@
 """Command line of the control program: init, check, task, meta, status, rollback, recover.
 
 Every command but `status` holds the lock (rsi.init.locked), so two never run at once. Exit codes: 0 done, 2 usage,
-3 refused (a Refused, or a ValueError raised while the request is validated: an unknown task, a bad version name),
-1 any other failure. Text for the owner is Chinese and short; `status --json` is the machine-readable form.
+3 refused (a Refused, or a request that fails the checks made before anything runs: an unknown task, a bad or
+missing version), 1 any other failure, shown as one short line without a traceback. Text for the owner is Chinese
+and short, with everything from records shown through safe(); `status --json` is the machine-readable form.
 """
 import json
 import os
 import re
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 from rsi.init import init, locked, recover
@@ -15,8 +17,9 @@ from rsi.labrun import run_task
 from rsi.limits import usage_by_class
 from rsi.meta import RELEASE_FILE, rollback, run_round
 from rsi.paths import Layout, Refused, find_layout
-from rsi.records import ENDED, Records
-from rsi.versions import VersionStore
+from rsi.records import ENDED, UNREADABLE, Records
+from rsi.tasks import load_task
+from rsi.versions import VERSION, VersionStore
 from rsi.workspace import raise_open_files_limit
 
 SEED = Path(__file__).resolve().parents[1] / 'seed'
@@ -43,7 +46,7 @@ USAGE = """用法：rsi <子命令>
   init                 建目录和版本库，生成两份 Codex 配置，检查两个 Codex 目录是否已登录
   check                逐项测隔离要求，不调用模型
   task <编号>          跑一次任务，然后跑一轮 Meta；加 --no-meta 只跑任务
-  meta                 单独跑一轮 Meta，看还没有被任何一轮看过的任务运行
+  meta                 跑一轮 Meta，看还没有被任何一轮看过的任务运行（没有就不跑）
   status [--json]      当前版本、最近的运行和发布、待处理的申请、各类成本合计
   rollback <版本>      退回到某个版本
   recover              控制程序被打断后，把没有结束的调用标成“中断”，把中断留下的东西移到 sealed/"""
@@ -51,6 +54,19 @@ USAGE = """用法：rsi <子命令>
 
 class Usage(Exception):
     """A command line that is not one of USAGE's."""
+
+
+class Invalid(Exception):
+    """A request that failed the checks made before anything runs (exit 3)."""
+
+
+@contextmanager
+def _validating():
+    """Inside: a ValueError is a bad request (Invalid). Only the checks of a request run inside, never a call."""
+    try:
+        yield
+    except ValueError as error:
+        raise Invalid(str(error)) from None
 
 
 def _parse(args: list[str]) -> tuple[str, dict]:
@@ -92,7 +108,7 @@ def main(argv: list[str] | None = None) -> int:
             return _status(layout, options['json'])
         with locked(layout):
             return COMMANDS[command](layout, **options)
-    except (Refused, ValueError) as error:
+    except (Refused, Invalid) as error:
         _error(error)
         return 3
     except KeyboardInterrupt:
@@ -165,9 +181,16 @@ def _check_words(check) -> str:
     return word
 
 
+def _word(words: dict, value) -> str:
+    """The Chinese word for a status or outcome; the value itself (shown safely) when there is none."""
+    return (words.get(value) if isinstance(value, str) else None) or safe(value, ID_CHARS)
+
+
 def _call_head(call: dict) -> str:
     state = call.get('status')
-    text = f'{safe(call.get("id"), ID_CHARS)}（{_what(call)}）：{STATUS_WORDS.get(state) or safe(state, ID_CHARS)}'
+    if state == UNREADABLE:                     # calls()' stand-in for a call.json that cannot be read
+        return f'{safe(call.get("id"), ID_CHARS)}：记录读不出来（{safe(call.get("problem"))}）'
+    text = f'{safe(call.get("id"), ID_CHARS)}（{_what(call)}）：{_word(STATUS_WORDS, state)}'
     check = _check_words(call.get('check'))
     return f'{text}，{check}' if check else text
 
@@ -197,13 +220,14 @@ def _call_lines(layout: Layout, call: dict) -> list[str]:
 
 def _round_lines(layout: Layout, record: dict) -> list[str]:
     outcome = record.get('outcome')
-    head = f'Meta 轮 {safe(record.get("id"), ID_CHARS)}：{OUTCOME_WORDS.get(outcome) or safe(outcome, ID_CHARS)}'
+    head = f'Meta 轮 {safe(record.get("id"), ID_CHARS)}：{_word(OUTCOME_WORDS, outcome)}'
     if record.get('version_after'):
         head += f' {safe(record["version_after"], ID_CHARS)}'
     if record.get('reason'):
         head += f'（{safe(record["reason"])}）'
     lines = [head, f'  Meta 调用：{_ids(record.get("calls"))}']
-    trials = [trial.get('id') for trial in record.get('trials') or [] if isinstance(trial, dict)]
+    trials = record.get('trials') if isinstance(record.get('trials'), list) else []
+    trials = [trial.get('id') for trial in trials if isinstance(trial, dict)]
     if trials:
         lines.append(f'  试跑：{_ids(trials)}')
     if record.get('applications'):
@@ -265,20 +289,26 @@ def _pending(records: Path) -> list[dict]:
     return out
 
 
-def status(layout: Layout) -> dict:
-    """What `status --json` prints. Reads records/ and the version store only; makes nothing."""
+def _state(layout: Layout) -> tuple[dict, list[dict]]:
+    """What `status --json` prints, and the newest five call records whole (for the text form)."""
     calls = Records(layout.records).calls() if layout.records.is_dir() else []
+    recent = list(reversed(calls[-5:]))
     store = VersionStore(layout.versions)
     log = store.log() if (store.git_dir / 'HEAD').is_file() else []
     return {'version': log[0]['version'] if log else None, 'versions': log[:5],
-            'calls': [{key: call.get(key) for key in CALL_KEYS} for call in reversed(calls[-5:])],
+            'calls': [{key: call.get(key) for key in CALL_KEYS} for call in recent],
             'releases': _releases(layout.records, 3), 'applications': _pending(layout.records),
             'usage': usage_by_class(calls),
-            'check': None}                      # rsi check (a later task) fills this in
+            'check': None}, recent              # check: rsi check (a later task) fills it in
+
+
+def status(layout: Layout) -> dict:
+    """What `status --json` prints. Reads records/ and the version store only; makes nothing."""
+    return _state(layout)[0]
 
 
 def _status(layout: Layout, as_json: bool) -> int:
-    state = status(layout)
+    state, recent = _state(layout)
     if as_json:
         print(json.dumps(state, ensure_ascii=True, indent=2))       # every control character comes out escaped
         return 0
@@ -287,7 +317,7 @@ def _status(layout: Layout, as_json: bool) -> int:
         lines.append('最近的版本：' + '；'.join(f'{safe(entry["version"], ID_CHARS)}（{safe(entry["author"], ID_CHARS)}）'
                                           for entry in state['versions']))
     lines.append('最近的调用：' if state['calls'] else '最近的调用：无')
-    for call in state['calls']:
+    for call in recent:
         lines.append(f'  {_call_head(call)}；记录在 {_run_folder(layout, call.get("id"))}/')
     if state['releases']:
         lines.append('最近的发布和回退：' + '；'.join(
@@ -316,8 +346,8 @@ def _init(layout: Layout) -> int:
         lines.append(f'新建的文件夹：{"、".join(report["folders"])}')
     if report['files']:
         lines.append(f'新写的文件：{"、".join(report["files"])}')
-    envelope = {'imported': '从 codex-home/config.toml 导入（原文件另存为 config.toml.before-rsi）',
-                'default': '按默认值新写（codex-home/config.toml 不存在）', 'kept': '已有，没有改'}
+    envelope = {'imported': '从原来的 codex-home/config.toml 导入（原文件存在 codex-home/config.toml.before-rsi）',
+                'default': '按默认值新写（没有原来的 codex-home/config.toml）', 'kept': '已有，没有改'}
     lines.append(f'Lab 的对外范围 owner/lab-envelope.toml：{envelope[report["envelope"]]}')
     first = f'，其中 {report["first_version"]} 是这次用种子文件建的' if report['first_version'] else ''
     lines.append(f'当前版本：{report["version"]}{first}')
@@ -325,6 +355,12 @@ def _init(layout: Layout) -> int:
     lines.append('env/：' + {'created': '新建了 Python 环境', 'kept': '已有，没有动', 'skipped': '没有建（见问题）',
                             'failed': '没建好（见问题）'}[report['env']])
     lines.append('Codex 配置 codex-home/config.toml：已重新生成')
+    original = report['original']
+    if original is not None and original['problem'] is not None:
+        lines.append(f'  原来的配置没有带过来：{safe(original["problem"])}')
+    elif original is not None and original['dropped']:
+        lines.append(f'  原来的配置（codex-home/config.toml.before-rsi）里这些顶层键没有带进新的 config.toml：'
+                     f'{_ids(original["dropped"])}（approval_policy、features、apps、plugins 以 owner/lab-envelope.toml 为准）')
     for home, state in report['signed_in'].items():
         lines.append(f'{home}：{"已登录" if state else "没有登录" if state is False else "查不了登录状态"}'
                      + ('' if state else f'（登录：CODEX_HOME={layout.root / home} codex login）'))
@@ -339,6 +375,8 @@ def _check(layout: Layout) -> int:
 
 
 def _task(layout: Layout, task: str, meta: bool) -> int:
+    with _validating():
+        load_task(layout.tasks, task)           # an unknown task or a bad id: refused before anything runs
     call = run_task(layout, task)
     _print(_call_lines(layout, call))
     if meta:
@@ -357,11 +395,14 @@ def untriggered(records: Records) -> list[str]:
             triggered.update(item for item in data['trigger'] if isinstance(item, str))
     return [call['id'] for call in records.calls()
             if call.get('role') == 'lab' and call.get('purpose') == 'task' and call.get('status') in ENDED
-            and call['id'] not in triggered]
+            and isinstance(call.get('id'), str) and call['id'] not in triggered]
 
 
 def _meta(layout: Layout) -> int:
     trigger = untriggered(Records(layout.records))
+    if not trigger:
+        _print(['没有新的任务运行，没有启动 Meta。'])
+        return 0
     _print([f'这一轮看的任务运行：{_ids(trigger)}'])
     _print(_round_lines(layout, run_round(layout, trigger)))
     _print(_footer(layout))
@@ -369,7 +410,13 @@ def _meta(layout: Layout) -> int:
 
 
 def _rollback(layout: Layout, version: str) -> int:
-    new = rollback(layout, version, OWNER)
+    with _validating():
+        if not VERSION.fullmatch(version):
+            raise ValueError(f'不是版本名：{version}。版本名形如 V0001。')
+        VersionStore(layout.versions).resolve(version)          # a version the store lacks
+        # rollback's ValueErrors are all about the request (its documented contract), the last one being a
+        # version whose content is already the current one.
+        new = rollback(layout, version, OWNER)
     new, version = safe(new, ID_CHARS), safe(version, ID_CHARS)
     _print([f'已回退：新版本 {new} 的内容和 {version} 相同，work/ 已换成它。',
             f'记录：{_shown(layout, layout.records / "releases")}/{new}.json'])
