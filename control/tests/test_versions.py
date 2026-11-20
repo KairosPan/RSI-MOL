@@ -62,6 +62,23 @@ class Versions(unittest.TestCase):
         self.assertEqual(self.store.commit(self.a, 'x', 'two'), 'V0002')     # only the top-level entry is excluded
         self.assertIn('b/sub/.agents/k', self.store.diff('V0001', 'V0002'))
 
+    def test_a_name_the_file_system_takes_for_agents_is_never_versioned(self):
+        probe = self.tmp / 'probe'; (probe / '.agentſ').mkdir(parents=True)
+        if not os.path.lexists(probe / '.agents'):
+            self.skipTest("the file system here does not take '.agentſ' for '.agents', so there is no alias to test")
+        (self.a / 'f.txt').write_text('1')
+        without = self.store.tree_of_dir(self.a)
+        alias = self.a / '.agentſ'
+        (alias / 'sub' / '.git').mkdir(parents=True); (alias / 'x').write_text('x')    # .git: never even looked at
+        self.assertEqual(self.store.tree_of_dir(self.a), without)
+        self.assertEqual(self.store.commit(self.a, 'init', 'one'), 'V0001')
+        self.assertEqual(self.store.tree_of('V0001'), without)
+        self.assertEqual(self.store.tree_of(self.store.snapshot(self.a, 'M0001', 's')), without)
+        shutil.rmtree(alias); os.symlink(self.tmp, alias)                              # a link by that name
+        self.assertEqual(self.store.tree_of_dir(self.a), without)
+        self.store.checkout('V0001', self.b)
+        self.assertEqual(os.listdir(self.b), ['f.txt'])
+
     def test_snapshot_does_not_move_main(self):
         (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
         self.store.checkout('V0001', self.b)

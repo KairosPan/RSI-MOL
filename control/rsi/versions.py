@@ -47,6 +47,30 @@ def _any_case(name: str) -> str:
     return ''.join(f'[{c.lower()}{c.upper()}]' if c.isalpha() else c for c in name)
 
 
+def same_entries(fd: int, names) -> set[str]:
+    """The listed names of the entries of the open folder fd that the file system itself takes for one of `names`,
+    however they are spelled in the listing (APFS takes `.AGENTS`, and `.agentſ` with a long s, for `.agents`): each
+    name is looked up relative to fd, never following a link, and matched to the listing by device and inode. A hard
+    link of such an entry under another name matches too. OSError when the folder cannot be listed, or a lookup fails
+    for another reason than a missing entry."""
+    wanted = set()
+    for name in names:
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        wanted.add((info.st_dev, info.st_ino))
+    found = set()
+    for listed in os.listdir(fd) if wanted else ():
+        try:
+            info = os.stat(listed, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if (info.st_dev, info.st_ino) in wanted:
+            found.add(listed)
+    return found
+
+
 class VersionStore:
     # Never versioned, never removed by checkout. .agents/ is built by the control program alone (rsi.skills).
     EXCLUDED = ('.tmp/', 'out/', 'in/', '.agents/')
@@ -214,18 +238,32 @@ class VersionStore:
 
         A fresh index takes every name as it is on disk: on a case-insensitive filesystem git would otherwise keep
         an old index entry through a case-only rename. --force makes a .gitignore in the folder ineffective; the
-        excluded names are left out by pathspec instead.
+        excluded names are left out by pathspec instead: in any letter case, and by the exact listed name of every
+        top-level entry the file system takes for an excluded name (_aliases), which git's pattern would miss. The
+        pathspecs go to git on stdin, NUL-separated, so a listed name never reaches its command line.
         """
         folder = self._folder(folder)
-        self._refuse_git_entries(folder)
+        aliases = self._aliases(folder)
+        self._refuse_git_entries(folder, aliases)
         index = self._index(folder)
         index.unlink(missing_ok=True)
+        specs = ['.', *(f':(top,exclude,icase){name}' for name in self._excluded),
+                 *(f':(top,exclude,literal){name}' for name in sorted(aliases))]
         try:
-            self._git('add', '--all', '--force', '--', '.',
-                      *(f':(top,exclude,icase){name}' for name in self._excluded), folder=folder)
+            self._git('add', '--all', '--force', '--pathspec-from-file=-', '--pathspec-file-nul',
+                      stdin=b'\0'.join(map(os.fsencode, specs)), folder=folder)
             return self._out('write-tree', folder=folder)
         finally:
             index.unlink(missing_ok=True)
+
+    def _aliases(self, folder: Path) -> set[str]:
+        """The listed names of the folder's top-level entries that the file system takes for an excluded name
+        (same_entries), looked up relative to a descriptor of the folder."""
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            return same_entries(fd, self._excluded)
+        finally:
+            os.close(fd)
 
     def _folder(self, folder: Path) -> Path:
         """The folder, absolute and resolved; ValueError unless it is a real folder apart from the store.
@@ -242,12 +280,13 @@ class VersionStore:
             raise ValueError(f'文件夹和版本库互相包含：{folder}')
         return real
 
-    def _refuse_git_entries(self, folder: Path) -> None:
+    def _refuse_git_entries(self, folder: Path, aliases: set[str]) -> None:
         """ValueError if the folder holds a `.git` entry: git would skip it or keep a nested repository as a bare
-        reference, so the version would silently lack that content."""
+        reference, so the version would silently lack that content. The excluded top-level entries, aliases
+        included, are not looked into."""
         for top, dirs, files in os.walk(folder):
             if top == str(folder):
-                dirs[:] = [name for name in dirs if name.lower() not in self._excluded]
+                dirs[:] = [name for name in dirs if name.lower() not in self._excluded and name not in aliases]
             for name in dirs + files:
                 if name.lower() == '.git':
                     raise ValueError(f'文件夹里有 .git，不能存为版本：{Path(top, name)}')

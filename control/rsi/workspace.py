@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 from rsi.settings import show
-from rsi.versions import VersionStore
+from rsi.versions import VersionStore, same_entries
 
 MAX_DEPTH = 48                  # folder levels walked; a deeper folder is left out of the version (removal: moved up)
 MAX_PATH_BYTES = 700            # a folder whose relative path is longer is left out: git's paths stay < 1024 bytes
@@ -87,6 +87,28 @@ def close(*fds: int | None) -> None:
     for fd in fds:
         if fd is not None:
             os.close(fd)
+
+
+def has_entry(folder: Path, name: str) -> bool:
+    """Whether the folder holds an entry the file system itself takes for `name`, in whatever spelling (looked up
+    relative to a descriptor of the folder, never following a link; no listed name is compared). Also True when
+    that cannot be told: the folder exists but cannot be opened, or the lookup fails for another reason than a
+    missing entry. A caller refuses rather than miss a `.codex`."""
+    try:
+        fd = open_folder(folder)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return True
 
 
 def kind(name: str, dir_fd: int) -> str | None:
@@ -430,8 +452,10 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
     a version: it may hold what the rules leave out. OSError if the tree itself is not a folder that can be opened.
 
     The tree is walked without following links, at most MAX_DEPTH folders deep; its top-level .tmp, out, in and
-    .agents (never versioned) are not entered. Every entry is unlocked on the entry itself (lock flags cleared, a folder
-    owner rwx, a regular file owner r, an ACL that refuses opening it cleared), except a file with other hard links.
+    .agents (never versioned) are not entered, nor is any top-level entry the file system takes for one of them under
+    another spelling (rsi.versions.same_entries; the store leaves those out as well). Every entry is unlocked on the
+    entry itself (lock flags cleared, a folder owner rwx, a regular file owner r, an ACL that refuses opening it
+    cleared), except a file with other hard links.
     An entry git takes for `.git`, or a link git takes for `.gitmodules`, is renamed in place to `.git.rsi-kept`
     (`.gitmodules.rsi-kept`), -2, -3, ... when taken. Left out, i.e. renamed (never copied) to left_out/<n>-<name>
     (shown names left_out in the lines): a folder deeper than MAX_DEPTH or whose relative path is longer than
@@ -444,6 +468,7 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
     root = open_unlocked(tree, None, tree)
     stack = [[root, iter(()), '', 0, {}]]
     try:
+        aliases = same_entries(root, EXCLUDED)
         stack[0][1] = iter(sorted(os.listdir(root)))
         while stack:
             fd, pending, prefix, depth, counters = stack[-1]
@@ -451,7 +476,7 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
             if name is None:
                 os.close(stack.pop()[0])
                 continue
-            if depth == 0 and name.lower() in EXCLUDED:
+            if depth == 0 and (name.lower() in EXCLUDED or name in aliases):
                 continue
             try:
                 _visit(name, fd, prefix, depth, counters, tree, aside, lines, stack)

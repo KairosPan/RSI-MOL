@@ -529,7 +529,8 @@ class Skills(unittest.TestCase):
             root.add_task('T1'); write_skill(root.layout.work, 'demo', 'demo-skill-marker')
             self.assertEqual(root.store.commit(root.layout.work, 'owner', 'a skill'), 'V0002')
             new = '---\nname: new-skill-marker\ndescription: Lab 自己加的技能\n---\n\n新技能。\n'
-            root.model.push(add_file('skills/new/SKILL.md', new), say('ok'))
+            root.model.push(add_file('skills/new/SKILL.md', new), add_file('skills/loose/x.md', 'no SKILL.md'),
+                            say('ok'))
             call = run_task(root.layout, 'T1')
             self.assertIn('demo-skill-marker', body(root.model.requests[0]))
             self.assertNotIn('new-skill-marker', body(root.model.requests[0]))
@@ -537,8 +538,11 @@ class Skills(unittest.TestCase):
                              ('finished', 'V0002', 'V0003'))
             diff = root.store.diff('V0002', 'V0003')
             self.assertIn('b/skills/new/SKILL.md', diff); self.assertNotIn('.agents', diff)
-            self.assertEqual((call['settings_problems'], call['problems']), ([], []))
-            for folder in ('demo', 'new'):                                  # the re-staged work/
+            # The re-staged work/ holds V0003: the skill it drops is told at once, in this call's problems.
+            [line] = call['problems']
+            self.assertEqual((call['settings_problems'], line.startswith(labrun.RESTAGED)), ([], True))
+            self.assertTrue(line.removeprefix(labrun.RESTAGED).startswith('skills/loose：'), line)
+            for folder in ('demo', 'new'):
                 self.assertTrue((root.layout.work / '.agents' / 'skills' / folder / 'SKILL.md').is_file(), folder)
             first = len(root.model.requests); root.model.push(say('ok'))
             call = run_task(root.layout, 'T1')
@@ -546,7 +550,18 @@ class Skills(unittest.TestCase):
             self.assertIn('demo-skill-marker', body(root.model.requests[first]))
             self.assertEqual((call['version_before'], call['version_after'], root.store.head()),
                              ('V0003', None, 'V0003'))                      # .agents never makes a version
+            self.assertEqual([line.split('：')[0] for line in call['settings_problems']], ['skills/loose'])
             self.assertEqual(leftovers(root), [])
+
+    def test_an_agents_folder_that_cannot_be_cleared_is_a_noted_refusal(self):
+        with Root() as root:
+            root.add_task('T1')
+            with mock.patch('rsi.skills._clear', side_effect=PermissionError(1, 'Operation not permitted')):
+                with self.assertRaisesRegex(Refused, 'Operation not permitted'): run_task(root.layout, 'T1')
+            self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
+            [refusal] = index(root, 'refusal')
+            self.assertIn('Operation not permitted', refusal['reason'])
+            self.assertIn('现在没有可用的 work/', refusal['reason'])          # the restore met the same failure
 
     def test_a_trial_loads_the_candidates_skills_not_heads(self):
         with Root() as root:

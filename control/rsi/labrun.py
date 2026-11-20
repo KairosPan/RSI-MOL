@@ -44,9 +44,10 @@ from rsi.settings import Settings, load_settings
 from rsi.skills import materialise
 from rsi.tasks import Task, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
 from rsi.versions import VersionStore
-from rsi.workspace import keep, open_folder, prepare_for_commit, remove, seal
+from rsi.workspace import has_entry, keep, open_folder, prepare_for_commit, remove, seal
 
 MANUAL = 'manual or leftover'   # author of what is found in work/ before a run: the owner's or a leftover process's
+RESTAGED = '运行后放回 work/ 的最新版本里：'   # before a skill line of the work/ re-staged after a run
 PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
 PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
@@ -231,7 +232,7 @@ def _stage(layout: Layout, store: VersionStore, version: str, task: Task | None 
     folder.mkdir()
     try:
         store.checkout(version, folder)
-        if os.path.lexists(folder / '.codex'):
+        if has_entry(folder, '.codex'):
             raise Refused(f'版本 {version} 里有 .codex，不能用它启动 Lab Codex：请先在版本里去掉它。')
         (folder / '.tmp').mkdir()
         (folder / 'out').mkdir()
@@ -315,7 +316,7 @@ def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: st
             reasons.append(f'有 {moved} 处内容没有存进版本，已移到 {layout.sealed.name}/{label}/left-out/')
         if blocked:
             reasons.append(f'有 {blocked} 处应排除在版本之外的内容没能移出去，版本没有保存')
-        if os.path.lexists(tree / '.codex'):
+        if has_entry(tree, '.codex'):
             reasons.append('里面有 .codex，版本没有保存')
         elif not blocked:
             save(tree)
@@ -527,9 +528,11 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
         with _problem(problems, '没能写 diff.patch'):
             with open(call_dir / 'diff.patch', 'x', encoding='utf-8') as stream:
                 stream.write(diff)
-        with _problem(problems, 'work/ 没能换成最新版本'):        # its skill lines: the next run's settings problems
+        restaged = []                       # what of the new head's skills/ the owner's work/ lacks: told at once
+        with _problem(problems, 'work/ 没能换成最新版本'):
             _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, problems,
-                     skill_lines=[])
+                     skill_lines=restaged)
+        problems += [RESTAGED + line for line in restaged]
 
 
 def _saver(store: VersionStore, run: _Run, call_id: str, end: dict):
