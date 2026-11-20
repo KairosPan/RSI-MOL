@@ -46,6 +46,7 @@ from rsi.workspace import keep, open_folder, prepare_for_commit, remove, seal
 MANUAL = 'manual or leftover'   # author of what is found in work/ before a run: the owner's or a leftover process's
 PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
+PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
 # What can go wrong with a sealed or staged folder, or with git on it (a time-out included).
 WORKSPACE_ERRORS = (OSError, subprocess.SubprocessError, RuntimeError, ValueError)
 
@@ -76,6 +77,34 @@ def _now() -> str:
 def _stamp() -> str:
     """A label for a staged or sealed folder that is not named after a call."""
     return datetime.now().strftime('%Y%m%d-%H%M%S-') + secrets.token_hex(3)
+
+
+def process_start(pid: int) -> str | None:
+    """When the process pid started, as local ISO time to the second, from ps; None when that cannot be told."""
+    try:
+        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=10, env={'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'}, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = ' '.join(done.stdout.split())
+    if done.returncode != 0 or not text:
+        return None
+    try:
+        return datetime.strptime(text, '%a %b %d %H:%M:%S %Y').astimezone().isoformat(timespec='seconds')
+    except ValueError:
+        return None
+
+
+def process_recorder(records: Records, call_id: str):
+    """run_codex's on_start for a call: records runs/<call>/process.json, {pid, started} (the start time as
+    process_start tells it), created once like every record file, so `rsi recover` can tell that the process group
+    is still this call's. Never raises an Exception: run_codex would stop the call."""
+    def record(pid: int) -> None:
+        try:
+            records.write_json(f'runs/{call_id}/{PROCESS_FILE}', {'pid': pid, 'started': process_start(pid) or _now()})
+        except Exception:
+            pass
+    return record
 
 
 @contextmanager
@@ -425,7 +454,7 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
         call_dir = records.call_dir(call_id)
         records.start_call(call_id, {**run.fields, 'started': _now()})
         result = run_codex(home=layout.lab_home, cwd=layout.root / run.name, prompt=run.prompt, config=run.config,
-                           record_dir=call_dir, timeout=run.timeout)
+                           record_dir=call_dir, timeout=run.timeout, on_start=process_recorder(records, call_id))
     except BaseException:
         if call_id is not None:
             _end_interrupted(records, call_id)

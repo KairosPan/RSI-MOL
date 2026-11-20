@@ -12,11 +12,12 @@ work/, meta/, library/ and env/ are agent-writable: init never reads, walks or r
 rsi.labrun). It only looks at the entry itself in the root (lstat), creates a missing one, and seals work/ before
 handling what was in it. trial/ and candidate/ are made by the runs that use them.
 
-recover marks every call still `started` as `interrupted` (a call is never started again), stops the process group a
-call recorded when it is provably that call's, and moves what only an interrupted run leaves (entries of staging/
-and sealed entries in the root) under sealed/, never deleting or reading them.
+recover marks every call still `started` as `interrupted` (a call is never started again), stops the process group
+recorded in the call's process.json when it is provably that call's, and moves what only an interrupted run leaves
+(entries of staging/ and sealed entries in the root) under sealed/, never deleting or reading them.
 """
 import fcntl
+import json
 import os
 import signal
 import shutil
@@ -28,8 +29,8 @@ from pathlib import Path
 
 from rsi.codexrun import codex_environment, codex_program
 from rsi.compose import ENVELOPE, TOOL_FOLDERS, load_envelope, write_home_config
-from rsi.labrun import (MANUAL, WORKSPACE_ERRORS, discard, move_in, now, refusing, restore_work, root_descriptor,
-                        settle, stage, stamp)
+from rsi.labrun import (MANUAL, PROCESS_FILE, WORKSPACE_ERRORS, discard, move_in, now, process_start, refusing,
+                        restore_work, root_descriptor, settle, stage, stamp)
 from rsi.paths import Layout, Refused
 from rsi.records import STARTED, Records
 from rsi.settings import Settings
@@ -46,9 +47,9 @@ AGENT_FOLDERS = ('meta', 'library')             # env/ is made by venv; work/ is
 OWNER_SEED = (Path('limits.toml'), Path('meta', 'AGENTS.md'), Path('meta', 'settings.toml'))
 LOGIN_SECONDS = 60
 VENV_SECONDS = 600
-# A call's process group is signalled only when the process that leads it started within this many seconds of the
-# call's `started` time: a recorded pid may since have been reused by an unrelated process.
-SAME_PROCESS = (-2, 120)
+# A call's process group is signalled only when the process with the recorded pid started within this many seconds
+# of the recorded start time (process.json): the pid may since have been reused by an unrelated process.
+SAME_PROCESS_SECONDS = 2
 ENVELOPE_HEADER = ('# Lab 的对外范围。负责人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
                    '# 取自当时的 codex-home/config.toml（原文件另存为 config.toml.before-rsi），[rsi] 是控制程序的设置。\n')
 
@@ -326,35 +327,31 @@ def init(layout: Layout, seed: Path) -> dict:
 
 # recover
 
-def _process_start(pid: int) -> datetime | None:
-    """When the process pid started (local time, to the second), from ps; None when that cannot be told."""
+def _moment(text) -> datetime | None:
     try:
-        done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
-                              timeout=10, env={'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'}, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    text = ' '.join(done.stdout.split())
-    if done.returncode != 0 or not text:
-        return None
-    try:
-        return datetime.strptime(text, '%a %b %d %H:%M:%S %Y').astimezone()
-    except ValueError:
+        return datetime.fromisoformat(text).astimezone()
+    except (TypeError, ValueError):
         return None
 
 
-def _stop_group(call: dict) -> bool:
-    """SIGTERM the process group the call recorded (`pid`, which leads its own group), when that group is alive
-    and its leader started with the call; whether it was signalled. A pid that may have been reused is left alone."""
-    pid = call.get('pid')
-    if type(pid) is not int or pid <= 1 or pid in (os.getpid(), os.getpgrp()):
+def _stop_group(records: Records, call_id: str) -> bool:
+    """SIGTERM the process group of the call's Codex process, as runs/<call>/process.json records it (the pid leads
+    its own group), when that group is alive and the process with that pid started when the record says (to within
+    SAME_PROCESS_SECONDS); whether it was signalled. A pid that may have been reused is left alone."""
+    try:
+        data = json.loads((records.call_dir(call_id) / PROCESS_FILE).read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return False
+    pid = data.get('pid') if isinstance(data, dict) else None
+    started = _moment(data.get('started')) if isinstance(data, dict) else None
+    if type(pid) is not int or pid <= 1 or pid in (os.getpid(), os.getpgrp()) or started is None:
         return False
     try:
-        started = datetime.fromisoformat(call['started']).astimezone()
         os.killpg(pid, 0)
-    except (KeyError, TypeError, ValueError, OSError):
+    except OSError:
         return False
-    began = _process_start(pid)
-    if began is None or not SAME_PROCESS[0] <= (began - started).total_seconds() <= SAME_PROCESS[1]:
+    began = _moment(process_start(pid))
+    if began is None or abs((began - started).total_seconds()) > SAME_PROCESS_SECONDS:
         return False
     try:
         os.killpg(pid, signal.SIGTERM)
@@ -418,7 +415,7 @@ def recover(layout: Layout, moved: list[str] | None = None) -> list[str]:
     for call in records.calls():
         if call.get('status') != STARTED:
             continue
-        signalled = _stop_group(call)
+        signalled = _stop_group(records, call['id'])
         try:
             records.finish_call(call['id'], {'status': 'interrupted', 'ended': now(), 'usage': None})
         except (KeyError, ValueError):

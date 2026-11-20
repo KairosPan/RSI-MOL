@@ -31,6 +31,12 @@ STATUS_WORDS = {'started': '未结束', 'finished': '完成', 'failed': '失败'
 OUTCOME_WORDS = {'no_change': '不改', 'released': '发布了新版本', 'limit_reached': '到了上限',
                  'invalid_decision': '没有交回合规的决定'}
 SHOWN_PROBLEMS = 5
+SHOWN_CHARS = 300                               # characters of one value from records or an agent
+ID_CHARS = 80                                   # characters of an id, a version or a status
+ERROR_CHARS = 2000                              # characters of a refusal or error message
+# Shown escaped in text mode: C0 and C1 controls (ESC, CR, LF), DEL, bidirectional controls, line and paragraph
+# separators, lone surrogates.
+UNSAFE = re.compile('[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069\ud800-\udfff]')
 
 USAGE = """用法：rsi <子命令>
 
@@ -73,7 +79,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         command, options = _parse(args)
     except Usage as error:
-        print(f'{error}\n\n{USAGE}' if str(error) else USAGE, file=sys.stderr)
+        if str(error):
+            _error(error)
+        print(f'\n{USAGE}' if str(error) else USAGE, file=sys.stderr)
         return 2
     if command == 'help':
         print(USAGE)
@@ -85,17 +93,42 @@ def main(argv: list[str] | None = None) -> int:
         with locked(layout):
             return COMMANDS[command](layout, **options)
     except (Refused, ValueError) as error:
-        print(str(error), file=sys.stderr)
+        _error(error)
         return 3
     except KeyboardInterrupt:
-        print('被打断了。如果 rsi status 里还有“未结束”的调用，请运行 rsi recover。', file=sys.stderr)
+        _error('被打断了。如果 rsi status 里还有“未结束”的调用，请运行 rsi recover。')
         return 1
     except Exception as error:
-        print(f'出错了：{type(error).__name__}: {error}', file=sys.stderr)
+        _error(f'出错了：{type(error).__name__}: {error}')
         return 1
 
 
-# What the commands print.
+# What the commands print. Everything that comes from records or from an agent (ids, task names, check messages,
+# problem lines, application text, version authors, reasons) is shown through safe(), and every printed line passes
+# through it once more, so no control character reaches the owner's terminal.
+
+def safe(value, limit: int | None = SHOWN_CHARS) -> str:
+    """value as text that is safe to print on a terminal: every C0 and C1 control character (ESC, CR and newline
+    included), DEL, every bidirectional-control or line-separator character and every lone surrogate is shown
+    escaped (ESC as \\x1b, U+202E as \\u202e), and the text is cut to `limit` characters (None: not cut)."""
+    def escape(match: re.Match) -> str:
+        code = ord(match.group())
+        return f'\\x{code:02x}' if code < 0x100 else f'\\u{code:04x}'
+    text = UNSAFE.sub(escape, value if isinstance(value, str) else str(value))
+    return text if limit is None or len(text) <= limit else text[:limit - 1] + '…'
+
+
+def _print(lines: list[str], stream=None) -> None:
+    print('\n'.join(safe(line, None) for line in lines), file=stream or sys.stdout)
+
+
+def _error(text) -> None:
+    _print([safe(text, ERROR_CHARS)], sys.stderr)
+
+
+def _ids(items) -> str:
+    return '、'.join(safe(item, ID_CHARS) for item in items) if isinstance(items, list) and items else '无'
+
 
 def _shown(layout: Layout, path: Path) -> str:
     """A path inside the root as the owner types it there, e.g. records/runs/R0001."""
@@ -105,16 +138,21 @@ def _shown(layout: Layout, path: Path) -> str:
         return str(path)
 
 
+def _run_folder(layout: Layout, call_id) -> str:
+    return f'{_shown(layout, layout.records / "runs")}/{safe(call_id, ID_CHARS)}'
+
+
 def _what(call: dict) -> str:
     role, purpose = call.get('role'), call.get('purpose')
-    in_round = f'，轮 {call["round"]}' if call.get('round') else ''        # status's entries carry no round
+    in_round = f'，轮 {safe(call["round"], ID_CHARS)}' if call.get('round') else ''   # status's entries carry none
     if role == 'meta':
         return f'Meta{in_round}'
     if purpose == 'task':
-        return f'Lab 任务 {call.get("task")}'
+        return f'Lab 任务 {safe(call.get("task"), ID_CHARS)}'
     if purpose == 'trial':
-        return f'Lab 试跑（{"任务 " + str(call["task"]) if call.get("task") else "测试文字"}）{in_round}'
-    return f'{role} {purpose}'
+        task = call.get('task')
+        return f'Lab 试跑（{"任务 " + safe(task, ID_CHARS) if task else "测试文字"}）{in_round}'
+    return f'{safe(role, ID_CHARS)} {safe(purpose, ID_CHARS)}'
 
 
 def _check_words(check) -> str:
@@ -122,11 +160,14 @@ def _check_words(check) -> str:
         return ''
     word = '检查通过' if check.get('passed') is True else '检查没通过'
     message = check.get('message')
-    return f'{word}：{message}' if isinstance(message, str) and message and message not in ('通过', '没通过') else word
+    if isinstance(message, str) and message and message not in ('通过', '没通过'):
+        return f'{word}：{safe(message)}'
+    return word
 
 
 def _call_head(call: dict) -> str:
-    text = f'{call.get("id")}（{_what(call)}）：{STATUS_WORDS.get(call.get("status"), call.get("status"))}'
+    state = call.get('status')
+    text = f'{safe(call.get("id"), ID_CHARS)}（{_what(call)}）：{STATUS_WORDS.get(state) or safe(state, ID_CHARS)}'
     check = _check_words(call.get('check'))
     return f'{text}，{check}' if check else text
 
@@ -134,19 +175,19 @@ def _call_head(call: dict) -> str:
 def _problem_lines(problems, where: str) -> list[str]:
     if not isinstance(problems, list) or not problems:
         return []
-    lines = [f'  问题：{line}' for line in problems[:SHOWN_PROBLEMS]]
+    lines = [f'  问题：{safe(line)}' for line in problems[:SHOWN_PROBLEMS]]
     if len(problems) > SHOWN_PROBLEMS:
         lines.append(f'  另有 {len(problems) - SHOWN_PROBLEMS} 条问题，见 {where}')
     return lines
 
 
 def _call_lines(layout: Layout, call: dict) -> list[str]:
-    folder = _shown(layout, layout.records / 'runs' / call['id'])
+    folder = _run_folder(layout, call.get('id'))
     lines = [_call_head(call), f'  结果和记录：{folder}/（结果在 out/）']
     if call.get('purpose') == 'task':
-        before, after = call.get('version_before'), call.get('version_after')
+        before, after = safe(call.get('version_before'), ID_CHARS), call.get('version_after')
         if after:
-            lines.append(f'  版本：{before} → {after}')
+            lines.append(f'  版本：{before} → {safe(after, ID_CHARS)}')
         elif call.get('commit_failed'):
             lines.append(f'  版本：仍是 {before}；这次的改动没能存成版本（见问题）')
         else:
@@ -155,32 +196,33 @@ def _call_lines(layout: Layout, call: dict) -> list[str]:
 
 
 def _round_lines(layout: Layout, record: dict) -> list[str]:
-    head = f'Meta 轮 {record["id"]}：{OUTCOME_WORDS.get(record.get("outcome"), record.get("outcome"))}'
+    outcome = record.get('outcome')
+    head = f'Meta 轮 {safe(record.get("id"), ID_CHARS)}：{OUTCOME_WORDS.get(outcome) or safe(outcome, ID_CHARS)}'
     if record.get('version_after'):
-        head += f' {record["version_after"]}'
+        head += f' {safe(record["version_after"], ID_CHARS)}'
     if record.get('reason'):
-        head += f'（{record["reason"]}）'
-    lines = [head, f'  Meta 调用：{"、".join(record.get("calls") or []) or "无"}']
-    trials = [trial.get('id') for trial in record.get('trials') or []]
+        head += f'（{safe(record["reason"])}）'
+    lines = [head, f'  Meta 调用：{_ids(record.get("calls"))}']
+    trials = [trial.get('id') for trial in record.get('trials') or [] if isinstance(trial, dict)]
     if trials:
-        lines.append(f'  试跑：{"、".join(trials)}')
+        lines.append(f'  试跑：{_ids(trials)}')
     if record.get('applications'):
-        lines.append(f'  新的申请：{"、".join(record["applications"])}')
-    where = f'{_shown(layout, layout.records / "rounds" / record["id"])}/round.json'
+        lines.append(f'  新的申请：{_ids(record["applications"])}')
+    where = f'{_shown(layout, layout.records / "rounds")}/{safe(record.get("id"), ID_CHARS)}/round.json'
     lines.append(f'  记录：{where}')
     return lines + _problem_lines(record.get('problems'), where)
 
 
+def _applications(items: list[dict]) -> str:
+    return '；'.join(f'{safe(item.get("id"), ID_CHARS)} {safe(item.get("what"))}' for item in items) or '无'
+
+
 def _footer(layout: Layout) -> list[str]:
     state = status(layout)
-    lines = [f'当前版本：{state["version"]}']
+    lines = [f'当前版本：{safe(state["version"], ID_CHARS)}']
     if state['applications']:
-        lines.append('待处理的申请：' + '；'.join(f'{item["id"]} {item["what"]}' for item in state['applications']))
+        lines.append(f'待处理的申请：{_applications(state["applications"])}')
     return lines
-
-
-def _print(lines: list[str]) -> None:
-    print('\n'.join(lines))
 
 
 # status
@@ -238,27 +280,29 @@ def status(layout: Layout) -> dict:
 def _status(layout: Layout, as_json: bool) -> int:
     state = status(layout)
     if as_json:
-        print(json.dumps(state, ensure_ascii=False, indent=2))
+        print(json.dumps(state, ensure_ascii=True, indent=2))       # every control character comes out escaped
         return 0
-    lines = [f'当前版本：{state["version"] or "还没有（请先运行 rsi init）"}']
+    lines = [f'当前版本：{safe(state["version"], ID_CHARS) if state["version"] else "还没有（请先运行 rsi init）"}']
     if state['versions']:
-        lines.append('最近的版本：' + '；'.join(f'{entry["version"]}（{entry["author"]}）' for entry in state['versions']))
+        lines.append('最近的版本：' + '；'.join(f'{safe(entry["version"], ID_CHARS)}（{safe(entry["author"], ID_CHARS)}）'
+                                          for entry in state['versions']))
     lines.append('最近的调用：' if state['calls'] else '最近的调用：无')
     for call in state['calls']:
-        lines.append(f'  {_call_head(call)}；记录在 {_shown(layout, layout.records / "runs" / str(call["id"]))}/')
+        lines.append(f'  {_call_head(call)}；记录在 {_run_folder(layout, call.get("id"))}/')
     if state['releases']:
         lines.append('最近的发布和回退：' + '；'.join(
-            f'{item.get("version")}（{"回退到 " + str(item.get("target")) if item.get("kind") == "rollback" else "发布"}，'
-            f'{item.get("author")}）' for item in state['releases']))
-    lines.append('待处理的申请：' + ('；'.join(f'{item["id"]} {item["what"]}' for item in state['applications'])
-                                    or '无'))
+            f'{safe(item.get("version"), ID_CHARS)}（'
+            f'{"回退到 " + safe(item.get("target"), ID_CHARS) if item.get("kind") == "rollback" else "发布"}，'
+            f'{safe(item.get("author"), ID_CHARS)}）' for item in state['releases']))
+    lines.append(f'待处理的申请：{_applications(state["applications"])}')
     lines.append('用量：' + '；'.join(
-        f'{cls} {totals["calls"]} 次，输入 {totals["input_tokens"]}、输出 {totals["output_tokens"]} token'
+        f'{safe(cls, ID_CHARS)} {totals["calls"]} 次，输入 {totals["input_tokens"]}、输出 {totals["output_tokens"]} token'
         + (f'（{totals["unknown_usage_calls"]} 次用量不明）' if totals['unknown_usage_calls'] else '')
         for cls, totals in state['usage'].items()))
-    lines.append('隔离检查：' + ('还没有运行 rsi check' if state['check'] is None else
-                                f'Codex {state["check"]["codex_version"]}，'
-                                f'{"通过" if state["check"]["passed"] else "没通过"}'))
+    check = state['check']
+    lines.append('隔离检查：' + ('还没有运行 rsi check' if check is None else
+                                f'Codex {safe(check.get("codex_version"), ID_CHARS)}，'
+                                f'{"通过" if check.get("passed") is True else "没通过"}'))
     _print(lines)
     return 0
 
@@ -284,13 +328,13 @@ def _init(layout: Layout) -> int:
     for home, state in report['signed_in'].items():
         lines.append(f'{home}：{"已登录" if state else "没有登录" if state is False else "查不了登录状态"}'
                      + ('' if state else f'（登录：CODEX_HOME={layout.root / home} codex login）'))
-    lines += [f'问题：{line}' for line in report['problems']]
+    lines += [f'问题：{safe(line)}' for line in report['problems']]
     _print(lines)
     return 0
 
 
 def _check(layout: Layout) -> int:
-    print('rsi check 还没有实现（计划的第 9 步）。', file=sys.stderr)
+    _error('rsi check 还没有实现（计划的第 9 步）。')
     return 1
 
 
@@ -318,7 +362,7 @@ def untriggered(records: Records) -> list[str]:
 
 def _meta(layout: Layout) -> int:
     trigger = untriggered(Records(layout.records))
-    _print([f'这一轮看的任务运行：{"、".join(trigger) or "无"}'])
+    _print([f'这一轮看的任务运行：{_ids(trigger)}'])
     _print(_round_lines(layout, run_round(layout, trigger)))
     _print(_footer(layout))
     return 0
@@ -326,16 +370,17 @@ def _meta(layout: Layout) -> int:
 
 def _rollback(layout: Layout, version: str) -> int:
     new = rollback(layout, version, OWNER)
+    new, version = safe(new, ID_CHARS), safe(version, ID_CHARS)
     _print([f'已回退：新版本 {new} 的内容和 {version} 相同，work/ 已换成它。',
-            f'记录：{_shown(layout, layout.records / "releases" / f"{new}.json")}'])
+            f'记录：{_shown(layout, layout.records / "releases")}/{new}.json'])
     return 0
 
 
 def _recover(layout: Layout) -> int:
     moved = []
     ids = recover(layout, moved)
-    lines = [f'标成“中断”的调用：{"、".join(ids)}' if ids else '没有未结束的调用。']
-    lines += [f'  {line}' for line in moved]
+    lines = [f'标成“中断”的调用：{_ids(ids)}' if ids else '没有未结束的调用。']
+    lines += [f'  {safe(line)}' for line in moved]
     _print(lines)
     return 0
 

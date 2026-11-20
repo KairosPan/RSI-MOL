@@ -34,8 +34,8 @@ from rsi.codexrun import run_codex
 from rsi.compose import load_envelope, meta_config, tool_server_problems, write_home_config
 from rsi.decision import SCHEMA, Decision, parse_decision
 from rsi.labrun import (WORKSPACE_ERRORS, admit, discard, dispose, end_interrupted, move_in, noting_refusals, now,
-                        open_store, problem, refusing, rename_in, restore_work, root_descriptor, run_trial, stage,
-                        stamp, take_work, usable_codex_version)
+                        open_store, problem, process_recorder, refusing, rename_in, restore_work, root_descriptor,
+                        run_trial, stage, stamp, take_work, usable_codex_version)
 from rsi.limits import Limits
 from rsi.paths import Layout, Refused
 from rsi.records import CALL_ID, Records
@@ -459,7 +459,7 @@ class _Round:
         try:
             result = run_codex(home=self.layout.meta_home, cwd=self.layout.meta, prompt=prompt, config=self.config,
                                record_dir=call_dir, timeout=self.limits.meta_seconds, resume=self.thread,
-                               schema=schema)
+                               schema=schema, on_start=process_recorder(records, call_id))
         except BaseException:
             end_interrupted(records, call_id)
             raise

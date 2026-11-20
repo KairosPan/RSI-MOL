@@ -12,7 +12,8 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from rsi.cli import main
+from rsi.cli import main, safe
+from rsi.labrun import process_recorder
 from rsi.init import init, locked, recover
 from rsi.mockmodel import add_file, say
 from rsi.paths import Layout, Refused
@@ -185,11 +186,11 @@ class Recover(unittest.TestCase):
             other = subprocess.Popen(['/bin/sleep', '30'], start_new_session=True)
             for process in (ours, other):
                 self.addCleanup(process.wait); self.addCleanup(process.kill)
-            now = datetime.now().astimezone()
-            for pid, started in ((ours.pid, now), (other.pid, now - timedelta(hours=1))):
-                call = root.records.new_id('R')
-                root.records.start_call(call, {'role': 'lab', 'purpose': 'task', 'pid': pid,
-                                               'started': started.isoformat(timespec='seconds')})
+            for _ in range(2):
+                root.records.start_call(root.records.new_id('R'), {'role': 'lab', 'purpose': 'task'})
+            process_recorder(root.records, 'R0001')(ours.pid)               # as labrun and meta record a call
+            an_hour_ago = (datetime.now().astimezone() - timedelta(hours=1)).isoformat(timespec='seconds')
+            root.records.write_json('runs/R0002/process.json', {'pid': other.pid, 'started': an_hour_ago})
             self.assertEqual(recover(root.layout), ['R0001', 'R0002'])
             self.assertEqual(ours.wait(timeout=10), -signal.SIGTERM)
             time.sleep(0.2)
@@ -230,12 +231,34 @@ class Commands(unittest.TestCase):
             code, out, _ = run('status')
             self.assertEqual(code, 0); self.assertIn('当前版本：V0001', out); self.assertIn('A0001', out)
 
+    def test_text_from_records_is_printed_without_control_characters(self):
+        hostile = 'x\x1b[2J\ry\u202ez\x07\x9b\u2066\n' + 'w' * 1000
+        with Root() as root:
+            root.records.write_json('applications/A0001.json', {'id': 'A0001', 'status': 'pending', 'what': hostile})
+            call = root.records.new_id('R')
+            root.records.start_call(call, {'role': 'lab', 'purpose': 'task', 'task': 'T\x1b]0;t\x07'})
+            root.records.finish_call(call, {'status': 'finished', 'check': {'passed': False, 'message': hostile}})
+            code, out, _ = run('status')
+            self.assertEqual(code, 0); self.assertIn('\\x1b[2J', out); self.assertIn('\\u202e', out)
+            for char in ('\x1b', '\r', '\u202e', '\x07', '\x9b', '\u2066'):
+                self.assertNotIn(char, out)
+            self.assertTrue(all(len(line) < 1000 for line in out.splitlines()))
+            code, out, _ = run('status', '--json')
+            self.assertEqual(json.loads(out)['applications'][0]['what'], hostile)
+            for char in ('\x1b', '\r', '\u202e', '\x07', '\x9b', '\u2066'):
+                self.assertNotIn(char, out)
+        self.assertEqual(safe('a\nb\ud800', None), 'a\\x0ab\\ud800'); self.assertEqual(len(safe('w' * 999)), 300)
+
     @needs_codex
     def test_task_command_end_to_end(self):
         with Root() as root:
             root.add_task('T1'); root.model.push(say('lab done'), say(decision('no_change')))
             self.assertEqual(run('task', 'T1')[0], 0)
             self.assertEqual([c['purpose'] for c in root.records.calls()], ['task', 'meta'])
+            for call in ('R0001', 'R0002'):                                  # a Lab call and a Meta call
+                process = json.loads((root.records.call_dir(call) / 'process.json').read_text())
+                self.assertEqual((type(process['pid']), type(datetime.fromisoformat(process['started']))),
+                                 (int, datetime))
             root.model.push(add_file('NOTES.md', 'n'), say('lab again'))
             code, out, _ = run('task', 'T1', '--no-meta')
             self.assertEqual(code, 0); self.assertIn('R0003', out); self.assertIn('records/runs/R0003', out)
