@@ -1,3 +1,4 @@
-# Meta Codex 的模型和推理强度（主人的文件；不写就用 Codex 的默认值）。只能写这两个键，例如：
-# model = "<模型名>"
+# The model and reasoning effort of the Meta Codex (the owner's file; when a key is left out, Codex's default is used).
+# Only these two keys are allowed, for example:
+# model = "<model name>"
 # model_reasoning_effort = "high"

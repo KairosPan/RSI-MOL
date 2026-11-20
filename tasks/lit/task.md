@@ -1,11 +1,14 @@
-## 目标
-查清一个小的文献问题：Adam 优化器的原始论文（Kingma 和 Ba）为它的超参数建议了哪些默认值？
+## Goal
+Answer a small literature question: which default values does the original paper of the Adam optimizer (Kingma and
+Ba) suggest for its hyperparameters?
 
-## 输入
-无。
+## Input
+None.
 
-## 要求
-这个问题必须派 `literature` 子 agent 去查，你自己不要凭记忆回答。把它交回的内容整理成 `out/lit/answer.md`，写明：答案；来源（arXiv 编号或 DOI）；支持答案的原文片段或它在原文里的位置；子 agent 说明的覆盖程度和局限。
+## Requirements
+You must send the `literature` sub-agent to look this up; do not answer from memory yourself. Turn what it hands
+back into `out/lit/answer.md`, stating: the answer; the source (an arXiv id or a DOI); the passage of the paper that
+supports the answer, or where it is in the paper; and how much the sub-agent says it covered, and its limits.
 
-## 完成判据
-`answer.md` 存在、不是空的，并且至少写了一个 arXiv 编号或 DOI。
+## Completion criteria
+`answer.md` exists, is not empty, and names at least one arXiv id or DOI.

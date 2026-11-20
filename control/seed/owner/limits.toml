@@ -1,13 +1,13 @@
-# 主人定的上限（只有主人改；agent 改不了）。删掉某个键就用它的默认值。
+# The owner's limits (only the owner changes them; agents cannot). A key that is left out takes its default value.
 
 [lab]
-seconds_per_run = 1800      # 一次 Lab 运行最长秒数
+seconds_per_run = 1800      # longest Lab run, in seconds
 
 [meta]
-calls_per_round = 8         # 一轮 Meta 最多调用几次
-trials_per_round = 4        # 一轮 Meta 最多试跑几次
-seconds_per_call = 900      # 一次 Meta 调用最长秒数
+calls_per_round = 8         # most Meta calls in one round
+trials_per_round = 4        # most trial runs in one Meta round
+seconds_per_call = 900      # longest Meta call, in seconds
 
 [day]
-calls = 60                  # 每天最多开始几次调用
-tokens = 0                  # 每天最多用多少 token；0 表示不设上限
+calls = 60                  # most calls started in one day
+tokens = 0                  # most tokens used in one day; 0 means no limit

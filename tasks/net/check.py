@@ -11,25 +11,25 @@ LIMIT = 1 << 20
 def verdict(folder: Path) -> str:
     path = folder / 'result.json'
     if not path.is_file():
-        return '缺少 result.json'
+        return 'result.json is missing'
     try:
         data = path.read_bytes()[:LIMIT + 1]
         if len(data) > LIMIT:
             raise ValueError('too long')
         result = json.loads(data.decode('utf-8'))
     except (OSError, ValueError, RecursionError):
-        return 'result.json 不是合法的 JSON'
+        return 'result.json is not valid JSON'
     if not isinstance(result, list) or len(result) != 3:
-        return '不是含三个对象的数组'
+        return 'it is not an array of three objects'
     for item in result:
         if not isinstance(item, dict) or not {'command', 'exit_code', 'stdout', 'stderr'} <= set(item):
-            return '有对象缺少字段'
+            return 'an object lacks a field'
         if type(item['exit_code']) is not int:
-            return 'exit_code 不是整数'
-    return '通过'
+            return 'exit_code is not an integer'
+    return 'passed'
 
 
 if __name__ == '__main__':
     message = verdict(Path(sys.argv[1]))
     print(message)
-    sys.exit(0 if message == '通过' else 1)
+    sys.exit(0 if message == 'passed' else 1)

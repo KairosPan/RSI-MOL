@@ -32,10 +32,57 @@ OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
 NAMES = re.compile(r'\bthe (owner|lead)\b', re.IGNORECASE)
 NAMED = {'AGENTS.md': ['lead'], 'codex/agents/literature.toml': ['lead'], 'codex/settings.toml': ['owner'],
          'notes/README.md': []}
-# The rule of Meta's standing instructions that keeps the Lab workspace in English, and the bullet it follows.
-ENGLISH_RULE = ('- Lab 工作区里留下的文件一律用英文写，文件名和文件夹名也用英文：指示、技能、角色、设置里的注释、脚本。'
-                '你在 `../candidate/` 里的改动用英文，你自己的笔记也用英文。')
-DISABLE_RULE = '- 要关掉已允许的某个连接器或插件'
+# The rule of Meta's standing instructions that keeps the Lab workspace in English (one bullet, its lines joined
+# by a space), and the bullet it follows.
+ENGLISH_RULE = ('- Every file kept in the Lab workspace is written in English, with English file and folder names: '
+                'instructions, skills, roles, comments in the settings, scripts. Your changes in `../candidate/` are '
+                'in English, and so are your own notes.')
+DISABLE_RULE = '- To switch off one of the allowed connectors or plugins'
+# The lines of the grid task's check, by the content of answer.json (None: no file, bytes: written as they are).
+GRID_LINES = {None: 'answer.json is missing', 'not json': 'answer.json is not a valid JSON object',
+              '[]': 'the fields do not meet the requirements',
+              '{"x": 0, "y": 0}': 'x and y do not give f its largest value', '{"x": 3, "y": -1}': 'passed'}
+# Meta's standing instructions in the seed, word for word.
+META_SEED = """# Meta
+
+You improve how the Lab works. You do not do the Lab's tasks for it.
+
+Each round:
+
+1. Observe. Read the run records handed to you this round; each is under `../records/runs/<id>/`:
+   `call.json` (the check result is its `check`; `problems` are problems the control program met before or after
+   the run; `settings_problems` are settings, tool servers and skills that did not take effect), `prompt.txt`,
+   `events.jsonl`, `stderr.txt` (Codex's errors; when a run could not start, the cause is only here),
+   `last-message.txt`, `out/`, `sessions/` (the session and the sub-agents' work), and for a task run `diff.patch`.
+   Check which task and version a record belongs to before you judge.
+2. Diagnose. Write down the problem, the evidence (cite record ids), the likely cause, and other explanations.
+   Do not treat something seen once as a pattern. If the evidence is not enough, decide to change nothing.
+3. Improve. Edit only in `../candidate/` (its full path is in this round's prompt), one small change at a time.
+   You may change instructions, skills (`skills/<name>/SKILL.md`), roles, settings, scripts, and tool servers.
+   Do not write the answer to any task into them.
+4. Validate. Ask for trial runs when you need them: which task, or a short test you write yourself; on the
+   candidate or on the current version. During a trial `env/` and `library/` are read-only: a candidate cannot
+   install packages into `env/` or save files to `library/` in a trial.
+5. Decide. Whether to release or to change nothing is your decision. A release must cite the ids of Lab run
+   records (usually trials), and those runs must have run exactly what you last left in the candidate. If you
+   change it, run again.
+
+Rules:
+
+- State possible regressions and what you are unsure of. Do not claim a benefit.
+- You cannot read or change a task's check script, the budget limits, or the control program. Records are
+  read-only.
+- To give the Lab a new connector or plugin, to let it read or write files outside its workspace, or to raise a
+  budget limit, write an application; the owner decides. Tool servers and command networking you may change
+  directly in the settings.
+- To switch off one of the allowed connectors or plugins, write its id under `[disable]` in the settings. The ids
+  are in a Lab run record's `call.json`, field `command`: the `apps=` and `plugins=` parts list them.
+- Every file kept in the Lab workspace is written in English, with English file and folder names: instructions,
+  skills, roles, comments in the settings, scripts. Your changes in `../candidate/` are in English, and so are
+  your own notes.
+- Your notes go in `notes/`; they are still there next round.
+- Every reply must be a JSON object in the required format.
+"""
 # A commented-out example line of the seed's settings.toml: a table header or `key = value`, after '# '.
 EXAMPLE = re.compile(r'# (\[[a-z_.]+\]|[a-z_]+ = .+)')
 IDS = '\n[apps.conn_a]\nenabled = true\n\n[plugins."pdf@x"]\nenabled = true\n'     # allowed connector and plugin
@@ -48,13 +95,26 @@ def files(folder: Path) -> list[str]:
 
 def observe_step(text: str) -> str:
     """Step 1 of Meta's standing instructions: what a run record holds."""
-    return text[text.index('1. 观察'):text.index('2. 诊断')]
+    return text[text.index('1. Observe'):text.index('2. Diagnose')]
+
+
+def bullets(text: str) -> list[str]:
+    """The `- ` bullets of a text, each with its indented continuation lines joined to it by a space."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith('- '):
+            out.append(line)
+        elif out and line.startswith('  ') and line.strip():
+            out[-1] += ' ' + line.strip()
+        elif out and out[-1] is not None:
+            out.append(None)                                    # anything else ends the bullet
+    return [bullet for bullet in out if bullet is not None]
 
 
 def meta_paths() -> tuple[str, str]:
     """A call's record folder and the candidate as seen from Meta's working folder, from the layout itself."""
     layout = Layout(Path('/RSI'))
-    return (f'{os.path.relpath(layout.records, layout.meta)}/{KINDS["R"]}/<编号>/',
+    return (f'{os.path.relpath(layout.records, layout.meta)}/{KINDS["R"]}/<id>/',
             f'{os.path.relpath(layout.candidate, layout.meta)}/')
 
 
@@ -66,14 +126,16 @@ class Seed(unittest.TestCase):
 
     def test_grid_check(self):
         check, task = TASKS / 'grid' / 'check.py', load_task(TASKS, 'grid')
-        cases = ((None, '缺少', 1), ('[]', '字段', 1), ('{"x": 3}', '字段', 1), ('{"x": 0, "y": 0}', '最大值', 1),
-                 ('{"x": 3, "y": -1}', '通过', 0), ('not json', 'JSON', 1),
+        cases = ((None, None, 1), ('[]', '[]', 1), ('{"x": 3}', '[]', 1), ('{"x": 0, "y": 0}', '{"x": 0, "y": 0}', 1),
+                 ('{"x": 3, "y": -1}', '{"x": 3, "y": -1}', 0), ('not json', 'not json', 1),
                  # beyond the plan: extra or repeated keys, values that are not integers, outside the range, bytes
                  # that are not UTF-8, nesting too deep for the parser
-                 ('{"x": 3, "y": -1, "z": 0}', '字段', 1), ('{"x": 3, "x": 3, "y": -1}', '字段', 1),
-                 ('{"x": true, "y": -1}', '字段', 1), ('{"x": 3.0, "y": -1}', '字段', 1),
-                 ('{"x": 13, "y": -1}', '最大值', 1), (b'{"x": 3, "y": -1}\xff', 'JSON', 1), ('[' * 100_000, 'JSON', 1))
-        for content, word, code in cases:
+                 ('{"x": 3, "y": -1, "z": 0}', '[]', 1), ('{"x": 3, "x": 3, "y": -1}', '[]', 1),
+                 ('{"x": true, "y": -1}', '[]', 1), ('{"x": 3.0, "y": -1}', '[]', 1),
+                 ('{"x": 13, "y": -1}', '{"x": 0, "y": 0}', 1), (b'{"x": 3, "y": -1}\xff', 'not json', 1),
+                 ('[' * 100_000, 'not json', 1))
+        self.assertEqual({GRID_LINES[like] for _, like, _ in cases}, set(GRID_LINES.values()))     # all five lines
+        for content, like, code in cases:
             with self.subTest(content=str(content)[:40]), tempfile.TemporaryDirectory() as folder:
                 out = Path(folder)
                 if isinstance(content, bytes):
@@ -82,8 +144,8 @@ class Seed(unittest.TestCase):
                     (out / 'answer.json').write_text(content, encoding='utf-8')
                 done = subprocess.run([sys.executable, '-X', 'utf8', str(check), str(out)], capture_output=True,
                                       encoding='utf-8', stdin=subprocess.DEVNULL)
-                self.assertEqual((done.returncode, done.stderr), (code, '')); self.assertIn(word, done.stdout)
-                self.assertEqual(done.stdout.count('\n'), 1)                # exactly one line
+                self.assertEqual((done.returncode, done.stderr), (code, ''))
+                self.assertEqual(done.stdout, GRID_LINES[like] + '\n')      # exactly one line, the one for this case
                 self.assertNotIn('-1', done.stdout); self.assertNotRegex(done.stdout, '[0-9]')     # never a value
                 result = run_check(task, out)                              # as the control program runs it
                 self.assertEqual(result, {'passed': code == 0, 'message': done.stdout.strip(), 'exit_code': code})
@@ -114,6 +176,9 @@ class Seed(unittest.TestCase):
         self.assertEqual(sorted(sorted(server) for server in settings.tool_servers.values()),
                          [['args', 'command', 'network'], ['bearer_token_env_var', 'url']])
 
+    def test_the_meta_seed_is_the_english_text(self):
+        self.assertEqual(META_TEXT.read_text(encoding='utf-8'), META_SEED)
+
     def test_the_owner_seed_files_hold_the_defaults(self):
         self.assertEqual(load_limits(SEED / 'owner'), Limits())
         self.assertEqual(tomllib.loads((SEED / 'owner' / 'meta' / 'settings.toml').read_text(encoding='utf-8')), {})
@@ -138,7 +203,7 @@ class Seed(unittest.TestCase):
             root.model.push(add_file('out/T1/answer.json', '{"x": 3, "y": -1}'), say('done'))
             call = run_task(root.layout, 'T1')
             folder = root.records.call_dir(call['id'])
-            self.assertEqual(os.path.normpath(root.layout.meta / runs.replace('<编号>', call['id'])), str(folder))
+            self.assertEqual(os.path.normpath(root.layout.meta / runs.replace('<id>', call['id'])), str(folder))
             entries = {path.name + ('/' if path.is_dir() else '') for path in folder.iterdir()}
         named = set(re.findall(r'`([^`]+)`', observe_step(text))) - {runs}
         self.assertEqual(call['status'], 'finished'); self.assertLessEqual({'out/', 'sessions/', 'stderr.txt'}, named)
@@ -159,8 +224,9 @@ class Seed(unittest.TestCase):
         found = sorted(path.relative_to(repo).as_posix() for path in paths
                        if path.is_file() and '__pycache__' not in path.parts and '负责人'.encode() in path.read_bytes())
         self.assertEqual(found, [])
-        for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS, META_TEXT.read_text(encoding='utf-8')):
+        for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS):
             self.assertIn('由主人决定', text)
+        self.assertIn('the owner decides', META_TEXT.read_text(encoding='utf-8'))
         texts = {name: (SEED / 'work' / name).read_text(encoding='utf-8') for name in WORK_FILES}
         named = {name: sorted({word.lower() for word in NAMES.findall(text)}) for name, text in texts.items()}
         self.assertEqual(named, NAMED)
@@ -174,10 +240,10 @@ class Seed(unittest.TestCase):
 
     def test_meta_is_told_to_keep_the_lab_workspace_in_english(self):
         """The rule is the bullet right after the one on turning off a connector or plugin."""
-        lines = META_TEXT.read_text(encoding='utf-8').splitlines()
-        disable = next(index for index, line in enumerate(lines) if line.startswith(DISABLE_RULE))
-        self.assertEqual(next(line for line in lines[disable + 1:] if line.startswith('- ')), ENGLISH_RULE)
-        self.assertEqual(lines.count(ENGLISH_RULE), 1)
+        found = bullets(META_TEXT.read_text(encoding='utf-8'))
+        disable = next(index for index, bullet in enumerate(found) if bullet.startswith(DISABLE_RULE))
+        self.assertEqual(found[disable + 1], ENGLISH_RULE)
+        self.assertEqual(found.count(ENGLISH_RULE), 1)
 
     def test_a_root_initialised_from_the_seed_has_it_as_v0001(self):
         tmp = Path(tempfile.mkdtemp()).resolve()

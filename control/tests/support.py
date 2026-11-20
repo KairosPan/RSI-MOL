@@ -22,15 +22,15 @@ needs_codex = unittest.skipUnless(shutil.which(os.environ.get('RSI_CODEX', 'code
 
 # The check script of the test task: passes when out/answer.json holds the maximum of f.
 PASS_CHECK = ('import json,sys,pathlib\np = pathlib.Path(sys.argv[1]) / "answer.json"\n'
-              'if not p.is_file(): print("缺少 answer.json"); sys.exit(1)\n'
+              'if not p.is_file(): print("answer.json is missing"); sys.exit(1)\n'
               'd = json.loads(p.read_text())\nok = d == {"x": 3, "y": -1}\n'
-              'print("通过" if ok else "x、y 没有使 f 取到最大值"); sys.exit(0 if ok else 1)\n')
+              'print("passed" if ok else "x and y do not give f its largest value"); sys.exit(0 if ok else 1)\n')
 
 TASK_SECTIONS = {
-    '目标': '找出使 f(x, y) = -(x - 3)² - (y + 1)² 取到最大值的整数 x、y。',
-    '输入': '没有输入文件。',
-    '要求': '把答案写成 answer.json，形如 {"x": 0, "y": 0}。',
-    '完成判据': 'answer.json 里的 x、y 使 f 取到最大值。',
+    'Goal': 'Find the integers x and y at which f(x, y) = -(x - 3)² - (y + 1)² is largest.',
+    'Input': 'There are no input files.',
+    'Requirements': 'Write the answer to answer.json, as {"x": 0, "y": 0}.',
+    'Completion criteria': 'x and y in answer.json give f its largest value.',
 }
 ENVELOPE = 'approval_policy = "never"\n\n[features]\napps = false\nplugins = false\n'
 LIMITS = ('[lab]\nseconds_per_run = 1800\n\n'
@@ -137,7 +137,7 @@ class Root:
             self.store = VersionStore(layout.versions)
             self.store.init()
             (layout.work / 'AGENTS.md').write_text('hello\n', encoding='utf-8')
-            self.store.commit(layout.work, 'owner', '初始版本')
+            self.store.commit(layout.work, 'owner', 'first version')
             self.records = Records(layout.records)
             if self.passed_check:
                 write_passing_check(layout)
@@ -163,7 +163,7 @@ class Root:
         folder = self.layout.tasks / task_id
         folder.mkdir(parents=True)
         sections = TASK_SECTIONS if sections is None else sections
-        text = f'# 任务 {task_id}\n\n' + ''.join(f'## {name}\n\n{body}\n\n' for name, body in sections.items())
+        text = f'# Task {task_id}\n\n' + ''.join(f'## {name}\n\n{body}\n\n' for name, body in sections.items())
         (folder / 'task.md').write_text(text, encoding='utf-8')
         if check is not None:
             (folder / 'check.py').write_text(check, encoding='utf-8')

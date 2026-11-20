@@ -8,7 +8,7 @@ SAFE_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}')
 
 
 class Refused(Exception):
-    """A request the program declines; str() is the Chinese message shown to the owner."""
+    """A request the program declines; str() is the English message shown to the owner."""
 
 
 @dataclass(frozen=True)
@@ -99,5 +99,6 @@ def find_layout() -> Layout:
 def safe_id(text: str, what: str) -> str:
     """Return text if it is one plain path component (never `..`, hidden or nested); else raise ValueError."""
     if not isinstance(text, str) or not SAFE_ID.fullmatch(text):
-        raise ValueError(f'{what} 不合规：{text!r}。只能用字母、数字、_ 和 -，以字母或数字开头，最长 64 个字符。')
+        raise ValueError(f'The {what} {text!r} is not valid. Use only letters, digits, _ and -, start with a letter '
+                         'or a digit, and use at most 64 characters.')
     return text

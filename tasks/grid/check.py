@@ -24,7 +24,7 @@ class Pairs(list):
 def verdict(folder: Path) -> str:
     path = folder / 'answer.json'
     if not path.is_file():
-        return '缺少 answer.json'
+        return 'answer.json is missing'
     try:
         with open(path, 'rb') as stream:
             data = stream.read(LIMIT + 1)
@@ -32,19 +32,19 @@ def verdict(folder: Path) -> str:
             raise ValueError('too long')
         answer = json.loads(data.decode('utf-8'), object_pairs_hook=Pairs)
     except (OSError, ValueError, RecursionError):
-        return 'answer.json 不是合法的 JSON 对象'
+        return 'answer.json is not a valid JSON object'
     if not isinstance(answer, Pairs) or sorted(key for key, _ in answer) != ['x', 'y']:
-        return '字段不符合要求'
+        return 'the fields do not meet the requirements'
     values = dict(answer)
     if not all(type(values[key]) is int for key in ('x', 'y')):
-        return '字段不符合要求'
+        return 'the fields do not meet the requirements'
     best = max(f(x, y) for x in GRID for y in GRID)
     if values['x'] not in GRID or values['y'] not in GRID or f(values['x'], values['y']) != best:
-        return 'x、y 没有使 f 取到最大值'
-    return '通过'
+        return 'x and y do not give f its largest value'
+    return 'passed'
 
 
 if __name__ == '__main__':
     message = verdict(Path(sys.argv[1]))
     print(message)
-    sys.exit(0 if message == '通过' else 1)
+    sys.exit(0 if message == 'passed' else 1)

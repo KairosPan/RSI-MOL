@@ -1,11 +1,11 @@
-## 目标
-找出使 f(x, y) = -((x-3)^2 + (y+1)^2) 最大的整数 x 和 y。x、y 都在 -10 到 10 之间。
+## Goal
+Find the integers x and y that maximise f(x, y) = -((x-3)^2 + (y+1)^2). Both x and y are between -10 and 10.
 
-## 输入
-无。
+## Input
+None.
 
-## 要求
-把结果写成 `out/grid/answer.json`，内容是一个 JSON 对象，只有两个整数字段 `x` 和 `y`。
+## Requirements
+Write the result to `out/grid/answer.json`: a JSON object with exactly two integer fields, `x` and `y`.
 
-## 完成判据
-`answer.json` 存在、格式符合要求，并且 x、y 使 f 取到最大值。
+## Completion criteria
+`answer.json` exists, has the required format, and x and y give f its largest value.

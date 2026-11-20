@@ -19,8 +19,8 @@ class TaskFiles(unittest.TestCase):
         with Root() as root:
             root.add_task('T1')
             self.assertEqual(sorted(load_task(root.layout.tasks, 'T1').sections), sorted(SECTIONS))
-            root.add_task('T2', sections={'目标': 'g', '输入': 'i', '要求': '', '完成判据': 'c'})
-            with self.assertRaisesRegex(ValueError, '要求'): load_task(root.layout.tasks, 'T2')
+            root.add_task('T2', sections={'Goal': 'g', 'Input': 'i', 'Requirements': '', 'Completion criteria': 'c'})
+            with self.assertRaisesRegex(ValueError, 'no "Requirements" section'): load_task(root.layout.tasks, 'T2')
             for bad in ('../T1', 'T1/x', ''):
                 with self.assertRaises(ValueError): load_task(root.layout.tasks, bad)
 
@@ -29,7 +29,7 @@ class TaskFiles(unittest.TestCase):
             root.add_task('T1', check='import time\nprint("x" * 100000, flush=True)\ntime.sleep(600)\n')
             result = run_check(load_task(root.layout.tasks, 'T1'), root.layout.root, timeout=2)
             self.assertEqual((result['passed'], len(result['message']) <= 500), (False, True))
-            self.assertEqual((result['message'], result['exit_code']), ('检查脚本超时', None))
+            self.assertEqual((result['message'], result['exit_code']), ('the check script timed out', None))
 
     def test_collect_out_never_follows_links(self):
         with Root() as root:
@@ -52,19 +52,31 @@ class MoreTaskFiles(unittest.TestCase):
         with Root() as root:
             folder = root.add_task('T1')
             text = (folder / 'task.md').read_text()
-            for extra in ('## 备注\n\nx\n', '## 目标\n\n再一次\n'):
+            for extra in ('## Notes\n\nx\n', '## Goal\n\nonce more\n'):
                 (folder / 'task.md').write_text(text + extra)
                 with self.assertRaises(ValueError): load_task(root.layout.tasks, 'T1')
-            (folder / 'task.md').write_text(text + '```\n## 备注\n```\n')     # a heading inside a code block is text
-            self.assertIn('## 备注', load_task(root.layout.tasks, 'T1').sections['完成判据'])
+            (folder / 'task.md').write_text(text + '```\n## Notes\n```\n')     # a heading inside a code block is text
+            self.assertIn('## Notes', load_task(root.layout.tasks, 'T1').sections['Completion criteria'])
             with self.assertRaisesRegex(ValueError, 'T9'): load_task(root.layout.tasks, 'T9')
+
+    def test_the_old_chinese_headings_are_refused_naming_the_english_ones(self):
+        """Input data in Chinese: the four headings task files had before the program spoke English."""
+        with Root() as root:
+            root.add_task('T1', sections=dict(zip(('目标', '输入', '要求', '完成判据'), 'abcd')))
+            with self.assertRaises(ValueError) as caught:
+                load_task(root.layout.tasks, 'T1')
+            message = str(caught.exception)
+            self.assertIn('unknown section', message)
+            self.assertIn('## Goal, ## Input, ## Requirements, ## Completion criteria', message)
 
     def test_prompt_names_inputs_and_results(self):
         with Root() as root:
             root.add_task('T1'); root.add_task('T2', inputs={'data.txt': 'd'})
             plain, with_inputs = (prompt_for(load_task(root.layout.tasks, name)) for name in ('T1', 'T2'))
-            self.assertLess(plain.index('## 目标'), plain.index('## 完成判据')); self.assertIn('out/T1/', plain)
-            self.assertNotIn('in/T1/', plain); self.assertIn('in/T2/', with_inputs)
+            self.assertLess(plain.index('## Goal'), plain.index('## Completion criteria'))
+            self.assertTrue(plain.endswith('\n\nWrite the results to out/T1/.\n'), plain)
+            self.assertNotIn('in/T1/', plain)
+            self.assertTrue(with_inputs.endswith('\n\nInput files are in in/T2/.\n\nWrite the results to out/T2/.\n'))
 
     def test_check_gets_the_folder_and_a_closed_environment(self):
         with Root() as root:
@@ -92,9 +104,9 @@ class MoreTaskFiles(unittest.TestCase):
         with Root() as root:
             root.add_task('T1', check=PASS_CHECK); task = load_task(root.layout.tasks, 'T1')
             out = root.layout.root / 'o'; out.mkdir()
-            self.assertEqual(run_check(task, out)['message'], '缺少 answer.json')
+            self.assertEqual(run_check(task, out)['message'], 'answer.json is missing')
             (out / 'answer.json').write_text('{"x": 3, "y": -1}')
-            self.assertEqual(run_check(task, out), {'passed': True, 'message': '通过', 'exit_code': 0})
+            self.assertEqual(run_check(task, out), {'passed': True, 'message': 'passed', 'exit_code': 0})
 
     def test_inputs_are_copied_into_a_staged_folder_with_links_kept(self):
         with Root() as root:
@@ -119,8 +131,8 @@ class MoreTaskFiles(unittest.TestCase):
             dest = root.layout.root / 'dest'
             problems = collect_out(tree, 'T1', dest)
             self.assertEqual(len(problems), 2)
-            self.assertTrue(any('out/T1/sub/to-owner' in line and '符号链接' in line for line in problems))
-            self.assertTrue(any('out/T1/sub/pipe' in line and '命名管道' in line for line in problems))
+            self.assertTrue(any('out/T1/sub/to-owner is a symbolic link' in line for line in problems), problems)
+            self.assertTrue(any('out/T1/sub/pipe is a named pipe' in line for line in problems), problems)
             found = sorted(os.path.relpath(os.path.join(top, name), dest)
                            for top, folders, files in os.walk(dest) for name in folders + files)
             self.assertEqual(found, ['h.txt', 'sub', 'sub/deeper', 'sub/deeper/kept.txt'])
@@ -147,8 +159,8 @@ class MoreTaskFiles(unittest.TestCase):
                 problems = collect_out(tree, 'T1', root.layout.root / 'dest')
             kept = sorted(os.listdir(root.layout.root / 'dest'))
             self.assertEqual(kept, ['f0.txt', 'f1.txt', 'f2.txt', 'f3.txt'])        # 'big.bin' sorts first: 40 > 30
-            self.assertTrue(any('big.bin' in line and '字节' in line for line in problems))
-            self.assertEqual(sum('个文件' in line for line in problems), 2)
+            self.assertTrue(any('big.bin has 40 bytes' in line for line in problems), problems)
+            self.assertEqual(sum('files and folders' in line for line in problems), 2)
             folders = tree / 'out' / 'T3'                                         # folders count as entries too
             for name in ('a', 'b', 'c'):
                 (folders / name).mkdir(parents=True); (folders / name / 'f').write_text('f')

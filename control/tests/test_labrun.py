@@ -45,13 +45,13 @@ class LabRuns(unittest.TestCase):
                              ('finished', 'task', 'online', 'lab'))
             self.assertEqual((call['version_before'], call['version_after'], root.store.head()),
                              ('V0001', 'V0002', 'V0002'))
-            self.assertEqual(call['check'], {'passed': True, 'message': '通过', 'exit_code': 0})
+            self.assertEqual(call['check'], {'passed': True, 'message': 'passed', 'exit_code': 0})
             run_dir = root.records.call_dir(call['id'])
             self.assertTrue((run_dir / 'out' / 'answer.json').is_file())
             self.assertTrue((run_dir / 'diff.patch').is_file())
             self.assertFalse((root.layout.work / 'out' / 'T1').exists())
             self.assertTrue((root.layout.work / 'notes' / 'n.md').is_file())
-            self.assertIn('目标', (run_dir / 'prompt.txt').read_text())
+            self.assertIn('## Goal', (run_dir / 'prompt.txt').read_text())
             self.assertEqual(call['codex_version'], codex_version())
             copies = [p.name for p in (run_dir / 'sessions').iterdir()]
             self.assertEqual((len(copies), copies[0].endswith(call['thread_id'] + '.jsonl'), call['subagent_threads']),
@@ -92,7 +92,7 @@ class LabRuns(unittest.TestCase):
             root.add_task('T1', check=PASS_CHECK, inputs={'data.txt': 'd'})
             root.model.push(say('nothing written'))
             call = run_task(root.layout, 'T1')
-            self.assertEqual((call['check']['passed'], call['check']['message']), (False, '缺少 answer.json'))
+            self.assertEqual((call['check']['passed'], call['check']['message']), (False, 'answer.json is missing'))
             self.assertFalse((root.layout.work / 'in' / 'T1').exists()); self.assertIsNone(call['version_after'])
             self.assertIn('in/T1/', (root.records.call_dir(call['id']) / 'prompt.txt').read_text())
 

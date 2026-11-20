@@ -11,19 +11,19 @@ SOURCE = re.compile(r'(arXiv\s*:?\s*\d{4}\.\d{4,5})|(\b10\.\d{4,9}/\S+)', re.IGN
 def verdict(folder: Path) -> str:
     path = folder / 'answer.md'
     if not path.is_file():
-        return '缺少 answer.md'
+        return 'answer.md is missing'
     try:
         text = path.read_bytes()[:LIMIT].decode('utf-8', 'replace')
     except OSError:
-        return 'answer.md 读不出来'
+        return 'answer.md cannot be read'
     if not text.strip():
-        return 'answer.md 是空的'
+        return 'answer.md is empty'
     if not SOURCE.search(text):
-        return '没有写 arXiv 编号或 DOI'
-    return '通过'
+        return 'it names no arXiv id or DOI'
+    return 'passed'
 
 
 if __name__ == '__main__':
     message = verdict(Path(sys.argv[1]))
     print(message)
-    sys.exit(0 if message == '通过' else 1)
+    sys.exit(0 if message == 'passed' else 1)
