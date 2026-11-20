@@ -10,7 +10,9 @@ resolve only to public addresses and may carry a secret only to the host the own
 """
 import copy
 import ipaddress
+import json
 import os
+import platform
 import shutil
 import socket
 import tomllib
@@ -19,7 +21,7 @@ from urllib.parse import urlsplit
 
 from rsi.codexrun import codex_program
 from rsi.paths import Layout, Refused
-from rsi.settings import ROLE, SETTINGS, Settings, is_workspace_path, show
+from rsi.settings import EFFORTS, MODEL, ROLE, SETTINGS, Settings, is_workspace_path, show
 from rsi.tomlout import render_file
 
 ENVELOPE = 'lab-envelope.toml'
@@ -27,6 +29,16 @@ ENVELOPE_TABLES = ('features', 'apps', 'plugins', 'rsi')
 TOOL_FOLDERS = ('/opt/homebrew/bin', '/opt/homebrew/Cellar', '/opt/homebrew/opt', '/opt/homebrew/lib',
                 '/opt/homebrew/share', '/opt/homebrew/etc/fonts')
 SYSTEM_PATH = '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+# The PATH of the unsandboxed `codex sandbox` wrapper: nothing an agent can write.
+WRAPPER_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
+# (system, machine) → (npm platform package, target triple), as in the npm package's bin/codex.js.
+NATIVE_TARGETS = {('Darwin', 'arm64'): ('codex-darwin-arm64', 'aarch64-apple-darwin'),
+                  ('Darwin', 'x86_64'): ('codex-darwin-x64', 'x86_64-apple-darwin'),
+                  ('Linux', 'x86_64'): ('codex-linux-x64', 'x86_64-unknown-linux-musl'),
+                  ('Linux', 'aarch64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl'),
+                  ('Linux', 'arm64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl')}
+HOW_TO_SET_CODEX = ('请把 $RSI_CODEX 设成 Codex 原生程序的绝对路径（npm 安装的在 '
+                    '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），它不能在 RSI 文件夹里')
 NETWORK_OFF = {'enabled': False}
 NETWORK_ON = {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}}
 
@@ -128,16 +140,63 @@ def _shell(layout: Layout, workspace: Path) -> dict:
     return {'inherit': 'core', 'set': {'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout)}}
 
 
-def _codex_path() -> str:
-    """The Codex program as an absolute path, looked up in the control program's own PATH (the wrapper's PATH
-    starts with Homebrew, which may hold another Codex); the bare name when it cannot be found."""
-    return shutil.which(codex_program()) or codex_program()
+def _script(path: str) -> bool:
+    with open(path, 'rb') as stream:
+        return stream.read(2) == b'#!'
 
 
-def _local_server(layout: Layout, workspace: Path, profile: str, server: dict) -> dict:
+def _shim_targets(shim: str) -> list[str]:
+    """Where the npm package that owns the shim `<package>/bin/codex.js` keeps the native program."""
+    package = os.path.dirname(os.path.dirname(shim))
+    try:
+        name = json.loads(Path(package, 'package.json').read_text(encoding='utf-8')).get('name')
+    except (OSError, ValueError, AttributeError):
+        return []
+    target = NATIVE_TARGETS.get((platform.system(), platform.machine()))
+    if name != '@openai/codex' or target is None:
+        return []
+    platform_package, triple = target
+    tail = os.path.join('vendor', triple, 'bin', 'codex')
+    return [os.path.join(package, 'node_modules', '@openai', platform_package, tail),
+            os.path.join(os.path.dirname(package), platform_package, tail), os.path.join(package, tail)]
+
+
+def native_codex(layout: Layout) -> str:
+    """The real path of Codex's native program, for the unsandboxed wrapper of local tool servers.
+
+    $RSI_CODEX must be absolute when set; otherwise `codex` is looked up in the control program's own PATH. An npm
+    shim (`#!/usr/bin/env node`, which would look node up in a PATH) is followed to its package's native program.
+    The result must exist, be executable, not be a script, and lie outside the RSI root, which agents can write;
+    anything else is refused rather than guessed.
+    """
+    program = codex_program()
+    if 'RSI_CODEX' in os.environ and not os.path.isabs(program):
+        raise Refused(f'$RSI_CODEX 必须是绝对路径，现在是 {program!r}。{HOW_TO_SET_CODEX}')
+    found = program if os.path.isabs(program) else shutil.which(program)
+    roots = {os.path.normpath(layout.root), os.path.realpath(layout.root)}
+
+    def outside(path: str) -> bool:
+        return not any(_within(form, root) for form in (os.path.abspath(path), os.path.realpath(path))
+                       for root in roots)
+
+    if not found or not os.path.isfile(found) or not outside(found):
+        raise Refused(f'找不到可用的 Codex 程序（{program!r}）。{HOW_TO_SET_CODEX}')
+    real = os.path.realpath(found)
+    candidates = _shim_targets(real) if _script(real) else [real]
+    for candidate in candidates:
+        if (os.path.isabs(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+                and outside(candidate) and not _script(candidate)):
+            return os.path.realpath(candidate)
+    raise Refused(f'{found} 不是 Codex 的原生程序，也找不到它对应的原生程序。{HOW_TO_SET_CODEX}')
+
+
+def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, codex: str) -> dict:
     """A local tool server started through `codex sandbox` under the run's profile, or its _net variant when the
     server has network. Workspace paths in its command and arguments become absolute paths in this workspace.
-    (load_settings has already left out a server whose paths leave the workspace.)"""
+    (load_settings has already left out a server whose paths leave the workspace.)
+
+    The wrapper itself runs outside the sandbox, so it is the native program with a PATH no agent can write; the
+    Lab's PATH (with env/bin first) is set by /usr/bin/env inside the sandbox."""
     command = server['command']
     if '/' in command and not os.path.isabs(command):
         command = str(workspace / os.path.normpath(command))
@@ -147,8 +206,8 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict) -
         sandbox = ['sandbox', '-P', profile + '_net', '--enable', 'network_proxy']
     else:
         sandbox = ['sandbox', '-P', profile]
-    return {'command': _codex_path(), 'args': [*sandbox, '--', command, *args],
-            'env': {'CODEX_HOME': str(layout.lab_home), 'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout)},
+    return {'command': codex, 'args': [*sandbox, '--', '/usr/bin/env', 'PATH=' + _path(layout), command, *args],
+            'env': {'CODEX_HOME': str(layout.lab_home), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
 
 
@@ -214,7 +273,7 @@ def _local_address(text: str) -> bool:
         return True
     forms = [address] + ([address.ipv4_mapped] if getattr(address, 'ipv4_mapped', None) else [])
     return any(not form.is_global or form.is_loopback or form.is_private or form.is_link_local or form.is_multicast
-               or form.is_reserved or form.is_unspecified for form in forms)
+               or form.is_reserved or form.is_unspecified or getattr(form, 'is_site_local', False) for form in forms)
 
 
 def _url_server_problems(envelope: dict, settings: Settings, resolve) -> dict[str, list[str]]:
@@ -288,8 +347,10 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
         agents[name] = {'description': role['description'],
                         'config_file': str(role_folder(layout, trial=trial) / (name + '.toml'))}
     refused = _url_server_problems(envelope, settings, resolve)
-    servers = {name: dict(server) if 'url' in server else _local_server(layout, workspace, base, server)
-               for name, server in settings.tool_servers.items() if name not in refused}
+    kept = {name: server for name, server in settings.tool_servers.items() if name not in refused}
+    codex = native_codex(layout) if any('url' not in server for server in kept.values()) else None
+    servers = {name: dict(server) if 'url' in server else _local_server(layout, workspace, base, server, codex)
+               for name, server in kept.items()}
     config.update({
         'features': features,
         'shell_environment_policy': _shell(layout, workspace),
@@ -315,8 +376,13 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
         filesystem[home] = 'deny'
     config = {'approval_policy': 'never', 'default_permissions': 'meta'}
     for key in ('model', 'model_reasoning_effort'):
-        if meta_settings.get(key) is not None:
-            config[key] = meta_settings[key]
+        value = meta_settings.get(key)
+        if value is None:
+            continue
+        valid = (isinstance(value, str) and MODEL.fullmatch(value)) if key == 'model' else value in EFFORTS
+        if not valid:
+            raise Refused(f'Meta 的设置里 {key} 不合规：{show(value)}（规则和 Lab 的 settings.toml 相同）')
+        config[key] = value
     config.update({
         'features': {'apps': False, 'plugins': False},
         'web_search': 'live',

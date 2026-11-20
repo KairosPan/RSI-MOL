@@ -1,4 +1,6 @@
+import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -8,9 +10,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rsi.codexrun import codex_program
-from rsi.compose import (lab_config, load_envelope, meta_config, profiles, tool_server_problems, write_home_config,
-                          write_role_files)
+from rsi.codexrun import codex_program, run_codex
+from rsi.compose import (NATIVE_TARGETS, lab_config, load_envelope, meta_config, profiles, tool_server_problems,
+                          write_home_config, write_role_files)
+from rsi.mockmodel import ScriptedModel, run_js, say
 from rsi.paths import Layout, Refused
 from rsi.settings import load_settings
 from rsi.tomlout import render_file, render_flags
@@ -38,6 +41,48 @@ def no_lookup(*args, **kwargs):
 
 
 PUBLIC = resolving_to('93.184.215.14')
+WRAPPER_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
+NATIVE = b'\xcf\xfa\xed\xfe a native program\n'
+
+# A minimal MCP server for the real test: it notes its PATH, whether it could write records/, and every method.
+PROBE_SERVER = r'''
+import json, os, sys
+here = os.path.dirname(os.path.abspath(__file__))
+def note(text):
+    with open(os.path.join(here, 'probe.log'), 'a') as stream:
+        stream.write(text + '\n')
+note('PATH=' + os.environ.get('PATH', ''))
+try:
+    with open(os.path.join(here, '..', '..', '..', 'records', 'x'), 'w') as stream:
+        stream.write('x')
+    note('records: written')
+except OSError:
+    note('records: denied')
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    note('method ' + str(method))
+    if 'id' not in message:
+        continue
+    if method == 'initialize':
+        result = {'protocolVersion': message['params']['protocolVersion'], 'capabilities': {'tools': {}},
+                  'serverInfo': {'name': 'probe', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'rsi_probe_ping', 'description': 'Answers pong.',
+                             'inputSchema': {'type': 'object', 'properties': {}}}]}
+    elif method == 'tools/call':
+        result = {'content': [{'type': 'text', 'text': 'pong'}]}
+    else:
+        result = None
+    answer = {'jsonrpc': '2.0', 'id': message['id']}
+    answer.update({'result': result} if result is not None else {'error': {'code': -32601, 'message': method}})
+    print(json.dumps(answer), flush=True)
+'''
+
+
+def executable(path: Path, content: bytes = NATIVE) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(content); path.chmod(0o755)
+    return path
 
 
 class ComposeTests(unittest.TestCase):
@@ -50,7 +95,11 @@ class ComposeTests(unittest.TestCase):
                          'plugins': {'_default': {'enabled': False}, 'pdf@x': {'enabled': True}},
                          'rsi': {'extra_read': ['/opt/x']}}
         patcher = mock.patch.dict(os.environ); patcher.start(); self.addCleanup(patcher.stop)
-        os.environ.pop('RSI_CODEX', None)
+        self.outside = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.outside, True)
+        self.native = executable(self.outside / 'native' / 'codex')       # a stand-in for Codex's native program
+        os.environ['RSI_CODEX'] = str(self.native)
+        self.lab_path = str(self.layout.env) + '/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 
     def settings(self, text=''):
         (self.layout.work / 'codex').mkdir(parents=True, exist_ok=True)
@@ -82,10 +131,12 @@ class ComposeTests(unittest.TestCase):
                 '[tool_servers.far]\nurl = "https://e/mcp"\n')
         c = lab_config(self.layout, self.envelope, self.settings(text), trial=False, resolve=PUBLIC)
         lit = c['mcp_servers']['lit']
-        self.assertEqual(lit['command'], shutil.which('codex') or 'codex')
+        self.assertEqual(lit['command'], str(self.native))
         self.assertEqual(lit['args'][:6], ['sandbox', '-P', 'lab_net', '--enable', 'network_proxy', '--'])
-        self.assertEqual(lit['args'][6:], ['python3', str(self.layout.work / 'tools/lit/server.py')])
-        self.assertEqual(lit['env']['CODEX_HOME'], str(self.layout.lab_home))
+        self.assertEqual(lit['args'][6:], ['/usr/bin/env', 'PATH=' + self.lab_path, 'python3',
+                                           str(self.layout.work / 'tools/lit/server.py')])
+        self.assertEqual(lit['env'], {'CODEX_HOME': str(self.layout.lab_home), 'TMPDIR': str(self.layout.work / '.tmp'),
+                                      'PATH': WRAPPER_PATH})
         self.assertEqual(c['mcp_servers']['far'], {'url': 'https://e/mcp'})
         self.assertEqual(c['default_permissions'], 'lab')           # commands stay offline
 
@@ -109,6 +160,7 @@ class ComposeTests(unittest.TestCase):
 
     @needs_codex
     def test_the_real_sandbox_accepts_the_flags(self):
+        os.environ.pop('RSI_CODEX', None)
         for d in ('work', 'records', 'codex-home'): (self.layout.root / d).mkdir(exist_ok=True)
         config = lab_config(self.layout, self.envelope, self.settings(), trial=False)
         flags = render_flags({'permissions': config['permissions']})
@@ -157,8 +209,8 @@ class ComposeTests(unittest.TestCase):
         c = lab_config(self.layout, self.envelope, s, trial=True)
         trial = self.layout.trial
         self.assertEqual(c['mcp_servers']['lit']['args'],
-                         ['sandbox', '-P', 'trial', '--', str(trial / 'tools/lit/run'), '-v', 'x.py',
-                          str(trial / 'notes.md')])
+                         ['sandbox', '-P', 'trial', '--', '/usr/bin/env', 'PATH=' + self.lab_path,
+                          str(trial / 'tools/lit/run'), '-v', 'x.py', str(trial / 'notes.md')])
         self.assertEqual(c['mcp_servers']['lit']['env']['TMPDIR'], str(trial / '.tmp'))
         self.assertEqual((c['mcp_servers']['lit']['default_tools_approval_mode'],
                           c['mcp_servers']['lit']['startup_timeout_sec']), ('approve', 30))
@@ -168,20 +220,104 @@ class ComposeTests(unittest.TestCase):
         fs = c['permissions']['trial']['filesystem']
         self.assertEqual((fs[str(trial)], fs[str(trial / '.codex')]), ('write', 'read'))
 
-    def test_the_wrapper_starts_codex_by_absolute_path(self):
-        folder = self.layout.root / 'bin'; folder.mkdir()
-        fake = folder / 'fake-codex'; fake.write_text('#!/bin/sh\n'); fake.chmod(0o755)
-        s = self.settings('[tool_servers.t]\ncommand = "c"\n')
+    def wrapper(self, text='[tool_servers.t]\ncommand = "c"\n'):
+        return lab_config(self.layout, self.envelope, self.settings(text), trial=False, resolve=no_lookup)
 
-        def wrapper():
-            config = lab_config(self.layout, self.envelope, s, trial=False, resolve=no_lookup)
-            return config['mcp_servers']['t']['command']
-        os.environ['RSI_CODEX'] = str(fake)
-        self.assertEqual(wrapper(), str(fake))
-        os.environ['RSI_CODEX'] = 'fake-codex'; os.environ['PATH'] = str(folder) + os.pathsep + os.environ['PATH']
-        self.assertEqual(wrapper(), str(fake))
-        os.environ['RSI_CODEX'] = str(self.layout.root / 'missing-codex')
-        self.assertEqual(wrapper(), str(self.layout.root / 'missing-codex'))
+    def test_the_wrapper_never_runs_from_the_agents_reach(self):
+        planted = self.layout.env / 'bin'
+        executable(planted / 'node', b'#!/bin/sh\necho planted\n'); executable(planted / 'codex')
+        os.environ['PATH'] = str(planted) + os.pathsep + os.environ['PATH']
+        t = self.wrapper()['mcp_servers']['t']
+        root = str(self.layout.root)
+        self.assertEqual(t['command'], str(self.native)); self.assertFalse(t['command'].startswith(root + '/'))
+        self.assertEqual(t['env']['PATH'], WRAPPER_PATH)
+        self.assertFalse([path for path in t['env']['PATH'].split(':') if path.startswith(root)])
+        self.assertEqual(t['args'][t['args'].index('--') + 1:], ['/usr/bin/env', 'PATH=' + self.lab_path, 'c'])
+        link = self.outside / 'link-to-planted'; link.symlink_to(planted / 'codex')
+        for program in (None, str(planted / 'codex'), str(link)):
+            if program is None:
+                os.environ.pop('RSI_CODEX')                          # found on PATH, in the agents' env/bin
+            else:
+                os.environ['RSI_CODEX'] = program
+            with self.assertRaises(Refused, msg=program):
+                self.wrapper()
+
+    def test_codex_must_be_an_absolute_native_program(self):
+        for program in ('codex', 'bin/codex', '', str(self.outside / 'missing')):
+            os.environ['RSI_CODEX'] = program
+            with self.assertRaises(Refused, msg=program) as refusal:
+                self.wrapper()
+            self.assertIn('RSI_CODEX', str(refusal.exception))
+        plain = executable(self.outside / 'plain'); plain.chmod(0o644)    # not executable
+        os.environ['RSI_CODEX'] = str(plain)
+        with self.assertRaises(Refused):
+            self.wrapper()
+        os.environ['RSI_CODEX'] = str(executable(self.outside / 'script', b'#!/bin/sh\nexec true\n'))
+        with self.assertRaises(Refused):
+            self.wrapper()
+        os.environ['RSI_CODEX'] = 'relative-but-no-local-server'
+        self.assertEqual(self.wrapper('')['mcp_servers'], {})
+
+    def test_an_npm_shim_is_followed_to_its_native_program(self):
+        package = self.outside / 'lib/node_modules/@openai/codex'
+        (package / 'package.json').parent.mkdir(parents=True)
+        (package / 'package.json').write_text(json.dumps({'name': '@openai/codex', 'version': '0.170.0'}))
+        shim = executable(package / 'bin/codex.js', b'#!/usr/bin/env node\n')
+        link = self.outside / 'bin/codex'; link.parent.mkdir(); link.symlink_to(shim)
+        os.environ['RSI_CODEX'] = str(link)
+        with self.assertRaises(Refused) as refusal:                       # a shim without its native program
+            self.wrapper()
+        self.assertIn('RSI_CODEX', str(refusal.exception))
+        target = NATIVE_TARGETS.get((platform.system(), platform.machine()))
+        if target is None:
+            self.skipTest('no npm platform package is known for this machine')
+        native = executable(package / 'node_modules/@openai' / target[0] / 'vendor' / target[1] / 'bin/codex')
+        self.assertEqual(self.wrapper()['mcp_servers']['t']['command'], str(native))
+        (package / 'package.json').write_text(json.dumps({'name': 'something-else'}))
+        with self.assertRaises(Refused):
+            self.wrapper()
+
+    @needs_codex
+    def test_the_installed_codex_resolves_to_its_native_program(self):
+        os.environ.pop('RSI_CODEX')
+        command = self.wrapper()['mcp_servers']['t']['command']
+        self.assertTrue(os.path.isabs(command) and os.access(command, os.X_OK), command)
+        with open(command, 'rb') as stream:
+            self.assertNotEqual(stream.read(2), b'#!')
+        home = self.layout.root / 'version-home'; home.mkdir()
+        versions = [subprocess.run([program, '--version'], capture_output=True, text=True, timeout=60,
+                                   env={**os.environ, 'CODEX_HOME': str(home)}).stdout.strip()
+                    for program in (command, shutil.which('codex'))]
+        self.assertEqual(versions[0], versions[1]); self.assertTrue(versions[0].startswith('codex-cli '), versions)
+
+    @needs_codex
+    def test_a_local_tool_server_starts_and_answers_through_the_wrapper(self):
+        os.environ.pop('RSI_CODEX')
+        for folder in (self.layout.records, self.layout.env / 'bin', self.layout.work / '.tmp',
+                       self.layout.work / 'tools' / 'probe'):
+            folder.mkdir(parents=True, exist_ok=True)
+        (self.layout.work / 'tools/probe/server.py').write_text(PROBE_SERVER)
+        envelope = dict(self.envelope, features={'apps': False, 'plugins': False}, apps={}, plugins={})
+        s = self.settings('[tool_servers.probe]\ncommand = "python3"\nargs = ["tools/probe/server.py"]\n')
+        write_home_config(self.layout, envelope, s, resolve=no_lookup)   # the wrapper reads its profile from here
+        model = ScriptedModel(); os.environ['RSI_TEST_MODEL_ENDPOINT'] = model.start(); self.addCleanup(model.stop)
+        model.push(run_js('text(JSON.stringify(await tools.mcp__probe__rsi_probe_ping({})));\n'), say('done'))
+        result = run_codex(home=self.layout.lab_home, cwd=self.layout.work, prompt='go', timeout=120,
+                           config=lab_config(self.layout, envelope, s, trial=False, resolve=no_lookup),
+                           record_dir=self.layout.root / 'call')
+        stderr = (self.layout.root / 'call' / 'stderr.txt').read_text(errors='replace')
+        self.assertEqual(result.status, 'finished', stderr[-3000:])
+        log = (self.layout.work / 'tools/probe/probe.log').read_text()
+        self.assertIn('PATH=' + self.lab_path + '\n', log)
+        self.assertIn('records: denied', log); self.assertFalse((self.layout.records / 'x').exists())
+        self.assertIn('method initialize', log); self.assertIn('method tools/list', log)
+        self.assertIn('mcp__probe', json.dumps(model.requests[0]))        # listed as a deferred tool namespace
+        self.assertIn('method tools/call', log); self.assertIn('pong', ' '.join(model.tool_outputs()))
+
+    def test_meta_settings_are_checked(self):
+        for bad in ({'model': 'two words'}, {'model': 3}, {'model_reasoning_effort': 'loud'}):
+            with self.assertRaises(Refused, msg=bad):
+                meta_config(self.layout, self.envelope, bad)
 
     def test_disabling_twice_reports_once(self):
         s = self.settings('[disable]\nplugins = ["nope"]\n')
@@ -286,6 +422,7 @@ class ComposeTests(unittest.TestCase):
         s = self.settings('[tool_servers.far]\nurl = "https://e:8443/mcp"\n[tool_servers.near]\ncommand = "c"\n')
         cases = {'127.0.0.1': True, '10.0.0.5': True, '169.254.169.254': True, '::1': True, '::ffff:127.0.0.1': True,
                  '192.168.1.2': True, '100.64.0.1': True, '224.0.0.1': True, '0.0.0.0': True, 'fe80::1%en0': True,
+                 'fec0::1': True,
                  '93.184.215.14': False, '2606:4700::1111': False}
         for address, refused in cases.items():
             resolve = resolving_to(address)
@@ -320,6 +457,7 @@ class ComposeTests(unittest.TestCase):
 
     @needs_codex
     def test_the_real_codex_accepts_whole_configurations(self):
+        os.environ.pop('RSI_CODEX', None)
         (self.layout.work / 'codex' / 'agents').mkdir(parents=True)
         (self.layout.work / 'codex' / 'agents' / 'literature.toml').write_text(LITERATURE)
         s = self.settings('model = "m"\nmodel_reasoning_effort = "low"\nweb_search = "live"\nnetwork = true\n'

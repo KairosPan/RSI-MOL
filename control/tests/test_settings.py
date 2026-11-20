@@ -141,6 +141,17 @@ class SettingsTests(unittest.TestCase):
         w = self.ws(); (w / 'codex').write_text('')
         self.assertTrue(load_settings(w).problems)
 
+    def test_deep_nesting_is_a_problem(self):
+        for value in ('[' * 5000 + ']' * 5000, '{a = ' * 5000 + '1' + '}' * 5000):
+            s = load_settings(self.ws('model = ' + value + '\n'))
+            self.assertEqual(s.model, None)
+            self.assertTrue(any('settings.toml' in p for p in s.problems), s.problems)
+            s = load_settings(self.ws('', {'literature': GOOD_ROLE + 'model = ' + value + '\n'}))
+            self.assertEqual(s.roles, {})
+            self.assertTrue(any('literature.toml' in p for p in s.problems), s.problems)
+        s = load_settings(self.ws('[tool_servers.t]\nurl = ' + '[' * 200 + ']' * 200 + '\n'))
+        self.assertTrue(any('<list>' in p for p in s.problems), s.problems)
+
     def test_a_fifo_does_not_hang(self):
         w = self.ws(); (w / 'codex').mkdir(); os.mkfifo(w / 'codex' / 'settings.toml')
         result = []

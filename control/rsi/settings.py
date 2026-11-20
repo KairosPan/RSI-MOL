@@ -54,11 +54,13 @@ class Settings:
 
 
 def show(value) -> str:
-    """value for a one-line message: plain names as they are, anything else quoted, escaped and cut short."""
-    text = value if isinstance(value, str) else repr(value)
-    if PLAIN.fullmatch(text):
-        return text
-    quoted = repr(text)
+    """value for a one-line message: plain names as they are, other text quoted, escaped and cut short; for
+    anything that is not text only its type (a repr could be huge or recurse too deep)."""
+    if not isinstance(value, str):
+        return f'<{type(value).__name__}>'
+    if PLAIN.fullmatch(value):
+        return value
+    quoted = repr(value)
     return quoted if len(quoted) <= 80 else quoted[:77] + '...'
 
 
@@ -95,11 +97,16 @@ def _read_table(path: Path, label: str, problems: list[str]) -> dict | None:
         problems.append(f'{label}：超过 {MAX_BYTES} 字节，按不存在处理')
         return None
     try:
-        return tomllib.loads(b''.join(chunks).decode('utf-8'))
+        text = b''.join(chunks).decode('utf-8')
     except UnicodeDecodeError:
         problems.append(f'{label}：不是 UTF-8 文本，按不存在处理')
+        return None
+    try:
+        return tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         problems.append(f'{label}：不是合法的 TOML（{" ".join(str(error).split())}），按不存在处理')
+    except Exception as error:  # e.g. RecursionError on deeply nested arrays or tables: still only a problem
+        problems.append(f'{label}：解析失败（{type(error).__name__}，可能嵌套太深），按不存在处理')
     return None
 
 
