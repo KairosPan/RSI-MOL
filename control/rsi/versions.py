@@ -1,9 +1,10 @@
 """Versions of the Lab workspace, kept in one git store outside the folders it versions.
 
-The store is a bare repository serving several folders (work/, trial/, meta/candidate/). Every git call that touches
-a folder sets GIT_WORK_TREE to it and GIT_INDEX_FILE to that folder's own index inside the store, so no folder ever
-gets a `.git` entry. Versions are commits on refs/heads/main, each tagged V0001, V0002, ...; a snapshot is a commit
-on refs/rounds/<round> whose parent is the head of main.
+The store is a bare repository serving several folders: staged and sealed copies of work/ and trial/ (the control
+program never runs git on a folder an agent can still write), and meta/candidate/. Every git call that touches a
+folder sets GIT_WORK_TREE to it and GIT_INDEX_FILE to that folder's own index inside the store, so no folder ever
+gets a `.git` entry; the index is removed again once the call is done. Versions are commits on refs/heads/main,
+each tagged V0001, V0002, ...; a snapshot is a commit on refs/rounds/<round> whose parent is the head of main.
 
 Agents write the folders, so their content is untrusted: git reads no configuration, hooks, ignore rules or
 attributes from them or from the owner's git setup, content is stored byte for byte, and no name reaches a git
@@ -125,9 +126,28 @@ class VersionStore:
         """
         commit = self.resolve(name)
         folder = self._folder(folder)
-        self._index(folder).unlink(missing_ok=True)
-        self._git('clean', '-q', '-ffdx', *(f'--exclude={pattern}' for pattern in self._ignore), folder=folder)
-        self._git('read-tree', '--reset', '-u', commit, folder=folder)
+        index = self._index(folder)
+        index.unlink(missing_ok=True)
+        try:
+            self._git('clean', '-q', '-ffdx', *(f'--exclude={pattern}' for pattern in self._ignore), folder=folder)
+            self._git('read-tree', '--reset', '-u', commit, folder=folder)
+        finally:
+            index.unlink(missing_ok=True)
+
+    def check_writable(self) -> None:
+        """RuntimeError (or a git time-out) unless a new version could be recorded now: main and the next version's
+        tag can be locked (a ref transaction that is prepared and then aborted, so nothing changes; a stale
+        `main.lock` fails it), and the object and index folders are writable."""
+        main = self._main()
+        if main is None:
+            raise RuntimeError('版本库里还没有任何版本')
+        names = self._versions()
+        tag = f'V{int(names[-1][1:]) + 1:04d}' if names else 'V0001'
+        self._git('update-ref', '--stdin',
+                  stdin=f'start\nverify {MAIN} {main}\ncreate refs/tags/{tag} {main}\nprepare\nabort\n'.encode())
+        for folder in ('objects', 'indexes'):
+            if not os.access(self.git_dir / folder, os.W_OK):
+                raise RuntimeError(f'{self.git_dir / folder} 不可写')
 
     def diff(self, old: str, new: str, limit: int = 1_000_000) -> str:
         """`git diff` from one version or commit to another, cut after `limit` bytes of output (with a note)."""
@@ -183,10 +203,14 @@ class VersionStore:
         """
         folder = self._folder(folder)
         self._refuse_git_entries(folder)
-        self._index(folder).unlink(missing_ok=True)
-        self._git('add', '--all', '--force', '--', '.',
-                  *(f':(top,exclude,icase){name}' for name in self._excluded), folder=folder)
-        return self._out('write-tree', folder=folder)
+        index = self._index(folder)
+        index.unlink(missing_ok=True)
+        try:
+            self._git('add', '--all', '--force', '--', '.',
+                      *(f':(top,exclude,icase){name}' for name in self._excluded), folder=folder)
+            return self._out('write-tree', folder=folder)
+        finally:
+            index.unlink(missing_ok=True)
 
     def _folder(self, folder: Path) -> Path:
         """The folder, absolute and resolved; ValueError unless it is a real folder apart from the store.

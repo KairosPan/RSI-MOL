@@ -20,6 +20,7 @@ class Paths(unittest.TestCase):
         self.assertEqual(layout.versions, Path('/x/versions/lab.git'))
         self.assertEqual(layout.lab_home, Path('/x/codex-home'))
         self.assertEqual(layout.meta_home, Path('/x/codex-home-meta'))
+        self.assertEqual((layout.staging, layout.sealed), (Path('/x/staging'), Path('/x/sealed')))
 
     def test_safe_id(self):
         self.assertEqual(safe_id('grid-1', 'task'), 'grid-1')

@@ -1,11 +1,11 @@
-"""The owner's tasks (`tasks/<id>/`), their check scripts, and what the control program does in a workspace.
+"""The owner's tasks (`tasks/<id>/`), their check scripts, their inputs and their collected results.
 
-A task is `tasks/<id>/task.md` with four `## ` sections (design §5.4), optionally `input/` (copied to the workspace's
-`in/<id>/` before a run) and `check.py` (run on the collected results afterwards). Only the owner writes `tasks/`.
+A task is `tasks/<id>/task.md` with four `## ` sections (design §5.4), optionally `input/` (copied to the staged
+workspace's `in/<id>/` before a run) and `check.py` (run on the collected results afterwards). Only the owner writes
+`tasks/`.
 
-The Lab writes the workspace and the control program runs outside every sandbox, so the workspace's `in/` and
-`out/` are handled through rsi.workspace, without ever following a link. Collected results keep only regular files
-(copied by content) and folders, within a budget.
+Results are collected from a sealed workspace (rsi.workspace), never from one an agent can still write, and without
+ever following a link: they keep only regular files (copied by content) and folders, within a budget.
 """
 import os
 import re
@@ -21,7 +21,7 @@ from pathlib import Path
 
 from rsi.paths import safe_id
 from rsi.settings import show
-from rsi.workspace import MAX_DEPTH, Lines, clear, close, grant, kind, open_folder, remove, top_folder
+from rsi.workspace import MAX_DEPTH, Lines, close, grant, kind, open_folder, open_unlocked
 
 SECTIONS = ('目标', '输入', '要求', '完成判据')
 TASK_FILE, CHECK_FILE, INPUT_FOLDER = 'task.md', 'check.py', 'input'
@@ -182,41 +182,11 @@ def run_check(task: Task, out: Path, timeout: float = 60) -> dict | None:
 
 # The task's inputs.
 
-def _copy_into(source: Path, folder_fd: int, name: str, depth: int = 1) -> None:
-    """Copy the owner's folder `source` as the new folder `name` of the open folder: folders made with
-    mkdir(dir_fd), files written with O_EXCL|O_NOFOLLOW, links made again as links. Nothing is opened by a path the
-    Lab could redirect, so even an `in` swapped for a link meanwhile is never written through."""
-    os.mkdir(name, dir_fd=folder_fd)
-    fd = open_folder(name, folder_fd)
-    try:
-        for entry in sorted(os.scandir(source), key=lambda entry: entry.name):
-            if entry.is_symlink():
-                os.symlink(os.readlink(entry.path), entry.name, dir_fd=fd)
-            elif entry.is_dir(follow_symlinks=False):
-                if depth < MAX_DEPTH:
-                    _copy_into(Path(entry.path), fd, entry.name, depth + 1)
-            elif entry.is_file(follow_symlinks=False):
-                with open(entry.path, 'rb') as stream:
-                    target = os.open(entry.name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                                     stat.S_IMODE(entry.stat(follow_symlinks=False).st_mode) | 0o600, dir_fd=fd)
-                    with os.fdopen(target, 'wb') as copy:
-                        shutil.copyfileobj(stream, copy, 1 << 20)
-    finally:
-        os.close(fd)
-
-
-def place_inputs(task: Task, workspace: Path) -> list[str]:
-    """Copy tasks/<id>/input/ to <workspace>/in/<id>/ (links copied as links, the owner's), through fds only; a
-    leftover in/<id> is removed first. Returns the problems (an `in` that was a link or not a folder, replaced)."""
-    problems = clear(workspace, 'in', task.id)
-    if task.inputs is None:
-        return problems
-    workspace_fd, in_fd = top_folder(workspace, 'in', problems, create=True)
-    try:
-        _copy_into(task.inputs, in_fd, task.id)
-    finally:
-        close(in_fd, workspace_fd)
-    return problems
+def place_inputs(task: Task, workspace: Path) -> None:
+    """Copy tasks/<id>/input/ (when the task has one) to <workspace>/in/<id>/. The workspace is a staging folder,
+    which only the control program writes; links are copied as links (they are the owner's)."""
+    if task.inputs is not None:
+        shutil.copytree(task.inputs, Path(workspace) / 'in' / task.id, symlinks=True)
 
 
 # Collected results: regular files and folders only, within a budget.
@@ -224,7 +194,7 @@ def place_inputs(task: Task, workspace: Path) -> list[str]:
 KIND_NAMES = {stat.S_IFLNK: '符号链接', stat.S_IFIFO: '命名管道', stat.S_IFSOCK: '套接字', stat.S_IFCHR: '字符设备',
               stat.S_IFBLK: '块设备'}
 MAX_RESULT_BYTES = 1 << 30      # bytes collected from one out/<id>/, by st_size, checked before each file
-MAX_RESULT_FILES = 5000         # files collected from one out/<id>/
+MAX_RESULT_ENTRIES = 5000       # files and folders collected from one out/<id>/
 
 
 def _kind_name(mode: int) -> str:
@@ -233,13 +203,21 @@ def _kind_name(mode: int) -> str:
 
 class _Budget:
     def __init__(self) -> None:
-        self.bytes, self.files = 0, 0
+        self.bytes, self.entries = 0, 0
+
+    def full(self, where: str, lines: Lines) -> bool:
+        """Whether no further file or folder may be collected (then a line says so); else it is counted."""
+        if self.entries >= MAX_RESULT_ENTRIES:
+            lines.add(f'{where} 超出收取上限（最多 {MAX_RESULT_ENTRIES} 个文件和文件夹），没有收进记录')
+            return True
+        self.entries += 1
+        return False
 
 
 def _copy_file(name: str, dir_fd: int, target: Path, size: int) -> str | None:
     """Copy at most `size` bytes of the regular file `name` of an open folder, by content, to the new file target
-    (so the record never shares an inode with a file the Lab can still write). None, or the kind of thing it turned
-    out to be when it is not a regular file."""
+    (so the record never shares an inode with a file the Lab wrote). None, or the kind of thing it turned out to be
+    when it is not a regular file."""
     fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
     with os.fdopen(fd, 'rb') as source:
         info = os.fstat(source.fileno())
@@ -261,19 +239,17 @@ def _copy_file(name: str, dir_fd: int, target: Path, size: int) -> str | None:
 
 def _collect_file(name: str, folder_fd: int, info: os.stat_result, target: Path, where: str, lines: Lines,
                   budget: _Budget) -> None:
-    if budget.files >= MAX_RESULT_FILES:
-        lines.add(f'{where} 超出收取上限（最多 {MAX_RESULT_FILES} 个文件），没有收进记录，已从工作区删掉')
-    elif budget.bytes + info.st_size > MAX_RESULT_BYTES:
-        lines.add(f'{where} 有 {info.st_size} 字节，超出收取上限（共 {MAX_RESULT_BYTES} 字节），没有收进记录，'
-                  '已从工作区删掉')
+    if budget.bytes + info.st_size > MAX_RESULT_BYTES:
+        lines.add(f'{where} 有 {info.st_size} 字节，超出收取上限（共 {MAX_RESULT_BYTES} 字节），没有收进记录')
+    elif budget.full(where, lines):
+        return
     elif not grant(name, folder_fd, info, stat.S_IRUSR):
-        lines.add(f'{where} 读不了，又有别的硬链接（不改它的权限），没有收进记录，已从工作区删掉')
+        lines.add(f'{where} 读不了，又有别的硬链接（不改它的权限），没有收进记录')
     else:
         other = _copy_file(name, folder_fd, target, info.st_size)
         if other is not None:
-            lines.add(f'{where} 是{other}，没有收进记录，已从工作区删掉')
+            lines.add(f'{where} 是{other}，没有收进记录')
         else:
-            budget.files += 1
             budget.bytes += info.st_size
 
 
@@ -287,7 +263,9 @@ def _copy_folder(folder_fd: int, dest: Path, label: str, lines: Lines, budget: _
             info = os.stat(name, dir_fd=folder_fd, follow_symlinks=False)
             if stat.S_ISDIR(info.st_mode):
                 if depth >= MAX_DEPTH:
-                    lines.add(f'{where} 在第 {MAX_DEPTH} 层以下，没有收进记录，已从工作区删掉')
+                    lines.add(f'{where} 在第 {MAX_DEPTH} 层以下，没有收进记录')
+                    continue
+                if budget.full(where, lines):
                     continue
                 grant(name, folder_fd, info, stat.S_IRWXU)
                 child = open_folder(name, folder_fd)
@@ -299,51 +277,52 @@ def _copy_folder(folder_fd: int, dest: Path, label: str, lines: Lines, budget: _
             elif stat.S_ISREG(info.st_mode):
                 _collect_file(name, folder_fd, info, dest / name, where, lines, budget)
             else:
-                lines.add(f'{where} 是{_kind_name(info.st_mode)}，没有收进记录，已从工作区删掉')
+                lines.add(f'{where} 是{_kind_name(info.st_mode)}，没有收进记录')
         except OSError as error:
             lines.add(f'{where} 读不了（{error.strerror or error}），没有收进记录')
 
 
+def _results_folder(parent_fd: int, name: str, label: str, problems: list[str]) -> int | None:
+    """An fd of the folder `name` of an open folder, given owner rwx; None (with a problem line if something else
+    is there) when it is missing, a link or not a folder."""
+    found = kind(name, parent_fd)
+    if found is None:
+        return None
+    if found != 'folder':
+        problems.append(f'{label} {"是符号链接" if found == "link" else "不是文件夹"}，没有收进记录')
+        return None
+    grant(name, parent_fd, os.stat(name, dir_fd=parent_fd, follow_symlinks=False), stat.S_IRWXU)
+    return open_folder(name, parent_fd)
+
+
 def collect_out(workspace: Path, task_id: str, dest: Path) -> list[str]:
-    """Take <workspace>/out/<task_id>/ out of the workspace into dest, and return the problems (Chinese lines).
+    """Copy out/<task_id>/ of a sealed workspace into dest, and return the problems (Chinese lines).
 
     The record holds only regular files (copied by content) and folders: the owner's check script runs outside
     every sandbox and would follow a link. Every link, FIFO, socket or device under out/<task_id>/ is left out, and
-    so is whatever goes past MAX_DEPTH levels, MAX_RESULT_FILES files or MAX_RESULT_BYTES bytes (by st_size): one
-    problem line each, capped. An `out` or `out/<task_id>` that is itself a link, or not a folder, is not collected.
-    Nothing is ever followed through a link; afterwards out/<task_id> is removed from the workspace (and `out` too
-    if it is left empty). dest must not exist; it is always created, empty when there was nothing to collect, so a
-    check script always gets a folder.
+    so is whatever goes past MAX_DEPTH levels, MAX_RESULT_ENTRIES files and folders or MAX_RESULT_BYTES bytes (by
+    st_size): one problem line each, capped. An `out` or `out/<task_id>` that is itself a link, or not a folder, is
+    not collected. Nothing is followed through a link, and nothing in the workspace is removed (a sealed workspace
+    is removed or kept as a whole). dest must not exist; it is always created, empty when there was nothing to
+    collect, so a check script always gets a folder.
     """
     safe_id(task_id, '任务编号')
     dest = Path(dest)
     if os.path.lexists(dest):
         raise FileExistsError(f'{dest} already exists')
     dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.mkdir()
     problems = []
-    workspace_fd, out_fd = top_folder(workspace, 'out', problems, create=False)
+    workspace_fd = open_unlocked(str(workspace), None, str(workspace))
+    out_fd = results_fd = None
     try:
-        dest.mkdir()
-        found = None if out_fd is None else kind(task_id, out_fd)
-        if found == 'folder':
-            grant(task_id, out_fd, os.stat(task_id, dir_fd=out_fd, follow_symlinks=False), stat.S_IRWXU)
+        out_fd = _results_folder(workspace_fd, 'out', 'out', problems)
+        if out_fd is not None:
+            results_fd = _results_folder(out_fd, task_id, f'out/{task_id}', problems)
+        if results_fd is not None:
             lines = Lines()
-            results_fd = open_folder(task_id, out_fd)
-            try:
-                _copy_folder(results_fd, dest, f'out/{task_id}', lines, _Budget(), 1)
-            finally:
-                os.close(results_fd)
+            _copy_folder(results_fd, dest, f'out/{task_id}', lines, _Budget(), 1)
             problems += lines.done()
-            try:
-                remove(task_id, out_fd)
-            except OSError as error:
-                problems.append(f'out/{task_id} 已收进记录，但没能从工作区删掉：{error}')
-        elif found is not None:
-            what = '是符号链接' if found == 'link' else '不是文件夹'
-            problems.append(f'out/{task_id} {what}，没有收进记录，已从工作区删掉')
-            os.unlink(task_id, dir_fd=out_fd)
-        if out_fd is not None and not os.listdir(out_fd):
-            os.rmdir('out', dir_fd=workspace_fd)
     finally:
-        close(out_fd, workspace_fd)
+        close(results_fd, out_fd, workspace_fd)
     return problems

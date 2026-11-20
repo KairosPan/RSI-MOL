@@ -60,6 +60,16 @@ class Layout:
         return self.root / 'env'
 
     @property
+    def staging(self) -> Path:
+        """Where the next work/ or trial/ is built before it is renamed into place; no agent profile grants it."""
+        return self.root / 'staging'
+
+    @property
+    def sealed(self) -> Path:
+        """Where sealed workspaces that could not be versioned whole are kept; no agent profile grants it."""
+        return self.root / 'sealed'
+
+    @property
     def versions(self) -> Path:
         return self.root / 'versions' / 'lab.git'
 

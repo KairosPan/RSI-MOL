@@ -10,4 +10,6 @@ versions/
 .rsi.lock
 .superpowers/
 __pycache__/
-quarantine/
+staging/
+sealed/
+.sealed-*

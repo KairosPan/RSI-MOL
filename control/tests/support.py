@@ -1,6 +1,7 @@
 """Helpers shared by the tests: a skip for machines without Codex, a confined config, and a temporary RSI root."""
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from rsi.mockmodel import ScriptedModel
 from rsi.paths import Layout
 from rsi.records import Records
 from rsi.versions import VersionStore
+from rsi.workspace import clear_acl, raise_open_files_limit
 
 needs_codex = unittest.skipUnless(shutil.which(os.environ.get('RSI_CODEX', 'codex')), 'Codex is not on the path')
 
@@ -39,18 +41,22 @@ def scratch_config(root: Path, workspace: Path) -> dict:
 
 
 def force_remove(path: Path) -> None:
-    """Remove a test folder whatever the test left in it: flags, folders with mode 000 (links are not followed)."""
+    """Remove a test folder whatever the test left in it: flags, ACLs, folders with mode 000 (links are not
+    followed)."""
     def unlock(entry: str) -> None:
         try:
             os.chflags(entry, 0, follow_symlinks=False)
         except (AttributeError, NotImplementedError, OSError):
             pass
         if not os.path.islink(entry):
+            if not clear_acl(entry) and os.path.exists('/bin/chmod'):         # an ACL that also denies reading it
+                subprocess.run(['/bin/chmod', '-N', entry], capture_output=True)
             try:
                 os.chmod(entry, 0o700)
             except OSError:
                 pass
 
+    raise_open_files_limit()        # a test may have lowered it, and rmtree holds a descriptor per level
     unlock(str(path))
     for top, folders, files in os.walk(path):
         for name in folders + files:

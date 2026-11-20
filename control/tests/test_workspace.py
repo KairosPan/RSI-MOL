@@ -1,19 +1,21 @@
 import os
 import resource
-import time
-import unittest
-from unittest import mock
-
 import stat
 import subprocess
 import sys
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
 
 from rsi import workspace
-from rsi.workspace import (clear, empty_folder, prepare_for_commit, quarantine, raise_open_files_limit, real_folder,
-                           remove)
+from rsi.workspace import (free_name, keep, open_folder, prepare_for_commit, raise_open_files_limit, remove, seal)
 from tests.support import Root
 
 DEPTH = 300
+DENY_ALL = ('write,delete,add_subdirectory,add_file,delete_child,writeattr,writeextattr,writesecurity,readsecurity,'
+            'list,search')
+macos = unittest.skipUnless(sys.platform == 'darwin', 'macOS flags and ACLs')
 
 
 def few_open_files(test: unittest.TestCase) -> None:
@@ -23,63 +25,130 @@ def few_open_files(test: unittest.TestCase) -> None:
     test.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
 
 
-class ControlFolders(unittest.TestCase):
-    def test_control_folders_are_made_real(self):
-        with Root() as root:
-            work, outside = root.layout.work, root.layout.root / 'outside'
-            outside.mkdir(); (outside / 'x').write_text('x')
-            os.symlink(outside, work / '.tmp')
-            self.assertEqual(len(real_folder(work, '.tmp')), 1)
-            self.assertTrue((work / '.tmp').is_dir()); self.assertFalse((work / '.tmp').is_symlink())
-            self.assertEqual(os.listdir(outside), ['x']); self.assertEqual(real_folder(work, '.tmp'), [])
-            (work / '.tmp' / 'y').write_text('kept')                            # a real folder is left as it is
-            (work / '.tmp').chmod(0)                                            # ... and opened again for the owner
-            self.assertEqual(real_folder(work, '.tmp'), []); self.assertTrue((work / '.tmp' / 'y').is_file())
+def deny(path: Path, rights: str) -> None:
+    subprocess.run(['/bin/chmod', '+a', f'{os.environ["USER"]} deny {rights}', str(path)], check=True)
 
+
+def prepare(root: Root, tree: Path) -> tuple[list[str], int]:
+    return prepare_for_commit(tree, root.layout.sealed / 'L' / 'left-out', 'sealed/L/left-out')
+
+
+def removed(test: unittest.TestCase, parent: Path, name: str) -> None:
+    fd = open_folder(parent)
+    try:
+        remove(name, fd, str(parent / name))
+    finally:
+        os.close(fd)
+    test.assertFalse(os.path.lexists(parent / name))
+
+
+class Seal(unittest.TestCase):
+    def test_any_entry_is_sealed_by_one_rename_in_the_root(self):
+        with Root() as root:
+            fd = open_folder(root.layout.root); self.addCleanup(os.close, fd)
+            outside = root.layout.root / 'outside'; outside.mkdir(); (outside / 'x').write_text('x')
+            work = root.layout.work
+            self.assertEqual(seal(fd, 'work', 'a'), '.sealed-work-a')               # a folder
+            self.assertEqual((root.layout.root / '.sealed-work-a' / 'AGENTS.md').read_text(), 'hello\n')
+            self.assertIsNone(seal(fd, 'work', 'b'))                                 # nothing there
+            os.symlink(outside, work); self.assertEqual(seal(fd, 'work', 'c'), '.sealed-work-c')   # a link
+            self.assertTrue((root.layout.root / '.sealed-work-c').is_symlink())
+            self.assertEqual(os.listdir(outside), ['x'])
+            work.mkdir(); (work / 'f').write_text('f'); work.chmod(0)                # mode 000
+            self.assertEqual(seal(fd, 'work', 'd'), '.sealed-work-d')
+            work.write_text('a file'); self.assertEqual(seal(fd, 'work', 'e'), '.sealed-work-e')
+            work.mkdir()
+            with self.assertRaises(FileExistsError): seal(fd, 'work', 'a')           # never over an earlier seal
+            self.assertTrue(work.is_dir())
+
+    @macos
+    def test_acls_and_flags_on_the_entry(self):
+        with Root() as root:
+            fd = open_folder(root.layout.root); self.addCleanup(os.close, fd)
+            work = root.layout.work; deny(work, 'list,search')
+            self.assertEqual(seal(fd, 'work', 'a'), '.sealed-work-a')                # a deny-search ACL: sealed
+            work.mkdir(); os.chflags(work, stat.UF_IMMUTABLE)
+            with self.assertRaises(PermissionError): seal(fd, 'work', 'b')           # an error, never a loop
+            os.chflags(work, 0); deny(work, 'delete')
+            with self.assertRaises(PermissionError): seal(fd, 'work', 'c')
+
+    def test_keep_moves_any_sealed_entry_aside(self):
+        with Root() as root:
+            fd = open_folder(root.layout.root); self.addCleanup(os.close, fd)
+            outside = root.layout.root / 'outside'; outside.mkdir()
+            (root.layout.work / 'f').write_text('f'); root.layout.work.chmod(0)
+            entry = seal(fd, 'work', 'a'); path = str(root.layout.root / entry)
+            keep(fd, entry, path, root.layout.sealed / 'a' / 'work')
+            self.assertEqual((root.layout.sealed / 'a' / 'work' / 'f').read_text(), 'f')
+            os.symlink(outside, root.layout.work); entry = seal(fd, 'work', 'b')
+            keep(fd, entry, str(root.layout.root / entry), root.layout.sealed / 'b' / 'work')
+            self.assertTrue((root.layout.sealed / 'b' / 'work').is_symlink()); self.assertEqual(os.listdir(outside), [])
+
+
+class Removal(unittest.TestCase):
     def test_deep_trees_are_removed_with_few_open_files(self):
         few_open_files(self)
         with Root() as root:
-            deep = root.layout.trial / ('a/' * DEPTH); deep.mkdir(parents=True); (deep / 'f').write_text('f')
-            (root.layout.trial / 'a' / 'a').chmod(0)
-            empty_folder(root.layout.trial)
-            self.assertEqual(os.listdir(root.layout.trial), [])
-            (root.layout.work / ('b/' * DEPTH)).mkdir(parents=True)
-            fd = workspace.open_folder(root.layout.work)
-            try:
-                remove('b', fd)
-            finally:
-                os.close(fd)
-            self.assertFalse(os.path.lexists(root.layout.work / 'b'))
+            tree = root.layout.root / '.sealed-trial-a'
+            deep = tree / ('a/' * DEPTH); deep.mkdir(parents=True); (deep / 'f').write_text('f')
+            (tree / 'a' / 'a').chmod(0)
+            removed(self, root.layout.root, '.sealed-trial-a')
 
-    def test_open_files_limit_is_raised(self):
-        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
-        raise_open_files_limit()
-        self.assertGreater(resource.getrlimit(resource.RLIMIT_NOFILE)[0], 256)
+    def test_links_are_removed_not_followed(self):
+        with Root() as root:
+            outside = root.layout.root / 'outside'; outside.mkdir(); (outside / 'x').write_text('x')
+            tree = root.layout.root / 'tree'; tree.mkdir(); os.symlink(outside, tree / 'in')
+            removed(self, root.layout.root, 'tree'); self.assertEqual(os.listdir(outside), ['x'])
+
+    def test_a_thousand_taken_names_do_not_stop_a_removal(self):
+        with Root() as root:
+            tree = root.layout.root / 'tree'                       # '-' sorts before '.': the chain is emptied first
+            (tree / '-chain' / ('a/' * workspace.MAX_DEPTH)).mkdir(parents=True)
+            for number in range(1, 1001):
+                (tree / ('.rsi-deep' if number == 1 else f'.rsi-deep-{number}')).write_text('taken')
+            removed(self, root.layout.root, 'tree')
+
+    def test_every_loop_has_a_cap(self):
+        with Root() as root:
+            tree = root.layout.root / 'tree'; (tree / ('a/' * (2 * workspace.MAX_DEPTH + 1))).mkdir(parents=True)
+            fd = open_folder(root.layout.root); self.addCleanup(os.close, fd)
+            with mock.patch.object(workspace, 'MAX_PASSES', 1):
+                with self.assertRaises(OSError): remove('tree', fd, str(tree))
+            for name in ['x'] + [f'x-{number}' for number in range(2, 70)]:
+                (root.layout.root / name).write_text('taken')
+            with mock.patch.object(workspace.secrets, 'token_hex', return_value='2'):
+                with self.assertRaises(FileExistsError): free_name(fd, 'x')
+
+    @macos
+    def test_flags_and_acls_do_not_stop_a_removal(self):
+        with Root() as root:
+            tree = root.layout.root / 'tree'; (tree / '.tmp' / 'sub').mkdir(parents=True)
+            (tree / '.tmp' / 'sub' / 'f').write_text('f'); os.chflags(tree / '.tmp' / 'sub' / 'f', stat.UF_IMMUTABLE)
+            os.chflags(tree / '.tmp' / 'sub', stat.UF_APPEND); deny(tree / '.tmp', 'list,search,delete_child')
+            removed(self, root.layout.root, 'tree')
 
 
 class BeforeCommit(unittest.TestCase):
     def test_nested_git_entries_are_set_aside(self):
         with Root() as root:
-            work, outside = root.layout.work, root.layout.root / 'outside'
-            (work / 'sub' / '.git').mkdir(parents=True); (work / 'sub' / '.git' / 'config').write_text('c')
-            (work / 'sub' / '.git.rsi-kept').mkdir()                           # the name is taken: -2
-            (work / 'a' / 'b').mkdir(parents=True); (work / 'a' / 'b' / '.GIT').write_text('gitdir: x')
-            (work / 'odd').mkdir(); (work / 'odd' / 'git~1').write_text('x'); (work / 'odd' / '.git ').mkdir()
-            os.symlink('target', work / 'odd' / '.gitmodules')
-            (outside / '.git').mkdir(parents=True); os.symlink(outside, work / 'linked')
-            (work / 'out').mkdir(); (work / 'out' / '.git').mkdir()                # never versioned: left alone
-            problems = prepare_for_commit(work, root.layout.library, 'manual')
-            self.assertEqual(len(problems), 5)
-            self.assertTrue(any('sub/.git' in line and 'sub/.git.rsi-kept-2' in line for line in problems))
-            self.assertEqual((work / 'sub' / '.git.rsi-kept-2' / 'config').read_text(), 'c')
-            self.assertTrue((work / 'a' / 'b' / '.git.rsi-kept').is_file())
-            self.assertEqual(sorted(os.listdir(work / 'odd')),
+            tree, outside = root.layout.work, root.layout.root / 'outside'
+            (tree / 'sub' / '.git').mkdir(parents=True); (tree / 'sub' / '.git' / 'config').write_text('c')
+            (tree / 'sub' / '.git.rsi-kept').mkdir()                           # the name is taken: -2
+            (tree / 'a' / 'b').mkdir(parents=True); (tree / 'a' / 'b' / '.GIT').write_text('gitdir: x')
+            (tree / 'odd').mkdir(); (tree / 'odd' / 'git~1').write_text('x'); (tree / 'odd' / '.git ').mkdir()
+            os.symlink('target', tree / 'odd' / '.gitmodules')
+            (outside / '.git').mkdir(parents=True); os.symlink(outside, tree / 'linked')
+            (tree / 'out').mkdir(); (tree / 'out' / '.git').mkdir()                # never versioned: left alone
+            lines, left = prepare(root, tree)
+            self.assertEqual((len(lines), left), (5, 0))
+            self.assertTrue(any('sub/.git' in line and 'sub/.git.rsi-kept-2' in line for line in lines))
+            self.assertEqual((tree / 'sub' / '.git.rsi-kept-2' / 'config').read_text(), 'c')
+            self.assertTrue((tree / 'a' / 'b' / '.git.rsi-kept').is_file())
+            self.assertEqual(sorted(os.listdir(tree / 'odd')),
                              ['.git.rsi-kept', '.git.rsi-kept-2', '.gitmodules.rsi-kept'])
-            self.assertTrue((outside / '.git').is_dir()); self.assertTrue((work / 'out' / '.git').is_dir())
-            self.assertIsNotNone(root.store.commit(work, 'owner (manual)', 'x'))   # versioning goes through now
-            self.assertEqual(prepare_for_commit(work, root.layout.library, 'manual'), [])
+            self.assertTrue((outside / '.git').is_dir()); self.assertTrue((tree / 'out' / '.git').is_dir())
+            self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'x'))   # versioning goes through
+            self.assertEqual(prepare(root, tree), ([], 0))
 
     def test_thousands_of_look_alikes_are_quick_and_reported_in_few_lines(self):
         with Root() as root:
@@ -88,157 +157,95 @@ class BeforeCommit(unittest.TestCase):
             for name in names:
                 (many / name).write_text('x')
             started = time.monotonic()
-            problems = prepare_for_commit(root.layout.work, root.layout.library, 'manual')
+            lines, left = prepare(root, root.layout.work)
             self.assertLess(time.monotonic() - started, 3)
-            self.assertEqual(len(problems), workspace.MAX_LINES + 1); self.assertIn('2900', problems[-1])
+            self.assertEqual((len(lines), left), (workspace.MAX_LINES + 1, 0)); self.assertIn('2900', lines[-1])
             self.assertEqual(sorted(os.listdir(many)),
                              sorted(['.git.rsi-kept'] + [f'.git.rsi-kept-{n}' for n in range(2, 3001)]))
 
-    def test_a_deep_tree_is_moved_aside_with_few_open_files(self):
-        few_open_files(self)
-        with Root() as root:
-            deep = root.layout.work / ('a/' * DEPTH); (deep / '.git').mkdir(parents=True)
-            (deep / '.git' / 'config').write_text('c'); (root.layout.work / 'a' / 'keep.txt').write_text('k')
-            problems = prepare_for_commit(root.layout.work, root.layout.library, 'manual')
-            self.assertEqual(len(problems), 1); self.assertIn('library/moved/manual/a', problems[0])
-            moved = root.layout.library / 'moved' / 'manual' / ('a/' * (workspace.MAX_DEPTH + 1))
-            self.assertTrue(moved.is_dir())
-            self.assertEqual(len(str(root.layout.work / 'a').split('/')) + workspace.MAX_DEPTH - 1,
-                             max(len(top.split('/')) for top, _, _ in os.walk(root.layout.work)))
-            self.assertIsNotNone(root.store.commit(root.layout.work, 'owner (manual)', 'deep'))
-
-    def test_unreadable_entries_are_opened_or_moved_aside(self):
-        with Root() as root:
-            work = root.layout.work; (work / 'notes' / 'locked').mkdir(parents=True)
-            (work / 'notes' / 'locked' / 'a.txt').write_text('a'); (work / 'notes' / 'locked' / 'a.txt').chmod(0)
-            (work / 'notes' / 'locked').chmod(0)
-            (work / 'notes' / 'shared.txt').write_text('s')
-            os.link(work / 'notes' / 'shared.txt', root.layout.env / 's')
-            (work / 'notes' / 'shared.txt').chmod(0)
-            problems = prepare_for_commit(work, root.layout.library, 'manual')
-            self.assertEqual(len(problems), 1); self.assertIn('notes/shared.txt', problems[0])
-            self.assertEqual((work / 'notes' / 'locked' / 'a.txt').read_text(), 'a')
-            moved = root.layout.library / 'moved' / 'manual' / 'notes' / 'shared.txt'
-            self.assertEqual(os.stat(moved).st_mode & 0o777, 0)                 # a shared inode is never changed
-            moved.chmod(0o600)
-            self.assertIsNotNone(root.store.commit(work, 'owner (manual)', 'readable'))
-
-    def test_big_files_are_moved_aside_and_library_links_are_not_followed(self):
-        with Root() as root:
-            work, outside = root.layout.work, root.layout.root / 'outside'
-            outside.mkdir(); (work / 'data').mkdir()
-            with open(work / 'data' / 'huge.bin', 'wb') as stream:
-                stream.truncate(workspace.BIG_FILE + 1)                         # sparse: nothing allocated
-            (work / 'data' / 'small.txt').write_text('s')
-            os.symlink(outside, root.layout.library / 'moved')                  # planted by the Lab
-            problems = prepare_for_commit(work, root.layout.library, 'R0007')
-            self.assertEqual(len(problems), 1); self.assertIn('library/moved-2/R0007/data/huge.bin', problems[0])
-            self.assertEqual(os.listdir(outside), [])
-            self.assertEqual((root.layout.library / 'moved-2' / 'R0007' / 'data' / 'huge.bin').stat().st_size,
-                             workspace.BIG_FILE + 1)
-            self.assertEqual(os.listdir(work / 'data'), ['small.txt'])
-            with mock.patch.object(workspace, 'BIG_FILE', 0):
-                prepare_for_commit(work, root.layout.library, 'R0007')
-            self.assertTrue((root.layout.library / 'moved-2' / 'R0007' / 'data' / 'small.txt').is_file())
-
-
-
-class NothingTheLabLeavesBlocks(unittest.TestCase):
-    """Fix round 2: taken names never run out, unwritable deep folders still move, an unusable library/ is avoided."""
-
     def test_a_thousand_taken_names_do_not_stop_the_set_aside(self):
         with Root() as root:
-            work = root.layout.work; (work / '.git').mkdir(); (work / '.git' / 'config').write_text('c')
+            tree = root.layout.work; (tree / '.git').mkdir(); (tree / '.git' / 'config').write_text('c')
             for number in range(1, 1001):
-                (work / ('.git.rsi-kept' if number == 1 else f'.git.rsi-kept-{number}')).write_text('taken')
-            problems = prepare_for_commit(work, root.layout.library, 'manual')
-            self.assertEqual(len(problems), 1); self.assertFalse(os.path.lexists(work / '.git'))
-            self.assertIsNotNone(root.store.commit(work, 'owner (manual)', 'kept'))
+                (tree / ('.git.rsi-kept' if number == 1 else f'.git.rsi-kept-{number}')).write_text('taken')
+            lines, left = prepare(root, tree)
+            self.assertEqual((len(lines), left), (1, 0)); self.assertFalse(os.path.lexists(tree / '.git'))
+            self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'kept'))
 
-    def test_a_thousand_taken_names_do_not_stop_a_removal(self):
+    def test_a_deep_tree_is_left_out_with_few_open_files(self):
+        few_open_files(self)
         with Root() as root:
-            out = root.layout.work / 'out' / 'T1'                 # '-' sorts before '.': the chain is emptied first
-            (out / '-chain' / ('a/' * workspace.MAX_DEPTH)).mkdir(parents=True)
-            for number in range(1, 1001):
-                (out / ('.rsi-deep' if number == 1 else f'.rsi-deep-{number}')).write_text('taken')
-            self.assertEqual(clear(root.layout.work, 'out', 'T1'), [])
-            self.assertFalse(os.path.lexists(root.layout.work / 'out'))
+            tree = root.layout.work
+            deep = tree / ('a/' * DEPTH); (deep / '.git').mkdir(parents=True)
+            (deep / '.git' / 'config').write_text('c'); (tree / 'a' / 'keep.txt').write_text('k')
+            (tree / ('a/' * workspace.MAX_DEPTH)).chmod(0)                       # unwritable at the limit
+            lines, left = prepare(root, tree)
+            self.assertEqual((len(lines), left), (1, 1)); self.assertIn('sealed/L/left-out/1-a', lines[0])
+            moved = root.layout.sealed / 'L' / 'left-out' / '1-a' / ('a/' * (DEPTH - workspace.MAX_DEPTH - 1))
+            self.assertTrue((moved / '.git' / 'config').is_file())
+            self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'deep'))
 
-    def test_a_thousand_taken_library_names_do_not_stop_a_move(self):
+    def test_unreadable_entries_are_opened_or_left_out(self):
         with Root() as root:
-            library = root.layout.library
-            for number in range(1, 1001):
-                (library / ('moved' if number == 1 else f'moved-{number}')).write_text('taken')
-            (root.layout.work / 'big.bin').write_text('x' * 20)
-            with mock.patch.object(workspace, 'BIG_FILE', 10):
-                problems = prepare_for_commit(root.layout.work, library, 'manual')
-            self.assertEqual(len(problems), 1); self.assertIn('library/moved-', problems[0])
-            self.assertFalse(os.path.lexists(root.layout.work / 'big.bin'))
+            tree = root.layout.work; (tree / 'notes' / 'locked').mkdir(parents=True)
+            (tree / 'notes' / 'locked' / 'a.txt').write_text('a'); (tree / 'notes' / 'locked' / 'a.txt').chmod(0)
+            (tree / 'notes' / 'locked').chmod(0)
+            (tree / 'notes' / 'shared.txt').write_text('s')
+            os.link(tree / 'notes' / 'shared.txt', root.layout.env / 's')
+            (tree / 'notes' / 'shared.txt').chmod(0)
+            lines, left = prepare(root, tree)
+            self.assertEqual((len(lines), left), (1, 1)); self.assertIn('notes/shared.txt', lines[0])
+            self.assertEqual((tree / 'notes' / 'locked' / 'a.txt').read_text(), 'a')
+            moved = root.layout.sealed / 'L' / 'left-out' / '1-shared.txt'
+            self.assertEqual(os.stat(moved).st_mode & 0o777, 0)                 # a shared inode is never changed
+            self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'readable'))
 
-    def test_an_unwritable_folder_at_the_depth_limit_still_moves(self):
+    @macos
+    def test_flags_and_acls_are_cleared_on_the_entries_themselves(self):
         with Root() as root:
-            trial = root.layout.trial; (trial / ('a/' * 51)).mkdir(parents=True)
-            (trial / ('a/' * 48)).chmod(0)
-            empty_folder(trial); self.assertEqual(os.listdir(trial), [])
-            work = root.layout.work; (work / ('b/' * 51)).mkdir(parents=True); (work / 'b' / 'keep.txt').write_text('k')
-            (work / ('b/' * 49)).chmod(0)
-            problems = prepare_for_commit(work, root.layout.library, 'manual')
-            self.assertEqual(len(problems), 1); self.assertIn('library/moved/manual/b', problems[0])
-            self.assertIsNotNone(root.store.commit(work, 'owner (manual)', 'moved'))
+            tree = root.layout.work; (tree / 'locked').mkdir(); (tree / 'locked' / 'f.txt').write_text('f')
+            (tree / 'locked' / '.git').mkdir(); os.chflags(tree / 'locked', stat.UF_IMMUTABLE)
+            (tree / 'secret.txt').write_text('s'); deny(tree / 'secret.txt', 'read')
+            (tree / 'hidden').mkdir(); (tree / 'hidden' / 'h.txt').write_text('h'); deny(tree / 'hidden', 'list,search')
+            deny(tree, 'list,search')
+            lines, left = prepare(root, tree)
+            self.assertEqual((len(lines), left), (1, 0)); self.assertIn('locked/.git.rsi-kept', lines[0])
+            self.assertEqual(root.store.commit(tree, 'manual or leftover', 'unlocked'), 'V0002')
+            self.assertIn('b/hidden/h.txt', root.store.diff('V0001', 'V0002'))
+            self.assertIn('b/secret.txt', root.store.diff('V0001', 'V0002'))
+            # An ACL that also denies reading itself cannot be cleared without following a link: it counts as left
+            # out (git would silently skip the folder), so the caller keeps the whole tree.
+            (tree / 'vault').mkdir(); (tree / 'vault' / 'v.txt').write_text('v'); deny(tree / 'vault', DENY_ALL)
+            lines, left = prepare(root, tree)
+            self.assertGreaterEqual(left, 1); self.assertTrue(any('vault' in line for line in lines))
 
-    def test_an_unusable_library_is_opened_or_avoided(self):
+    def test_big_files_are_left_out(self):
         with Root() as root:
-            work, library = root.layout.work, root.layout.library
-            for case in ('mode 000', 'moved 555', 'a link'):
-                with open(work / 'big.bin', 'wb') as stream:
-                    stream.truncate(11)
-                if case == 'mode 000':
-                    library.chmod(0)
-                elif case == 'moved 555':
-                    (library / 'moved').chmod(0o555)
-                else:
-                    outside = root.layout.root / 'outside'; outside.mkdir()
-                    os.rename(library, root.layout.root / 'library-old'); os.symlink(outside, library)
-                with mock.patch.object(workspace, 'BIG_FILE', 10):
-                    problems = prepare_for_commit(work, library, 'manual')
-                self.assertEqual(len(problems), 1, case); self.assertFalse(os.path.lexists(work / 'big.bin'), case)
-            self.assertIn('.tmp/rsi-moved-big.bin', problems[0]); self.assertEqual(os.listdir(outside), [])
-            self.assertTrue((work / '.tmp' / 'rsi-moved-big.bin').is_file())
-            self.assertEqual(sorted(os.listdir(root.layout.root / 'library-old' / 'moved' / 'manual')),
-                             ['big.bin', 'big.bin-2'])
-            root.store.commit(work, 'owner (manual)', 'no big file')                  # nothing left to refuse
+            tree = root.layout.work; (tree / 'data').mkdir()
+            with open(tree / 'data' / 'huge.bin', 'wb') as stream:
+                stream.truncate(workspace.BIG_FILE + 1)                         # sparse: nothing allocated
+            (tree / 'data' / 'small.txt').write_text('s')
+            lines, left = prepare(root, tree)
+            self.assertEqual((len(lines), left), (1, 1)); self.assertIn('data/huge.bin', lines[0])
+            self.assertEqual((root.layout.sealed / 'L' / 'left-out' / '1-huge.bin').stat().st_size,
+                             workspace.BIG_FILE + 1)
+            self.assertEqual(os.listdir(tree / 'data'), ['small.txt'])
 
-
-class Quarantine(unittest.TestCase):
-    def test_any_entry_is_set_apart_and_replaced_by_a_fresh_folder(self):
+    def test_a_tree_that_is_not_a_folder_is_an_error(self):
         with Root() as root:
-            outside = root.layout.root / 'outside'; outside.mkdir(); (outside / 'x').write_text('x')
-            work = root.layout.work
-            cases = []
-            work.rename(root.layout.root / 'work-old'); os.symlink(outside, work); cases.append('link')
-            moved = quarantine(root.layout, work, 'work')
-            self.assertEqual(moved, root.layout.root / 'quarantine' / 'work-1'); self.assertTrue(moved.is_symlink())
-            self.assertEqual(os.listdir(outside), ['x'])
-            self.assertTrue(work.is_dir() and not work.is_symlink()); self.assertEqual(os.listdir(work), [])
-            (work / 'f').write_text('f'); work.chmod(0)                                 # mode 000
-            self.assertEqual(quarantine(root.layout, work, 'work'), root.layout.root / 'quarantine' / 'work-2')
-            (work / 'f').write_text('f'); os.chflags(work, stat.UF_IMMUTABLE)            # chflags uchg
-            self.assertEqual(quarantine(root.layout, work, 'work'), root.layout.root / 'quarantine' / 'work-3')
-            os.rmdir(work); work.write_text('a file')                                    # a file
-            self.assertEqual(quarantine(root.layout, work, 'work'), root.layout.root / 'quarantine' / 'work-4')
-            self.assertTrue(work.is_dir()); self.assertEqual(os.listdir(work), [])
-            os.rmdir(work)                                                               # nothing at all
-            self.assertIsNone(quarantine(root.layout, work, 'work')); self.assertTrue(work.is_dir())
+            outside = root.layout.root / 'outside'; outside.mkdir()
+            os.symlink(outside, root.layout.root / 'tree')
+            with self.assertRaises(OSError): prepare(root, root.layout.root / 'tree')
+            self.assertEqual(os.listdir(outside), [])
 
-    @unittest.skipUnless(sys.platform == 'darwin', 'macOS ACLs')
-    def test_a_deny_acl_does_not_stop_it(self):
-        with Root() as root:
-            work = root.layout.work; (work / 'f').write_text('f')
-            rights = ('write,delete,add_subdirectory,add_file,delete_child,writeattr,writeextattr,writesecurity,'
-                      'readsecurity,list,search')
-            subprocess.run(['/bin/chmod', '+a', f'{os.environ["USER"]} deny {rights}', str(work)], check=True)
-            moved = quarantine(root.layout, work, 'work')
-            self.assertEqual(sorted(os.listdir(moved)), ['AGENTS.md', 'f']); self.assertEqual(os.listdir(work), [])
+
+class Limits(unittest.TestCase):
+    def test_open_files_limit_is_raised(self):
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
+        raise_open_files_limit()
+        self.assertGreater(resource.getrlimit(resource.RLIMIT_NOFILE)[0], 256)
 
 
 if __name__ == '__main__':

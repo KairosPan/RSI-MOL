@@ -1,11 +1,17 @@
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from rsi import tasks
 from rsi.tasks import SECTIONS, collect_out, load_task, place_inputs, prompt_for, run_check
-from rsi.workspace import clear
 from tests.support import PASS_CHECK, Root
+
+
+def sealed(root: Root) -> Path:
+    """A folder standing in for a sealed workspace (its out/ is collected)."""
+    tree = root.layout.root / '.sealed-work-R0001'; tree.mkdir()
+    return tree
 
 
 class TaskFiles(unittest.TestCase):
@@ -27,15 +33,15 @@ class TaskFiles(unittest.TestCase):
 
     def test_collect_out_never_follows_links(self):
         with Root() as root:
-            out = root.layout.work / 'out' / 'T1'; out.mkdir(parents=True); secret = root.layout.owner / 'limits.toml'
+            tree = sealed(root)
+            out = tree / 'out' / 'T1'; out.mkdir(parents=True); secret = root.layout.owner / 'limits.toml'
             os.symlink(secret, out / 'link'); (out / 'a.txt').write_text('a'); dest = root.layout.root / 'dest'
-            problems = collect_out(root.layout.work, 'T1', dest)          # ruling: links are dropped, not kept
+            problems = collect_out(tree, 'T1', dest)                       # ruling: links are dropped, not kept
             self.assertEqual(len(problems), 1); self.assertIn('link', problems[0])
             self.assertFalse(os.path.lexists(dest / 'link')); self.assertEqual((dest / 'a.txt').read_text(), 'a')
-            self.assertFalse((root.layout.work / 'out' / 'T1').exists()); self.assertTrue(secret.is_file())
-            (root.layout.work / 'out').mkdir(exist_ok=True)
-            os.symlink(root.layout.owner, root.layout.work / 'out' / 'T2')
-            self.assertTrue(collect_out(root.layout.work, 'T2', root.layout.root / 'dest2'))
+            self.assertTrue(secret.is_file()); self.assertTrue(os.path.islink(out / 'link'))   # nothing removed
+            os.symlink(root.layout.owner, tree / 'out' / 'T2')
+            self.assertTrue(collect_out(tree, 'T2', root.layout.root / 'dest2'))
             self.assertFalse((root.layout.root / 'dest2' / 'limits.toml').exists())
 
 
@@ -90,30 +96,28 @@ class MoreTaskFiles(unittest.TestCase):
             (out / 'answer.json').write_text('{"x": 3, "y": -1}')
             self.assertEqual(run_check(task, out), {'passed': True, 'message': '通过', 'exit_code': 0})
 
-    def test_inputs_are_placed_afresh_with_links_kept(self):
+    def test_inputs_are_copied_into_a_staged_folder_with_links_kept(self):
         with Root() as root:
-            folder = root.add_task('T1', inputs={'data.txt': 'd'})
+            folder = root.add_task('T1', inputs={'data.txt': 'd'}); root.add_task('T2')
             os.symlink(root.layout.owner / 'limits.toml', folder / 'input' / 'link')
-            work = root.layout.work
-            (work / 'in').write_text('a file where the folder belongs')
-            self.assertEqual(len(place_inputs(load_task(root.layout.tasks, 'T1'), work)), 1)
-            self.assertEqual((work / 'in' / 'T1' / 'data.txt').read_text(), 'd')
-            self.assertTrue(os.path.islink(work / 'in' / 'T1' / 'link'))
-            (work / 'in' / 'T1' / 'stale.txt').write_text('left by an earlier run')
-            self.assertEqual(place_inputs(load_task(root.layout.tasks, 'T1'), work), [])
-            self.assertEqual(sorted(os.listdir(work / 'in' / 'T1')), ['data.txt', 'link'])
-            self.assertEqual(clear(work, 'in', 'T1'), []); self.assertFalse(os.path.lexists(work / 'in'))
+            staged = root.layout.staging / 'x'; staged.mkdir(parents=True)
+            place_inputs(load_task(root.layout.tasks, 'T1'), staged)
+            self.assertEqual((staged / 'in' / 'T1' / 'data.txt').read_text(), 'd')
+            self.assertTrue(os.path.islink(staged / 'in' / 'T1' / 'link'))
+            place_inputs(load_task(root.layout.tasks, 'T2'), staged)              # no inputs: nothing to copy
+            self.assertEqual(os.listdir(staged / 'in'), ['T1'])
+            with self.assertRaises(FileExistsError): place_inputs(load_task(root.layout.tasks, 'T1'), staged)
 
     def test_collected_results_hold_only_regular_files_and_folders(self):
         with Root() as root:
-            work = root.layout.work; out = work / 'out' / 'T1'; (out / 'sub' / 'deeper').mkdir(parents=True)
+            tree = sealed(root); out = tree / 'out' / 'T1'; (out / 'sub' / 'deeper').mkdir(parents=True)
             (out / 'sub' / 'deeper' / 'kept.txt').write_text('k')
             os.symlink(root.layout.owner, out / 'sub' / 'to-owner')
             os.mkfifo(out / 'sub' / 'pipe')
-            (work / 'notes').mkdir(); (work / 'notes' / 'h.txt').write_text('shared')
-            os.link(work / 'notes' / 'h.txt', out / 'h.txt')
+            (tree / 'notes').mkdir(); (tree / 'notes' / 'h.txt').write_text('shared')
+            os.link(tree / 'notes' / 'h.txt', out / 'h.txt')
             dest = root.layout.root / 'dest'
-            problems = collect_out(work, 'T1', dest)
+            problems = collect_out(tree, 'T1', dest)
             self.assertEqual(len(problems), 2)
             self.assertTrue(any('out/T1/sub/to-owner' in line and '符号链接' in line for line in problems))
             self.assertTrue(any('out/T1/sub/pipe' in line and '命名管道' in line for line in problems))
@@ -121,74 +125,59 @@ class MoreTaskFiles(unittest.TestCase):
                            for top, folders, files in os.walk(dest) for name in folders + files)
             self.assertEqual(found, ['h.txt', 'sub', 'sub/deeper', 'sub/deeper/kept.txt'])
             self.assertEqual(os.stat(dest / 'h.txt').st_nlink, 1)           # copied by content, not shared
-            (work / 'notes' / 'h.txt').write_text('changed later')
-            self.assertEqual((dest / 'h.txt').read_text(), 'shared')
-            self.assertFalse(os.path.lexists(out)); self.assertTrue(root.layout.owner.is_dir())
+            (tree / 'notes' / 'h.txt').write_text('changed later')
+            self.assertEqual((dest / 'h.txt').read_text(), 'shared'); self.assertTrue(root.layout.owner.is_dir())
 
     def test_collected_results_are_made_readable(self):
         with Root() as root:
-            locked = root.layout.work / 'out' / 'T1' / 'locked'; locked.mkdir(parents=True)
+            tree = sealed(root); locked = tree / 'out' / 'T1' / 'locked'; locked.mkdir(parents=True)
             (locked / 'a.txt').write_text('a'); (locked / 'a.txt').chmod(0); locked.chmod(0)
+            (tree / 'out').chmod(0); tree.chmod(0)                           # the sealed folder itself too
             dest = root.layout.root / 'dest'
-            self.assertEqual(collect_out(root.layout.work, 'T1', dest), [])
+            self.assertEqual(collect_out(tree, 'T1', dest), [])
             self.assertEqual((dest / 'locked' / 'a.txt').read_text(), 'a')
 
     def test_results_over_the_budget_are_left_out(self):
         with Root() as root:
-            out = root.layout.work / 'out' / 'T1'; out.mkdir(parents=True)
+            tree = sealed(root); out = tree / 'out' / 'T1'; out.mkdir(parents=True)
             for number in range(6):
                 (out / f'f{number}.txt').write_text('12345')
             (out / 'big.bin').write_text('x' * 40)
-            with mock.patch.object(tasks, 'MAX_RESULT_BYTES', 30), mock.patch.object(tasks, 'MAX_RESULT_FILES', 4):
-                problems = collect_out(root.layout.work, 'T1', root.layout.root / 'dest')
+            with mock.patch.object(tasks, 'MAX_RESULT_BYTES', 30), mock.patch.object(tasks, 'MAX_RESULT_ENTRIES', 4):
+                problems = collect_out(tree, 'T1', root.layout.root / 'dest')
             kept = sorted(os.listdir(root.layout.root / 'dest'))
             self.assertEqual(kept, ['f0.txt', 'f1.txt', 'f2.txt', 'f3.txt'])        # 'big.bin' sorts first: 40 > 30
             self.assertTrue(any('big.bin' in line and '字节' in line for line in problems))
             self.assertEqual(sum('个文件' in line for line in problems), 2)
-            self.assertFalse(os.path.lexists(out))
-            sparse = root.layout.work / 'out' / 'T2'; sparse.mkdir(parents=True)
+            folders = tree / 'out' / 'T3'                                         # folders count as entries too
+            for name in ('a', 'b', 'c'):
+                (folders / name).mkdir(parents=True); (folders / name / 'f').write_text('f')
+            with mock.patch.object(tasks, 'MAX_RESULT_ENTRIES', 4):
+                problems = collect_out(tree, 'T3', root.layout.root / 'dest3')
+            found = sorted(os.path.relpath(os.path.join(top, name), root.layout.root / 'dest3')
+                           for top, dirs, files in os.walk(root.layout.root / 'dest3') for name in dirs + files)
+            self.assertEqual((found, len(problems)), (['a', 'a/f', 'b', 'b/f'], 1))      # c is left out whole
+            sparse = tree / 'out' / 'T2'; sparse.mkdir(parents=True)
             with open(sparse / 'huge', 'wb') as stream:
                 stream.truncate((1 << 40))                                         # 1 TiB, nothing allocated
-            problems = collect_out(root.layout.work, 'T2', root.layout.root / 'dest2')
+            problems = collect_out(tree, 'T2', root.layout.root / 'dest2')
             self.assertEqual((os.listdir(root.layout.root / 'dest2'), len(problems)), ([], 1))
 
-    def test_unreadable_folders_of_the_control_program_are_opened(self):
+    def test_out_that_is_a_link_or_a_file_is_not_collected(self):
         with Root() as root:
-            work = root.layout.work; (work / 'out' / 'T1').mkdir(parents=True)
-            (work / 'out' / 'T1' / 'a.txt').write_text('a'); (work / 'out').chmod(0)
-            dest = root.layout.root / 'dest'
-            self.assertEqual(collect_out(work, 'T1', dest), []); self.assertEqual((dest / 'a.txt').read_text(), 'a')
-            (work / 'in' / 'T1').mkdir(parents=True); (work / 'in' / 'T1').chmod(0); (work / 'in').chmod(0)
-            self.assertEqual(clear(work, 'in', 'T1'), []); self.assertFalse(os.path.lexists(work / 'in'))
-
-    def test_inputs_are_never_written_through_a_swapped_in(self):
-        with Root() as root:
-            root.add_task('T1', inputs={'data.txt': 'd'}); work = root.layout.work
-            outside = root.layout.root / 'outside'; outside.mkdir()
-            original = tasks._copy_into
-
-            def swap_then_copy(source, folder_fd, name, depth=1):
-                os.rename(work / 'in', work / 'in-moved'); os.symlink(outside, work / 'in')    # a stray process
-                return original(source, folder_fd, name, depth)
-
-            with mock.patch.object(tasks, '_copy_into', swap_then_copy):
-                place_inputs(load_task(root.layout.tasks, 'T1'), work)
-            self.assertEqual(os.listdir(outside), [])
-            self.assertEqual((work / 'in-moved' / 'T1' / 'data.txt').read_text(), 'd')
-
-    def test_out_that_is_a_link_or_a_file_is_refused(self):
-        with Root() as root:
-            work = root.layout.work
-            os.symlink(root.layout.owner, work / 'out')
-            problems = collect_out(work, 'T1', root.layout.root / 'd1')
-            self.assertEqual(len(problems), 1); self.assertFalse(os.path.lexists(work / 'out'))
+            tree = sealed(root)
+            os.symlink(root.layout.owner, tree / 'out')
+            problems = collect_out(tree, 'T1', root.layout.root / 'd1')
+            self.assertEqual(len(problems), 1); self.assertTrue((tree / 'out').is_symlink())
             self.assertTrue(root.layout.owner.is_dir()); self.assertEqual(os.listdir(root.layout.root / 'd1'), [])
-            (work / 'out').mkdir(); (work / 'out' / 'T1').write_text('not a folder')
-            self.assertEqual(len(collect_out(work, 'T1', root.layout.root / 'd2')), 1)
-            self.assertFalse(os.path.lexists(work / 'out' / 'T1'))
-            self.assertEqual(collect_out(work, 'T1', root.layout.root / 'd3'), [])      # nothing there: no problem
+            (tree / 'out').unlink(); (tree / 'out').mkdir(); (tree / 'out' / 'T1').write_text('not a folder')
+            self.assertEqual(len(collect_out(tree, 'T1', root.layout.root / 'd2')), 1)
+            self.assertEqual(collect_out(tree, 'T9', root.layout.root / 'd3'), [])      # nothing there: no problem
             self.assertTrue((root.layout.root / 'd3').is_dir())
-            with self.assertRaises(ValueError): collect_out(work, '../owner', root.layout.root / 'd4')
+            with self.assertRaises(ValueError): collect_out(tree, '../owner', root.layout.root / 'd4')
+            os.symlink(root.layout.owner, root.layout.root / 'linked')                 # a sealed link: an error
+            with self.assertRaises(NotADirectoryError): collect_out(root.layout.root / 'linked', 'T1',
+                                                                    root.layout.root / 'd5')
 
 
 if __name__ == '__main__':

@@ -191,6 +191,24 @@ class Versions(unittest.TestCase):
         cut = self.store.diff('V0001', 'V0002', limit=100)
         self.assertTrue(cut.startswith(full[:100])); self.assertLess(len(cut), 200)
 
+    def test_no_index_is_left_behind(self):
+        (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
+        self.store.checkout('V0001', self.b); self.store.tree_of_dir(self.b); self.store.snapshot(self.b, 'M0001', 's')
+        self.assertEqual(os.listdir(self.store.git_dir / 'indexes'), [])
+
+    def test_check_writable_locks_nothing_and_changes_nothing(self):
+        with self.assertRaisesRegex(RuntimeError, '还没有任何版本'): self.store.check_writable()
+        (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
+        refs = self.store._out('for-each-ref')
+        self.store.check_writable(); self.store.check_writable()
+        self.assertEqual(self.store._out('for-each-ref'), refs)
+        lock = self.store.git_dir / 'refs' / 'heads' / 'main.lock'; lock.touch()     # a git that crashed
+        with self.assertRaises(RuntimeError): self.store.check_writable()
+        lock.unlink(); (self.store.git_dir / 'objects').chmod(0o555)
+        self.addCleanup((self.store.git_dir / 'objects').chmod, 0o755)
+        with self.assertRaisesRegex(RuntimeError, 'objects'): self.store.check_writable()
+        (self.store.git_dir / 'objects').chmod(0o755); self.store.check_writable()
+
 
 if __name__ == '__main__':
     unittest.main()
