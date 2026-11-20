@@ -6,6 +6,7 @@ import re
 
 BARE_KEY = re.compile(r'[A-Za-z0-9_-]+')
 ESCAPES = {'"': '\\"', '\\': '\\\\', '\b': '\\b', '\t': '\\t', '\n': '\\n', '\f': '\\f', '\r': '\\r'}
+INT_MIN, INT_MAX = -2 ** 63, 2 ** 63 - 1
 
 
 def _string(text: str) -> str:
@@ -33,6 +34,8 @@ def toml_value(value) -> str:
     if isinstance(value, str):
         return _string(value)
     if isinstance(value, int):
+        if not INT_MIN <= value <= INT_MAX:
+            raise ValueError(f'TOML integers are signed 64-bit; out of range: {value}')
         return str(value)
     if isinstance(value, float):
         return repr(value)
@@ -51,8 +54,13 @@ def render_file(config: dict) -> str:
 
 
 def render_flags(config: dict) -> list[str]:
-    """The same config as Codex `-c key=value` flags, one pair per top-level key, keys sorted."""
+    """The same config as Codex `-c key=value` flags, one pair per top-level key, keys sorted.
+
+    Codex splits a `-c` key on dots and does not unquote it, so every top-level key must be bare.
+    """
     flags = []
     for key in sorted(config):
-        flags += ['-c', f'{_key(key)}={toml_value(config[key])}']
+        if not isinstance(key, str) or not BARE_KEY.fullmatch(key):
+            raise ValueError(f'a -c key must be bare ([A-Za-z0-9_-]+): {key!r}')
+        flags += ['-c', f'{key}={toml_value(config[key])}']
     return flags

@@ -77,10 +77,10 @@ class Layout:
 
 
 def find_layout() -> Layout:
-    """$RSI_ROOT if set, else the folder that holds the `rsi` launcher (two levels above this package)."""
+    """$RSI_ROOT if set, else the folder that holds the `rsi` launcher (two levels above this package); resolved."""
     root = os.environ.get('RSI_ROOT')
     if root:
-        return Layout(Path(root).absolute())
+        return Layout(Path(root).resolve())
     return Layout(Path(__file__).resolve().parents[2])
 
 
