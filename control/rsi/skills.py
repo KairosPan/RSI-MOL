@@ -174,7 +174,7 @@ def _folder(source: int, relative: str, level: int, names: list[str], target: _T
             continue
         if stat.S_ISDIR(info.st_mode):
             if level + 1 > MAX_DEPTH:
-                walk.line(path, f'folders nested more than {MAX_DEPTH} levels deep; it does not go into {WHERE}')
+                walk.line(path, f'nested more than {MAX_DEPTH} folder levels deep; it does not go into {WHERE}')
                 continue
             opened = _listed(name, source, path, walk)
             if opened is None:
