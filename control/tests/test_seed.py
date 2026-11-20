@@ -224,9 +224,8 @@ class Seed(unittest.TestCase):
         found = sorted(path.relative_to(repo).as_posix() for path in paths
                        if path.is_file() and '__pycache__' not in path.parts and '负责人'.encode() in path.read_bytes())
         self.assertEqual(found, [])
-        for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS):
-            self.assertIn('由主人决定', text)
-        self.assertIn('the owner decides', META_TEXT.read_text(encoding='utf-8'))
+        for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS, META_TEXT.read_text(encoding='utf-8')):
+            self.assertIn('the owner decides', text)
         texts = {name: (SEED / 'work' / name).read_text(encoding='utf-8') for name in WORK_FILES}
         named = {name: sorted({word.lower() for word in NAMES.findall(text)}) for name, text in texts.items()}
         self.assertEqual(named, NAMED)

@@ -52,7 +52,10 @@ class MetaRounds(unittest.TestCase):
             call = root.records.load_call('R0001')
             self.assertEqual((call['role'], call['purpose'], call['cost_class'], call['round']),
                              ('meta', 'meta', 'meta', 'M0001'))
-            self.assertIn('Meta', (root.records.call_dir('R0001') / 'prompt.txt').read_text())
+            prompt = (root.records.call_dir('R0001') / 'prompt.txt').read_text()
+            self.assertIn('# Meta round M0001', prompt)
+            self.assertTrue(prompt.rstrip().endswith('\n\nWrite every text field of your reply in English.'),
+                            prompt[-200:])
 
     def test_trial_then_release(self):
         with Root() as root:
@@ -64,7 +67,7 @@ class MetaRounds(unittest.TestCase):
             self.assertEqual((root.layout.work / 'RULES.md').read_text().strip(), 'new rule')
             release = json.loads((root.layout.records / 'releases' / 'V0002.json').read_text())
             self.assertEqual((release['kind'], release['benefit'], release['evidence'], release['parent']),
-                             ('release', '未评估', ['R0002'], 'V0001'))
+                             ('release', 'not evaluated', ['R0002'], 'V0001'))
             self.assertEqual([(t['id'], t['task_seen']) for t in release['trials']], [('R0002', 'new')])
             self.assertEqual(root.store.log()[0]['author'], 'meta M0001')
             self.assertIn('lab', tomllib.loads((root.layout.lab_home / 'config.toml').read_text())['permissions'])
@@ -82,7 +85,7 @@ class MetaRounds(unittest.TestCase):
         self.refused([edit, say(decision('release', evidence=['R0001']))], 'R0001')       # a Meta call is not evidence
         self.refused([edit, trial, *self.LAB_OK, add_file('../candidate/MORE.md', 'm'),
                       say(decision('release', evidence=['R0002']))], 'R0002')
-        self.refused([say(decision('release', evidence=['R0001']))], '没有改动')
+        self.refused([say(decision('release', evidence=['R0001']))], 'no changes')
         self.refused([add_file('../candidate/codex/settings.toml', 'sandbox_mode = "x"'), trial], 'sandbox_mode')
 
     def test_invalid_twice_ends_the_round(self):
@@ -107,13 +110,13 @@ class MetaRounds(unittest.TestCase):
     def test_applications_and_current_version_trials(self):
         with Root() as root:
             root.add_task('T1')
-            application = [{'what': '连接器 X', 'why': 'w', 'records': []}]
+            application = [{'what': 'connector X', 'why': 'w', 'records': []}]
             root.model.push(say(decision('trial', trials=[{'task': 'T1', 'probe': None, 'version': 'current'}],
                                          applications=application)),
                             say('lab done'), say(decision('no_change')))
             run_round(root.layout, [])
             saved = json.loads((root.layout.records / 'applications' / 'A0001.json').read_text())
-            self.assertEqual((saved['status'], saved['what'], saved['round']), ('pending', '连接器 X', 'M0001'))
+            self.assertEqual((saved['status'], saved['what'], saved['round']), ('pending', 'connector X', 'M0001'))
             self.assertEqual(root.records.load_call('R0002')['tree'], root.store.tree_of('V0001'))
 
     def test_seen_task_label_and_rollback(self):
@@ -159,7 +162,7 @@ class SealedCandidate(unittest.TestCase):
                              ('no_change', 'V0001', ['meta', 'meta', 'meta']))
             self.assertEqual((sorted(os.listdir(outside)), (outside / 'RULES.md').read_text()), (['RULES.md', 'x'],
                                                                                                   'outside'))
-            self.assertIn('符号链接', prompts(root))
+            self.assertIn('symbolic link', prompts(root))
             self.assertFalse((root.store.git_dir / 'refs' / 'rounds' / 'M0001').exists())     # no snapshot at all
             notes = [note for note in index(root, 'sealed') if note['workspace'] == 'candidate']
             self.assertEqual(len(notes), 2)
@@ -273,7 +276,7 @@ class MoreMetaRounds(unittest.TestCase):
             rnd = run_round(root.layout, ['R0001'])
             self.assertEqual((rnd['outcome'], root.store.head()), ('no_change', 'V0001'))
             first = (root.records.call_dir('R0002') / 'prompt.txt').read_text()
-            self.assertIn('R0001：状态 interrupted', first)
+            self.assertIn('- R0001: status interrupted\n', first)
             self.assertTrue(any('R0001' in line and 'interrupted' in line
                                 for line in rnd['decisions'][0]['result']['refused']))
 
@@ -286,9 +289,10 @@ class MoreMetaRounds(unittest.TestCase):
                             say(decision('no_change')))
             rnd = run_round(root.layout, ['R0001'])
             self.assertEqual((rnd['outcome'], rnd['calls']), ('no_change', ['R0002', 'R0003']))
-            self.assertIn('R0001：记录读不出来', (root.records.call_dir('R0002') / 'prompt.txt').read_text())
+            self.assertIn('- R0001: the record cannot be read\n',
+                          (root.records.call_dir('R0002') / 'prompt.txt').read_text())
             refused = rnd['decisions'][0]['result']['refused']
-            self.assertTrue(any('R0001' in line and '读不出来' in line for line in refused), refused)
+            self.assertTrue(any('R0001' in line and 'cannot be read' in line for line in refused), refused)
 
     def test_release_problems_names_what_it_is_about(self):
         with Root() as root:
@@ -296,8 +300,9 @@ class MoreMetaRounds(unittest.TestCase):
             self.assertEqual(run_task(root.layout, 'T1')['version_after'], 'V0002')        # R0001 ran on V0001
             old, head, base = root.store.tree_of('V0001'), root.store.tree_of('V0002'), root.store.resolve('V0002')
             problems = release_problems(root.store, root.records, evidence=['R0001', 'R0007', 'X1'], tree=head,
-                                        base=base, round_id='M0001', problems=['codex/settings.toml：不允许的键 x'])
-            self.assertTrue(any('没有改动' in line for line in problems))
+                                        base=base, round_id='M0001',
+                                        problems=['codex/settings.toml: the key x is not allowed'])
+            self.assertTrue(any('no changes' in line for line in problems))
             for word in ('R0001', 'R0007', 'X1', 'codex/settings.toml'):
                 self.assertTrue(any(word in line for line in problems), word)
             # The old version, released on its own earlier run (design §5.6, last paragraph).
@@ -398,7 +403,7 @@ class MoreMetaRounds(unittest.TestCase):
             self.assertFalse((root.layout.work / 'mine.txt').exists())
             record = json.loads((root.layout.records / 'releases' / 'V0003.json').read_text())
             self.assertEqual((record['kind'], record['version'], record['parent'], record['benefit']),
-                             ('rollback', 'V0003', 'V0002', '未评估'))
+                             ('rollback', 'V0003', 'V0002', 'not evaluated'))
             self.assertIn('mine.txt', (root.layout.records / record['diff']).read_text())
             for version in ('V0003', 'V0009', 'HEAD', '0' * 40):
                 with self.assertRaises(ValueError, msg=version): rollback(root.layout, version, 'owner')
@@ -439,7 +444,7 @@ class FixRound1(unittest.TestCase):
             self.assertEqual(sorted(os.listdir(outside)), ['RULES.md', 'x'])
             [note] = [note for note in index(root, 'sealed') if note['workspace'] == 'candidate']
             self.assertTrue((root.layout.root / note['path']).is_symlink())
-            self.assertIn('符号链接', str(root.model.requests[-1]['input'][-1]))          # Meta is told
+            self.assertIn('symbolic link', str(root.model.requests[-1]['input'][-1]))     # Meta is told
             self.assertEqual(root.store.tree_of_dir(root.layout.candidate), root.store.tree_of('V0001'))
 
     def test_an_immutable_link_that_cannot_be_sealed_stops_the_round_before_another_call(self):
@@ -475,7 +480,7 @@ class FixRound1(unittest.TestCase):
 
             def unrecordable(text):                       # as if a lone surrogate had got past parse_decision
                 parsed = real(text)
-                parsed.notes['problem'] = '坏\ud800'
+                parsed.notes['problem'] = 'bad\ud800'
                 return parsed
 
             root.model.push(add_file('../candidate/RULES.md', 'r'), say(decision('trial', trials=self.TRIAL)),
@@ -484,7 +489,7 @@ class FixRound1(unittest.TestCase):
                 rnd = run_round(root.layout, [])
             self.assertEqual((rnd['outcome'], root.store.head()), ('released', 'V0002'))
             release = json.loads((root.layout.records / 'releases' / 'V0002.json').read_text())
-            self.assertEqual((release['decision']['problem'], release['evidence']), ('坏\\ud800', ['R0002']))
+            self.assertEqual((release['decision']['problem'], release['evidence']), ('bad\\ud800', ['R0002']))
             saved = json.loads((root.layout.records / 'rounds' / 'M0001' / 'round.json').read_text())
             self.assertEqual((saved['outcome'], saved['version_after']), ('released', 'V0002'))
             self.assertTrue(any('UTF-8' in line for line in rnd['problems']), rnd['problems'])
@@ -492,7 +497,7 @@ class FixRound1(unittest.TestCase):
     def test_meta_never_loads_standing_instructions_from_its_own_folder(self):
         with Root() as root:
             for name in ('AGENTS.md', 'AGENTS.override.md'):
-                (root.layout.meta / name).write_text(f'Meta 自己写的指示 MARKER-7f3a-{name}\n')
+                (root.layout.meta / name).write_text(f'Instructions Meta wrote for itself MARKER-7f3a-{name}\n')
             root.model.push(say('not json'), say(decision('no_change')))
             self.assertEqual(run_round(root.layout, [])['outcome'], 'no_change')
             self.assertEqual(len(root.model.requests), 2)

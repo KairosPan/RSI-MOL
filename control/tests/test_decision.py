@@ -40,24 +40,24 @@ class DecisionTests(unittest.TestCase):
         self.assertEqual(sorted(SCHEMA['properties']), sorted(json.loads(decision('no_change'))))
 
     def test_the_parts_of_a_decision(self):
-        text = decision('release', evidence=['R0002', 'R0003'], observations=[{'record': 'R0002', 'note': '看到了'}],
-                        applications=[{'what': '连接器 X', 'why': 'w', 'records': ['R0002']}], problem='问题')
+        text = decision('release', evidence=['R0002', 'R0003'], observations=[{'record': 'R0002', 'note': 'seen'}],
+                        applications=[{'what': 'connector X', 'why': 'w', 'records': ['R0002']}], problem='a problem')
         parsed = parse_decision('\n  ' + text + '\n')
         self.assertEqual((parsed.kind, parsed.evidence, parsed.trials), ('release', ['R0002', 'R0003'], []))
-        self.assertEqual(parsed.notes, {'observations': [{'record': 'R0002', 'note': '看到了'}], 'problem': '问题',
+        self.assertEqual(parsed.notes, {'observations': [{'record': 'R0002', 'note': 'seen'}], 'problem': 'a problem',
                                         'likely_cause': 'c', 'other_explanations': 'o', 'change': 'ch',
                                         'expected_effect': 'e', 'risks': 'r', 'uncertain': 'u'})
-        self.assertEqual(parsed.applications, [{'what': '连接器 X', 'why': 'w', 'records': ['R0002']}])
+        self.assertEqual(parsed.applications, [{'what': 'connector X', 'why': 'w', 'records': ['R0002']}])
         self.assertEqual(parsed.as_dict(), json.loads(text))
-        probe = parse_decision(decision('trial', trials=[{'task': None, 'probe': '说你好', 'version': 'current'}]))
-        self.assertEqual(probe.trials, [{'task': None, 'probe': '说你好', 'version': 'current'}])
+        probe = parse_decision(decision('trial', trials=[{'task': None, 'probe': 'say hello', 'version': 'current'}]))
+        self.assertEqual(probe.trials, [{'task': None, 'probe': 'say hello', 'version': 'current'}])
 
-    def test_every_rule_has_a_one_line_chinese_reason(self):
+    def test_every_rule_has_a_one_line_english_reason(self):
         trial = {'task': 'T1', 'probe': None, 'version': 'candidate'}
         cases = {
-            '[]': 'JSON 对象',
+            '[]': 'JSON object',
             decision('no_change') + 'x': 'JSON',
-            '{"decision": "no_change", "decision": "trial"}': '重复',
+            '{"decision": "no_change", "decision": "trial"}': 'repeated',
             json.dumps({**json.loads(decision('no_change')), 'extra': 1}): 'extra',
             decision('trial', trials=[{**trial, 'version': 'head'}]): 'version',
             decision('trial', trials=[{'task': None, 'probe': None, 'version': 'current'}]): 'task',
@@ -77,7 +77,7 @@ class DecisionTests(unittest.TestCase):
             decision('no_change', observations=[{'record': 'R0001'}]): 'note',
             decision('no_change', applications=[{'what': '', 'why': 'w', 'records': []}]): 'what',
             decision('no_change', applications=[{'what': 'x', 'why': 'w', 'records': ['A0001']}]): 'A0001',
-            decision('no_change', problem='x' * (1 << 20)): '字符',
+            decision('no_change', problem='x' * (1 << 20)): 'characters',
             '[' * 100000 + ']' * 100000: 'JSON',
         }
         for text, word in cases.items():
@@ -111,9 +111,9 @@ class DecisionTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             parse_decision(many)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertIn('键', str(caught.exception))
+        self.assertIn('keys', str(caught.exception))
         repeated = '{' + ', '.join(['"decision": "no_change"'] * 2) + '}'
-        with self.assertRaisesRegex(ValueError, '重复'):
+        with self.assertRaisesRegex(ValueError, 'repeated'):
             parse_decision(repeated)
 
     def test_repeated_evidence_is_kept_once_in_order(self):

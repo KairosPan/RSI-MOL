@@ -20,7 +20,7 @@ only creates meta/.tmp and meta/notes when missing.
 
 Everything in a decision is untrusted: ids are checked before any path or git command is built from them. A release
 needs real evidence: Lab runs that ended (finished, failed or timed_out) on exactly the tree being released. Whether
-the evidence shows an improvement is Meta's call, so a release record always says benefit 未评估.
+the evidence shows an improvement is Meta's call, so a release record always says benefit `not evaluated`.
 """
 import hashlib
 import json
@@ -50,31 +50,42 @@ INSTRUCTIONS = Path('meta', 'AGENTS.md')        # under owner/: Meta's standing 
 META_SETTINGS = Path('meta', 'settings.toml')   # under owner/: Meta's model and reasoning effort
 META_KEYS = ('model', 'model_reasoning_effort')
 RUN_ENDED = ('finished', 'failed', 'timed_out')  # a Lab run that counts as evidence; an interrupted one does not
-BENEFIT = '未评估'
+BENEFIT = 'not evaluated'
 RELEASE_FILE = re.compile(r'V[0-9]{4,}\.json')
 TEXT_KEPT = 50_000                              # characters of an invalid answer kept in the round record
 WRITE_TRIES = 3                                 # tries to claim an application id
-DEFAULT_INSTRUCTIONS = """你是 Meta Codex：在任务之间改进 Lab Codex 的工作区（它的指示、技能、设置、子 agent 角色和工具服务）。
+# Why something found at candidate/ while the program handles the candidate is kept aside.
+UNUSED = 'it appeared while the control program was handling the candidate; it was not used'
+DEFAULT_INSTRUCTIONS = """You are the Meta Codex: between tasks you improve the Lab Codex's workspace (its \
+instructions, skills, settings, sub-agent roles and tool servers).
 
-- 先核对记录再下判断，判断里引用记录编号。
-- 单次现象不当作规律；依据不足就不改。
-- 一次只做一个小改动。
-- 不把某个任务的答案写进 Lab 的指示。
-- 写明可能的退化和拿不准的地方；不声称收益。
-- 要扩大 Lab 的外部范围（连接器、插件、工作区以外的文件、预算上限），写申请，由主人决定。
+- Check the records before you judge, and cite record ids in your judgement.
+- Do not treat something seen once as a pattern; if the evidence is not enough, change nothing.
+- Make one small change at a time.
+- Do not write the answer to any task into the Lab's instructions.
+- State possible regressions and what you are unsure of; do not claim a benefit.
+- To widen what the Lab can reach outside (connectors, plugins, files outside its workspace, budget limits), write \
+an application; the owner decides.
 """
-DECISION_GUIDE = """每次调用最后只交回一个 JSON 对象（格式见输出约束），decision 三选一：
+DECISION_GUIDE = """End every call by returning exactly one JSON object (its format is in the output constraints). Its \
+decision is one of three:
 
-- no_change：不改，本轮结束。
-- trial：在 trials 里列出要试跑的项。每项给 task（已有任务的编号）或 probe（你写的一段测试文字，没有检查脚本，\
-结果由你自己看）二者之一，version 写 candidate（现在的候选版）或 current（当前版本）。控制程序先把候选版存成快照，\
-再在 trial/ 里逐项运行，然后在同一会话里告诉你新的调用编号、状态和检查结果。
-- release：发布现在的候选版，在 evidence 里列出作为依据的运行记录。控制程序只核对：本轮还没发布过；候选版是从当前\
-版本改出来的，并且确实有改动；设置文件和角色文件里只有允许改的键，没有 .codex；引用的每条记录都是已经结束的 Lab \
-运行，跑的内容和现在的候选版完全一样（改了候选版之后，之前的试跑就不再算）。结果好不好由你判断。
+- no_change: change nothing; the round ends.
+- trial: list the trial runs you want in trials. Each item gives either task (the id of an existing task) or probe \
+(a test text you write; it has no check script, and you read its result yourself), and a version: candidate (the \
+candidate as it is now) or current (the current version). The control program first saves the candidate as a \
+snapshot, then runs the items one by one in trial/, and then tells you in the same session the new call ids, their \
+statuses and their check results.
+- release: release the candidate as it is now, and list in evidence the run records the release rests on. The \
+control program checks only this: nothing has been released in this round yet; the candidate was cut from the current \
+version and does have changes; the settings file and the role files hold only keys that may be changed, and there is \
+no .codex; every record cited is a Lab run that has ended and that ran exactly the candidate as it is now (once you \
+change the candidate, earlier trials no longer count). Whether the results are good is your judgement.
 
-observations 的 record、evidence 和 applications 的 records 都只能是调用编号（R 加数字，例如 R0002）。\
-要扩大 Lab 的外部范围，写在 applications 里，由主人决定。"""
+The record of an observation, the evidence and the records of an application can only be call ids (R and digits, \
+for example R0002). To widen what the Lab can reach outside, write it in applications; the owner decides.
+
+Write every text field of your reply in English."""
 
 
 def _owner_text(path: Path) -> str | None:
@@ -84,7 +95,7 @@ def _owner_text(path: Path) -> str | None:
     except FileNotFoundError:
         return None
     except (OSError, UnicodeDecodeError) as error:
-        raise Refused(f'{path} 读不了：{error}') from None
+        raise Refused(f'{path} cannot be read: {error}') from None
 
 
 def _instructions(layout: Layout) -> str:
@@ -101,18 +112,18 @@ def _meta_settings(layout: Layout) -> dict:
     try:
         table = tomllib.loads(text)
     except (tomllib.TOMLDecodeError, RecursionError) as error:
-        raise Refused(f'{path} 不是合法的 TOML：{" ".join(str(error).split())}') from None
+        raise Refused(f'{path} is not valid TOML: {" ".join(str(error).split())}') from None
     unknown = sorted(set(table) - set(META_KEYS))
     if unknown:
-        raise Refused(f'{path} 里有不认识的键：{"、".join(unknown)}（只能有 {"、".join(META_KEYS)}）')
+        raise Refused(f'{path} has unknown keys: {", ".join(unknown)} (only {", ".join(META_KEYS)} are allowed)')
     return table
 
 
 def _check_text(check) -> str:
     if not isinstance(check, dict):
-        return '没有检查脚本'
+        return 'no check script'
     message = check.get('message')
-    return ('通过' if check.get('passed') is True else '没通过') + (f'（{message}）' if message else '')
+    return ('passed' if check.get('passed') is True else 'not passed') + (f' ({message})' if message else '')
 
 
 def _bullets(title: str, lines: list[str]) -> str:
@@ -140,12 +151,14 @@ def _write(records: Records, relative: str, data: dict, problems: list[str]) -> 
             return True
         except UnicodeEncodeError:
             if attempt:
-                problems.append(f'没能写记录 {relative}：转义以后仍不能存成 UTF-8')
+                problems.append(f'Could not write the record {relative}: it still cannot be stored as UTF-8 after '
+                                'escaping')
                 break
-            problems.append(f'{relative} 里有不能存成 UTF-8 的字符，已转义后保存')
+            problems.append(f'{relative} had characters that cannot be stored as UTF-8; they were escaped and it '
+                            'was saved')
             data = _recordable(data)
         except Exception as error:
-            problems.append(f'没能写记录 {relative}：{type(error).__name__}: {error}')
+            problems.append(f'Could not write the record {relative}: {type(error).__name__}: {error}')
             break
     try:
         records.note('unrecorded', {'path': relative, 'reason': problems[-1]})
@@ -161,7 +174,7 @@ def _save_patch(records: Records, version: str, text: str) -> tuple[str, str]:
         os.mkdir(folder)
     except FileExistsError:
         if folder.is_symlink() or not folder.is_dir():
-            raise ValueError(f'{folder} 不是普通文件夹') from None
+            raise ValueError(f'{folder} is not a plain folder') from None
     data = text.encode('utf-8')
     with open(folder / f'{version}.patch', 'xb') as stream:
         stream.write(data)
@@ -189,7 +202,7 @@ def _released_in(records: Records, round_id: str) -> str | None:
 
 def release_problems(store: VersionStore, records: Records, *, evidence: list[str], tree: str, base: str,
                      round_id: str, problems: list[str] = ()) -> list[str]:
-    """Why the candidate whose tree is `tree` may not be released: the four checks of design §5.6, one Chinese line
+    """Why the candidate whose tree is `tree` may not be released: the four checks of design §5.6, one English line
     per problem, each naming the version, key or record it is about; empty means release.
 
     base is main's head commit when the round cut the candidate; problems are the candidate's settings and
@@ -198,37 +211,40 @@ def release_problems(store: VersionStore, records: Records, *, evidence: list[st
     out = []
     done = _released_in(records, round_id)                                         # 1
     if done is not None:
-        out.append(f'本轮（{round_id}）已经发布过 {done}，一轮只能发布一次')
+        out.append(f'This round ({round_id}) has already released {done}; a round can release only once')
     head = store.head()                                                            # 2
     if tree == store.tree_of(head):
-        out.append(f'候选版和当前版本 {head} 相比没有改动')
+        out.append(f'The candidate has no changes compared with the current version {head}')
     if store.resolve(head) != base:
-        out.append(f'候选版不是从现在的当前版本 {head} 改出来的（本轮开始以后版本变了）')
+        out.append(f'The candidate was not cut from the current version {head} (the version changed after this round '
+                   'began)')
     out += list(problems)                                                          # 3
     if not evidence:                                                               # 4
-        out.append('没有引用任何运行记录，至少要引用一条')
+        out.append('No run record is cited; cite at least one')
     checked = []
     for call_id in evidence:
         if call_id in checked:                                                     # each id once, in order
             continue
         checked.append(call_id)
         if not isinstance(call_id, str) or not CALL_ID.fullmatch(call_id):
-            out.append(f'{show(call_id)} 不是调用编号')
+            out.append(f'{show(call_id)} is not a call id')
             continue
         try:
             call = records.load_call(call_id)
         except KeyError:
-            out.append(f'{call_id} 不存在')
+            out.append(f'{call_id} does not exist')
             continue
         except ValueError:
-            out.append(f'{call_id} 的记录读不出来')
+            out.append(f'The record of {call_id} cannot be read')
             continue
         if call.get('role') != 'lab':
-            out.append(f'{call_id} 不是 Lab 的运行（是 {show(call.get("role"))} 的调用），不能作为依据')
+            out.append(f'{call_id} is not a Lab run (it is a call of {show(call.get("role"))}); it cannot be evidence')
         elif call.get('status') not in RUN_ENDED:
-            out.append(f'{call_id} 的状态是 {show(call.get("status"))}，不是 {"、".join(RUN_ENDED)} 之一，不能作为依据')
+            out.append(f'The status of {call_id} is {show(call.get("status"))}, not one of {", ".join(RUN_ENDED)}; it '
+                       'cannot be evidence')
         elif call.get('tree') != tree:
-            out.append(f'{call_id} 跑的内容和现在的候选版不一样（改了候选版之后要重新试跑），不能作为依据')
+            out.append(f'{call_id} did not run the candidate as it is now (after a change to the candidate, run '
+                       'the trials again); it cannot be evidence')
     return out
 
 
@@ -297,14 +313,15 @@ class _Round:
         while outcome is None:
             if len(self.calls) >= self.limits.meta_calls:
                 outcome = 'limit_reached'
-                reason = f'本轮的 Meta 调用到了 {self.limits.meta_calls} 次的上限（owner/limits.toml 的 meta.calls_per_round）'
+                reason = (f'The Meta calls of this round reached the limit of {self.limits.meta_calls} '
+                          '(meta.calls_per_round in owner/limits.toml)')
                 break
             refused = self._refusal()
             if refused is not None:
                 outcome, reason = 'limit_reached', refused
                 break
             if self.notices:                               # what the program had to do before this call
-                prompt = f'{prompt}\n\n{_bullets("另外：", self.notices)}'
+                prompt = f'{prompt}\n\n{_bullets("Also:", self.notices)}'
                 self.notices = []
             call, text = self._call(prompt, schema)
             entry = {'call': call['id'], 'status': call['status'], 'decision': None}
@@ -315,9 +332,11 @@ class _Round:
                 invalid += 1
                 entry.update(invalid=str(error), text=text[:TEXT_KEPT])
                 if invalid >= 2:
-                    outcome, reason = 'invalid_decision', f'Meta 两次交回的都不是合规的决定（{call["id"]}：{error}）'
+                    outcome = 'invalid_decision'
+                    reason = f'Meta twice returned no valid decision ({call["id"]}: {error})'
                     break
-                reply = f'你交回的不是合规的决定：{error}。请只交回一个符合格式的 JSON 决定。'
+                reply = (f'Your reply is not a valid decision: {error}. Reply with exactly one JSON decision in the '
+                         'required format.')
             else:
                 entry['decision'] = decision.as_dict()
                 entry['applications'] = self._applications(decision, call['id'])
@@ -345,38 +364,38 @@ class _Round:
         try:
             call = self.records.load_call(call_id)
         except KeyError:
-            return f'- {call_id}：没有这条记录'
+            return f'- {call_id}: there is no such record'
         except ValueError:
-            return f'- {call_id}：记录读不出来'
+            return f'- {call_id}: the record cannot be read'
         status = call.get('status')
         if status not in RUN_ENDED:                   # interrupted (or not ended): its status only
-            return f'- {call_id}：状态 {show(status)}'
+            return f'- {call_id}: status {show(status)}'
         task = call.get('task')
-        what = f'任务 {task}' if isinstance(task, str) else '测试文字' if call.get('probe') else '没有任务'
-        return f'- {call_id}：{what}，状态 {status}，检查：{_check_text(call.get("check"))}'
+        what = f'task {task}' if isinstance(task, str) else 'a test text' if call.get('probe') else 'no task'
+        return f'- {call_id}: {what}, status {status}, check: {_check_text(call.get("check"))}'
 
     def _brief(self, trigger: list[str]) -> str:
         layout = self.layout
-        lines = [f'# Meta 轮 {self.round_id}', '', f'当前版本：{self.version}。', '']
+        lines = [f'# Meta round {self.round_id}', '', f'Current version: {self.version}.', '']
         if trigger:
-            lines += ['触发本轮的调用：', *(self._trigger_line(call_id) for call_id in trigger)]
+            lines += ['The calls that started this round:', *(self._trigger_line(call_id) for call_id in trigger)]
         else:
-            lines.append('这一轮是单独运行的，没有触发它的调用。')
-        lines += ['', f'你的工作目录是 meta/，即 {layout.meta}。',
-                  f'- 记录：{layout.records}（只读）。每次 Codex 调用在 runs/<编号>/，每轮 Meta 在 rounds/<编号>/，'
-                  '发布和回退在 releases/，申请在 applications/。',
-                  f'- Lab 工作区：{layout.work}（只读），就是当前版本。',
-                  f'- 候选版：../candidate，即 {layout.candidate}（可写）。本轮开始时它是当前版本的副本；'
-                  '试跑和发布用的都是它。',
-                  f'- 你的笔记：notes/，即 {layout.notes}（可写），各轮之间保留。', '', self._left(), '',
-                  DECISION_GUIDE]
+            lines.append('This round was run on its own; no call started it.')
+        lines += ['', f'Your working folder is meta/, that is {layout.meta}.',
+                  f'- Records: {layout.records} (read-only). Each Codex call is in runs/<id>/, each Meta round in '
+                  'rounds/<id>/, releases and rollbacks in releases/, applications in applications/.',
+                  f'- The Lab workspace: {layout.work} (read-only). It holds the current version.',
+                  f'- The candidate: ../candidate, that is {layout.candidate} (writable). When this round began it was '
+                  'a copy of the current version; trials and releases use it.',
+                  f'- Your notes: notes/, that is {layout.notes} (writable). They are kept from round to round.', '',
+                  self._left(), '', DECISION_GUIDE]
         return '\n'.join(lines)
 
     def _left(self) -> str:
         calls = max(self.limits.meta_calls - len(self.calls), 0)
         trials = max(self.limits.meta_trials - self.trials_run, 0)
-        return (f'本轮还剩：Meta 调用 {calls} 次（含读到这段话的这一次），试跑 {trials} 次；'
-                f'每次 Meta 调用最长 {self.limits.meta_seconds} 秒。')
+        return (f'Left in this round: {calls} Meta calls (counting the one that reads this) and {trials} trial runs; '
+                f'each Meta call may last at most {self.limits.meta_seconds} seconds.')
 
     # One Meta call.
 
@@ -397,7 +416,8 @@ class _Round:
             try:
                 step()
             except (Refused, *WORKSPACE_ERRORS) as error:
-                reason = f'{name} 不是可用的文件夹，也没能换成一个（{type(error).__name__}: {error}），不再启动 Meta'
+                reason = (f'{name} is not a usable folder and could not be replaced by one ({type(error).__name__}: '
+                          f'{error}); Meta is not started again')
         if reason is not None:
             self.records.note('refusal', {'reason': reason, **self.context})
         return reason
@@ -411,19 +431,20 @@ class _Round:
         found = kind('candidate', root_fd)
         if found == 'folder':
             return
-        what = '不见了' if found is None else '被换成了符号链接' if found == 'link' else '被换成了文件'
+        what = ('is gone' if found is None else 'was replaced by a symbolic link' if found == 'link'
+                else 'was replaced by a file')
         kept = ''
         if found is not None:
             label = stamp()
             entry = seal(root_fd, 'candidate', label)
             if entry is not None:
                 dispose(self.layout, self.records, root_fd, entry, 'candidate', label,
-                        [f'candidate/ 在两次 Meta 调用之间{what}'], self.context, self.problems)
-                kept = '控制程序没有跟着它走，已把它留档；'
+                        [f'candidate/ {what} between two Meta calls'], self.context, self.problems)
+                kept = 'the control program did not follow it and kept it aside; '
         _put_candidate(self.layout, self.records, self.store, root_fd, self.last or self.base,
-                       '它在控制程序处理候选版时出现，没有用它', self.context, self.problems)
-        source = '本轮上一次存的快照' if self.last is not None else f'当前版本（{self.version}）'
-        notice = f'candidate/ {what}，{kept}candidate/ 已换成{source}'
+                       UNUSED, self.context, self.problems)
+        source = "this round's last snapshot" if self.last is not None else f'the current version ({self.version})'
+        notice = f'candidate/ {what}; {kept}candidate/ is now {source}'
         self.notices.append(notice)
         self.problems.append(notice)
 
@@ -436,8 +457,8 @@ class _Round:
             label = stamp()
             entry = seal(root_fd, 'meta', label)
             if entry is not None:
-                dispose(self.layout, self.records, root_fd, entry, 'meta', label, ['meta/ 不是文件夹（可能是符号链接）'],
-                        self.context, self.problems)
+                dispose(self.layout, self.records, root_fd, entry, 'meta', label,
+                        ['meta/ is not a folder (it may be a symbolic link)'], self.context, self.problems)
         try:
             os.mkdir('meta', 0o755, dir_fd=root_fd)
         except FileExistsError:
@@ -474,11 +495,11 @@ class _Round:
         problems = []
         try:
             if result.thread_id is not None:
-                with problem(problems, '没能取出会话记录'):
+                with problem(problems, 'Could not copy the session records'):
                     end['subagent_threads'] = collect_sessions(self.layout.meta_home, result.thread_id,
                                                                call_dir / 'sessions')
         except BaseException as error:                  # only an interruption gets here
-            problems.append(f'取会话记录时被打断（{type(error).__name__}）')
+            problems.append(f'Interrupted while copying the session records ({type(error).__name__})')
             try:
                 records.finish_call(call_id, {**end, 'problems': problems})
             except Exception:
@@ -505,13 +526,13 @@ class _Round:
                 except FileExistsError:
                     continue
                 except Exception as error:
-                    self.problems.append(f'{call_id} 的申请“{show(fields["what"])}”没能存下：{type(error).__name__}: '
-                                         f'{error}')
+                    self.problems.append(f'The application {show(fields["what"])} of {call_id} could not be saved: '
+                                         f'{type(error).__name__}: {error}')
                     break
                 ids.append(app_id)
                 break
             else:
-                self.problems.append(f'{call_id} 的申请“{show(fields["what"])}”没能存下')
+                self.problems.append(f'The application {show(fields["what"])} of {call_id} could not be saved')
         self.applications += ids
         return ids
 
@@ -523,8 +544,8 @@ class _Round:
         if decision.kind == 'trial':
             if len(self.calls) >= self.limits.meta_calls:
                 entry['result'] = {'ended': 'limit_reached'}
-                return 'limit_reached', (f'Meta 要求试跑，但本轮的 Meta 调用已经用完（{self.limits.meta_calls} 次），'
-                                         '没有运行任何试跑'), ''
+                return 'limit_reached', (f'Meta asked for trials, but the Meta calls of this round are used up '
+                                         f'({self.limits.meta_calls}); no trial was run'), ''
             return None, None, self._trials(decision, call_id, entry)
         reply = self._release(decision, call_id, entry)
         if self.released is not None:
@@ -535,11 +556,13 @@ class _Round:
         taken = self._take_candidate(call_id)
         if taken.snapshot is None:
             entry['result'] = {'refused': taken.problems, 'notes': taken.notes}
-            return _bullets('候选版有问题，这次的试跑一项也没有运行：', taken.problems + taken.notes) + '\n请改好以后再给出决定。'
+            return (_bullets('The candidate has problems; none of these trials was run:', taken.problems + taken.notes)
+                    + '\nFix them, then give your decision again.')
         lines, ran, not_run = [], [], []
         for number, trial in enumerate(decision.trials, start=1):
-            what = f'任务 {trial["task"]}' if trial['task'] is not None else '测试文字'
-            label = f'第 {number} 项（{what}，{"候选版" if trial["version"] == "candidate" else "当前版本"}）'
+            what = f'task {trial["task"]}' if trial['task'] is not None else 'a test text'
+            which = 'the candidate' if trial['version'] == 'candidate' else 'the current version'
+            label = f'item {number} ({what}, {which})'
             if self.trials_run >= self.limits.meta_trials:
                 not_run.append(label)
                 continue
@@ -548,7 +571,7 @@ class _Round:
                 call = run_trial(self.layout, commit=commit, round_id=self.round_id, task_id=trial['task'],
                                  probe=trial['probe'], resolve=self.resolve)
             except (Refused, *WORKSPACE_ERRORS) as error:
-                lines.append(f'{label}没有运行：{error}')
+                lines.append(f'{label} was not run: {error}')
                 continue
             self.trials_run += 1
             seen = 'probe' if trial['probe'] is not None else 'seen' if trial['task'] in self.seen else 'new'
@@ -556,11 +579,12 @@ class _Round:
                                 'version': trial['version'], 'commit': commit, 'tree': call.get('tree'),
                                 'status': call.get('status'), 'check': call.get('check'), 'task_seen': seen})
             ran.append(call['id'])
-            lines.append(f'{call["id"]}：{label}，状态 {call.get("status")}，检查：{_check_text(call.get("check"))}')
+            lines.append(f'{call["id"]}: {label}, status {call.get("status")}, check: {_check_text(call.get("check"))}')
         if not_run:
-            lines.append(f'本轮的试跑次数（{self.limits.meta_trials} 次）用完了，没有运行：{"；".join(not_run)}')
+            lines.append(f'The trial runs of this round ({self.limits.meta_trials}) are used up; not run: '
+                         f'{"; ".join(not_run)}')
         entry['result'] = {'trials': ran, 'lines': lines, 'notes': taken.notes}
-        return _bullets('试跑结果（记录在 records/runs/<编号>/）：', lines + taken.notes)
+        return _bullets('Trial results (their records are in records/runs/<id>/):', lines + taken.notes)
 
     def _release(self, decision: Decision, call_id: str, entry: dict) -> str:
         taken = self._take_candidate(call_id)
@@ -570,14 +594,14 @@ class _Round:
                 problems = release_problems(self.store, self.records, evidence=decision.evidence, tree=taken.tree,
                                             base=self.base, round_id=self.round_id, problems=taken.problems)
             except WORKSPACE_ERRORS as error:
-                problems = [f'没能核对发布的条件（{type(error).__name__}: {error}）']
+                problems = [f'Could not check the conditions of a release ({type(error).__name__}: {error})']
         if not problems:
             problems = self._publish(decision, call_id, taken)
         if not problems:
             entry['result'] = {'released': self.released}
             return ''
         entry['result'] = {'refused': problems, 'notes': taken.notes}
-        return _bullets('没有发布，原因：', problems + taken.notes)
+        return _bullets('Not released, because:', problems + taken.notes)
 
     def _publish(self, decision: Decision, call_id: str, taken: _Taken) -> list[str]:
         """Make the snapshot the next version, put it into work/, and write the release record; [] when that
@@ -587,32 +611,33 @@ class _Round:
         try:
             take_work(layout, self.records, store, self.root_fd, self.records.calls(), self.context, self.problems)
         except Refused as refused:
-            return [f'{refused}，所以没有发布']
+            return [f'{refused}; so nothing was released']
         reasons, version = [], None
         try:
             head = store.head()
             if store.resolve(head) != self.base:
-                reasons.append(f'work/ 里有本轮开始以后的改动，已存成版本 {head}；候选版不再是从当前版本改出来的')
+                reasons.append(f'work/ had changes made after this round began; they were saved as version {head}, '
+                               'so the candidate is no longer cut from the current version')
             else:
                 version = store.commit_tree(taken.snapshot, f'meta {self.round_id}',
-                                            f'Meta 轮 {self.round_id} 发布（决定 {call_id}，依据 '
-                                            f'{"、".join(decision.evidence)}）')
+                                            f'Meta round {self.round_id} release (decision {call_id}, evidence '
+                                            f'{", ".join(decision.evidence)})')
                 if version is None:
-                    reasons.append(f'候选版和当前版本 {head} 相比没有改动')
+                    reasons.append(f'The candidate has no changes compared with the current version {head}')
         except WORKSPACE_ERRORS as error:
-            reasons.append(f'没能存成新版本（{type(error).__name__}: {error}）')
+            reasons.append(f'Could not save a new version ({type(error).__name__}: {error})')
         settings = None
-        with problem(self.problems, 'work/ 没能换成最新版本'):
+        with problem(self.problems, 'work/ could not be replaced by the newest version'):
             staged, settings = stage(layout, store, store.head())
             move_in(layout, self.records, self.root_fd, staged, 'work', self.context, self.problems)
         if version is None:
             return reasons
         self.released = version
         if settings is not None:
-            with problem(self.problems, 'Lab 的 Codex 配置（codex-home/config.toml）没能更新'):
+            with problem(self.problems, "The Lab's Codex configuration (codex-home/config.toml) could not be updated"):
                 write_home_config(layout, self.envelope, settings, resolve=self.resolve)
         diff = digest = None
-        with problem(self.problems, f'没能保存 {self.version} 到 {version} 的差异'):
+        with problem(self.problems, f'Could not save the diff from {self.version} to {version}'):
             diff, digest = _save_patch(self.records, version, store.diff(self.version, version))
         record = {'kind': 'release', 'version': version, 'parent': self.version, 'round': self.round_id,
                   'call': call_id, 'author': f'meta {self.round_id}', 'time': now(), 'snapshot': taken.snapshot,
@@ -633,31 +658,35 @@ class _Round:
         try:
             entry = seal(root_fd, 'candidate', label)
         except OSError as error:
-            taken.problems.append(f'candidate/ 封存不了（{error.strerror or error}），没有用它；'
-                                  '请检查 candidate/ 本身的标志和权限')
+            taken.problems.append(f'candidate/ cannot be sealed ({error.strerror or error}) and was not used; '
+                                  'check the flags and permissions of candidate/ itself')
             return taken
         if entry is None:
-            taken.problems.append('candidate/ 不在了')
+            taken.problems.append('candidate/ is gone')
             self._start_over(taken, context)
             return taken
         path, found = layout.root / entry, kind(entry, root_fd)
         if found != 'folder':
-            reason = 'candidate/ 被换成了符号链接' if found == 'link' else 'candidate/ 不是文件夹'
+            reason = 'candidate/ was replaced by a symbolic link' if found == 'link' else 'candidate/ is not a folder'
             keep.append(reason)
-            taken.problems.append(f'{reason}；控制程序不会跟着它走，也不会把它存成快照')
+            taken.problems.append(f'{reason}; the control program does not follow it and does not save it as a '
+                                  'snapshot')
         else:
             try:
                 lines, moved, blocked = prepare_for_commit(path, layout.sealed / label / 'left-out',
                                                            f'{layout.sealed.name}/{label}/left-out')
                 taken.notes += lines
                 if moved:
-                    keep.append(f'有 {moved} 处内容没有存进快照，已移到 {layout.sealed.name}/{label}/left-out/')
+                    keep.append(f'{moved} entries were not saved in the snapshot; they were moved to '
+                                f'{layout.sealed.name}/{label}/left-out/')
                 if blocked:
-                    keep.append(f'有 {blocked} 处应排除在快照之外的内容没能移出去')
-                    taken.problems.append(f'候选版里有 {blocked} 处应排除在版本之外的内容没能移出去，没有存成快照')
+                    keep.append(f'{blocked} entries that must be left out of the snapshot could not be moved out')
+                    taken.problems.append(f'The candidate has {blocked} entries that must be left out of a version '
+                                          'but could not be moved out; it was not saved as a snapshot')
                 elif os.path.lexists(path / '.codex'):
-                    keep.append('里面有 .codex')
-                    taken.problems.append('候选版里有 .codex，不能存成快照，也不能试跑或发布')
+                    keep.append('it holds .codex')
+                    taken.problems.append('The candidate holds .codex; it cannot be saved as a snapshot, tried or '
+                                          'released')
                 else:
                     found_problems = workspace_problems(path) + tool_server_problems(
                         self.envelope, load_settings(path), resolve=self.resolve)
@@ -665,12 +694,12 @@ class _Round:
                         taken.tree = self.store.tree_of_dir(path)
                         taken.problems += found_problems
                     else:
-                        taken.snapshot = self.store.snapshot(path, self.round_id,
-                                                             f'Meta 轮 {self.round_id} 的候选版（决定 {call_id}）')
+                        taken.snapshot = self.store.snapshot(
+                            path, self.round_id, f'Meta round {self.round_id} candidate (decision {call_id})')
                         taken.tree = self.store.tree_of(taken.snapshot)
             except WORKSPACE_ERRORS as error:
                 taken.tree = taken.snapshot = None
-                reason = f'候选版没能存成快照（{type(error).__name__}: {error}）'
+                reason = f'The candidate could not be saved as a snapshot ({type(error).__name__}: {error})'
                 keep.append(reason)
                 taken.problems.append(reason)
         if taken.snapshot is not None:
@@ -689,29 +718,31 @@ class _Round:
         try:
             os.rename(entry, 'candidate', src_dir_fd=self.root_fd, dst_dir_fd=self.root_fd)
         except OSError as error:
-            keep.append(f'没能放回 candidate/（{error.strerror or error}）')
+            keep.append(f'it could not be put back as candidate/ ({error.strerror or error})')
             return False
         if keep:
             self.records.note('sealed', {'workspace': 'candidate', 'reasons': keep, **context,
                                          'path': f'{self.layout.sealed.name}/{label}/left-out'})
-        taken.notes.append('candidate/ 还是你改过的样子（没有存成快照），改好上面的问题再给出决定')
+        taken.notes.append('candidate/ is still as you left it (it was not saved as a snapshot); fix the problems '
+                           'above, then give your decision again')
         return True
 
     def _restage(self, source: str, lines: list[str], context: dict) -> bool:
         """candidate/ as a fresh checkout of source; whether that worked (else a line says why)."""
         try:
             _put_candidate(self.layout, self.records, self.store, self.root_fd, source,
-                           '它在控制程序处理候选版时出现，没有用它', context, lines)
+                           UNUSED, context, lines)
             return True
         except Exception as error:
-            lines.append(f'candidate/ 没能换成新的内容：{type(error).__name__}: {error}')
+            lines.append(f'candidate/ could not be replaced by the new content: {type(error).__name__}: {error}')
             return False
 
     def _keep_final(self) -> None:
-        """Keep the candidate of a round that released nothing (§5.5: 没有发布的候选版也留档). It is sealed; when it
-        passes the checks a trial snapshot needs and its tree differs from main's head and from the round's last
-        snapshot, it is snapshotted on refs/rounds/<round> (final_candidate); then it is renamed back as candidate/.
-        One that cannot be snapshotted is kept under sealed/ with a note. Never fails the round: a problem line."""
+        """Keep the candidate of a round that released nothing (§5.5: a candidate that was not released is kept
+        too). It is sealed; when it passes the checks a trial snapshot needs and its tree differs from main's head and
+        from the round's last snapshot, it is snapshotted on refs/rounds/<round> (final_candidate); then it is renamed
+        back as candidate/. One that cannot be snapshotted is kept under sealed/ with a note. Never fails the round: a
+        problem line."""
         layout, store, label = self.layout, self.store, f'final-{self.round_id}'
         context, left, unstorable, lines = {**self.context, 'final': True}, [], [], []
         try:
@@ -720,39 +751,45 @@ class _Round:
                 return
             path = layout.root / entry
             if kind(entry, self.root_fd) != 'folder':
-                unstorable.append('本轮结束时 candidate/ 不是文件夹（可能是符号链接），没有跟着它走')
+                unstorable.append('At the end of the round candidate/ was not a folder (it may be a symbolic link); '
+                                  'it was not followed')
             else:
                 try:
                     lines, moved, blocked = prepare_for_commit(path, layout.sealed / label / 'left-out',
                                                                f'{layout.sealed.name}/{label}/left-out')
                     if moved:
-                        left.append(f'有 {moved} 处内容没有存进快照，已移到 {layout.sealed.name}/{label}/left-out/')
+                        left.append(f'{moved} entries were not saved in the snapshot; they were moved to '
+                                    f'{layout.sealed.name}/{label}/left-out/')
                     if blocked:
-                        found = [f'有 {blocked} 处应排除在版本之外的内容没能移出去']
+                        found = [f'{blocked} entries that must be left out of a version could not be moved out']
                     elif has_entry(path, '.codex'):
-                        found = ['里面有 .codex']
+                        found = ['it holds .codex']
                     else:
                         found = workspace_problems(path) + tool_server_problems(
                             self.envelope, load_settings(path), resolve=self.resolve)
                     if found:
-                        unstorable.append(f'本轮结束时的候选版存不成快照：{"；".join(found)}')
+                        unstorable.append(f'The candidate at the end of the round cannot be saved as a snapshot: '
+                                          f'{"; ".join(found)}')
                     elif store.tree_of_dir(path) not in {store.tree_of(store.head()),
                                                          *([store.tree_of(self.last)] if self.last else [])}:
-                        self.final = store.snapshot(path, self.round_id, f'Meta 轮 {self.round_id} 结束时没有发布的候选版')
+                        self.final = store.snapshot(
+                            path, self.round_id, f'Meta round {self.round_id} candidate left unreleased at its end')
                 except WORKSPACE_ERRORS as error:
-                    unstorable.append(f'本轮结束时的候选版存不成快照（{type(error).__name__}: {error}）')
+                    unstorable.append(f'The candidate at the end of the round cannot be saved as a snapshot '
+                                      f'({type(error).__name__}: {error})')
             self.problems.extend(lines)
             if unstorable or not self._rename_back(entry, label, left, context, _Taken()):
                 dispose(layout, self.records, self.root_fd, entry, 'candidate', label, left + unstorable, context,
                         self.problems)
         except Exception as error:
-            self.problems.append(f'本轮结束时没能把候选版留档：{type(error).__name__}: {error}')
+            self.problems.append(f'Could not keep the candidate at the end of the round: {type(error).__name__}: '
+                                 f'{error}')
 
     def _start_over(self, taken: _Taken, context: dict) -> None:
         """candidate/ from the round's last snapshot, or the current version when there is none."""
-        what = '本轮上一次存的快照' if self.last is not None else f'当前版本（{self.version}）'
+        what = "this round's last snapshot" if self.last is not None else f'the current version ({self.version})'
         if self._restage(self.last or self.base, taken.notes, context):
-            taken.problems.append(f'candidate/ 已换成{what}，请在它上面重新改')
+            taken.problems.append(f'candidate/ is now {what}; make your changes again on it')
 
 
 def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo) -> dict:
@@ -762,7 +799,7 @@ def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo)
     ValueError before any call. resolve looks up the hosts of URL tool servers (socket.getaddrinfo; tests pass a
     stand-in)."""
     if not isinstance(trigger, list):
-        raise ValueError('触发本轮的调用必须是调用编号的列表')
+        raise ValueError('The calls that start a round must be a list of call ids')
     records = Records(layout.records)
     for call_id in trigger:
         records.call_dir(call_id)                       # ValueError for anything but a call id
@@ -779,15 +816,15 @@ def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo)
         # What sits in work/ becomes a version first (as before a task run), so the candidate is cut from it.
         take_work(layout, records, store, root_fd, calls, context, problems)
         try:
-            with refusing('版本库用不了'):
+            with refusing('The version store cannot be used'):
                 version = store.head()
                 base = store.resolve(version)
                 staged, _ = stage(layout, store, version)
-            with refusing('准备好的工作区放不进 work/'):
+            with refusing('The staged workspace could not be moved into work/'):
                 move_in(layout, records, root_fd, staged, 'work', context, problems)
         except Refused as refused:
             raise Refused(f'{refused}{restore_work(layout, records, store, root_fd, context)}') from None
-        with refusing('候选版准备不了'):
+        with refusing('The candidate could not be prepared'):
             _put_candidate(layout, records, store, root_fd, base, None, context, problems)
         round_id = records.new_id('M')
         state = _Round(layout, records, store, root_fd, envelope, config, limits, resolve, codex, round_id, version,
@@ -801,9 +838,9 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
     before a task run). ValueError for a bad version name or author, a version the store lacks, or one whose content
     is the current version's; Refused (noted) when the store cannot take a version."""
     if not isinstance(version, str) or not VERSION.fullmatch(version):
-        raise ValueError(f'不是版本名：{show(version)}。版本名形如 V0001。')
+        raise ValueError(f'{show(version)} is not a version name. A version name looks like V0001.')
     if not isinstance(who, str) or not AUTHOR.fullmatch(who):
-        raise ValueError(f'回退人的名字不合规：{show(who)}')
+        raise ValueError(f'The name of who rolls back is not valid: {show(who)}')
     records = Records(layout.records)
     context = {'command': 'rollback', 'version': version}
     with noting_refusals(records, context), root_descriptor(layout) as root_fd:
@@ -816,20 +853,21 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
         settings = None
         try:
             parent = store.head()
-            new = store.commit_tree(version, who, f'回退到 {version}（{who}）')
+            new = store.commit_tree(version, who, f'Rollback to {version} ({who})')
         finally:                                        # work/ was sealed: main's head goes back into it
-            with problem(problems, 'work/ 没能换成最新版本'):
+            with problem(problems, 'work/ could not be replaced by the newest version'):
                 staged, settings = stage(layout, store, store.head())
                 move_in(layout, records, root_fd, staged, 'work', context, problems)
         if new is None:
-            raise ValueError(f'当前版本 {parent} 的内容已经和 {version} 一样，不需要回退')
+            raise ValueError(f'The current version {parent} already has the content of {version}; there is '
+                             'nothing to roll back')
         if settings is not None:
-            with problem(problems, 'Lab 的 Codex 配置（codex-home/config.toml）没能更新'):
+            with problem(problems, "The Lab's Codex configuration (codex-home/config.toml) could not be updated"):
                 write_home_config(layout, envelope, settings, resolve=resolve)
         diff = digest = tree = None                     # main has moved: from here on nothing raises
-        with problem(problems, f'没能保存 {parent} 到 {new} 的差异'):
+        with problem(problems, f'Could not save the diff from {parent} to {new}'):
             diff, digest = _save_patch(records, new, store.diff(parent, new))
-        with problem(problems, f'没能读出 {new} 的树'):
+        with problem(problems, f'Could not read the tree of {new}'):
             tree = store.tree_of(new)
         _write(records, f'releases/{new}.json', {
             'kind': 'rollback', 'version': new, 'parent': parent, 'target': version, 'round': None, 'who': who,

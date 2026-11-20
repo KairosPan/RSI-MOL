@@ -4,7 +4,7 @@ Meta is untrusted, so its answer is parsed strictly before anything is done with
 the types it names, and the rules beyond it. A trial decision lists at least one trial, and each trial names exactly
 one of a task (a plain id, rsi.paths.safe_id) and a probe text; a release decision cites at least one record (each id
 is kept once); every record id (observations, evidence, applications) is a call id; every text can be encoded as
-UTF-8, so it can be recorded and sent on. Anything else is a ValueError whose message is one Chinese line, which goes
+UTF-8, so it can be recorded and sent on. Anything else is a ValueError whose message is one English line, which goes
 back to Meta as the reason.
 """
 import json
@@ -63,11 +63,11 @@ class Decision:
 def _no_duplicates(pairs: list) -> dict:
     """One object of the JSON text, refused when it has more than MAX_PAIRS keys or a key twice; linear in size."""
     if len(pairs) > MAX_PAIRS:
-        raise ValueError(f'决定里有一个对象有 {len(pairs)} 个键，最多只能有 {MAX_PAIRS} 个')
+        raise ValueError(f'an object in the decision has {len(pairs)} keys; at most {MAX_PAIRS} are allowed')
     found = {}
     for key, value in pairs:
         if key in found:
-            raise ValueError(f'决定里的键重复了：{show(key)}')
+            raise ValueError(f'a key is repeated in the decision: {show(key)}')
         found[key] = value
     return found
 
@@ -78,40 +78,43 @@ def _utf8(value: str, where: str) -> str:
     try:
         value.encode('utf-8')
     except UnicodeEncodeError:
-        raise ValueError(f'{where} 里有不能存成 UTF-8 的字符（例如单独的代理码位），请去掉') from None
+        raise ValueError(f'{where} has characters that cannot be stored as UTF-8 (a lone surrogate, for example); '
+                         'remove them') from None
     return value
 
 
 def _keys(value, keys: tuple, where: str) -> dict:
     """value as an object with exactly these keys."""
     if not isinstance(value, dict):
-        raise ValueError(f'{where} 必须是一个 JSON 对象')
+        raise ValueError(f'{where} must be a JSON object')
     missing = [key for key in keys if key not in value]
     extra = sorted(set(value) - set(keys), key=str)
     if missing:
-        raise ValueError(f'{where} 缺少键：{"、".join(missing)}')
+        raise ValueError(f'{where} lacks keys: {", ".join(missing)}')
     if extra:
-        raise ValueError(f'{where} 多了不认识的键：{show(", ".join(map(str, extra)))}（只能有 {"、".join(keys)}）')
+        raise ValueError(f'{where} has unknown keys: {show(", ".join(map(str, extra)))} (only {", ".join(keys)} are '
+                         'allowed)')
     return value
 
 
 def _text(value, where: str, *, filled: bool = False) -> str:
     if not isinstance(value, str) or (filled and not value.strip()):
-        raise ValueError(f'{where} 必须是{"非空" if filled else ""}文本')
+        raise ValueError(f'{where} must be {"non-empty " if filled else ""}text')
     return _utf8(value, where)
 
 
 def _list(value, where: str, limit: int) -> list:
     if not isinstance(value, list):
-        raise ValueError(f'{where} 必须是列表')
+        raise ValueError(f'{where} must be a list')
     if len(value) > limit:
-        raise ValueError(f'{where} 最多 {limit} 项，现在有 {len(value)} 项')
+        raise ValueError(f'{where} may have at most {limit} items; it has {len(value)}')
     return value
 
 
 def _call_id(value, where: str) -> str:
     if not isinstance(value, str) or len(value) > MAX_ID or not CALL_ID.fullmatch(value):
-        raise ValueError(f'{where} 里的 {show(value)} 不是调用编号（应为 R 加至少四位数字，例如 R0002）')
+        raise ValueError(f'{show(value)} in {where} is not a call id (a call id is R and at least four digits, for '
+                         'example R0002)')
     return value
 
 
@@ -120,55 +123,58 @@ def _ids(value, where: str) -> list[str]:
 
 
 def _trial(value, number: int) -> dict:
-    where = f'trials 第 {number} 项'
+    where = f'trials item {number}'
     if not isinstance(value, dict):
-        raise ValueError(f'trials 的每一项必须是对象，{where} 不是')
+        raise ValueError(f'every item of trials must be an object; {where} is not')
     trial = _keys(value, ('task', 'probe', 'version'), where)
     task, probe, version = trial['task'], trial['probe'], trial['version']
     if version not in VERSIONS:
-        raise ValueError(f'{where} 的 version 只能是 candidate 或 current，现在是 {show(version)}')
+        raise ValueError(f'the field version of {where} must be candidate or current; it is {show(version)}')
     if (task is None) == (probe is None):
-        raise ValueError(f'{where} 要么给 task（已有任务的编号），要么给 probe（一段测试文字），只能给其中一个')
+        raise ValueError(f'{where} must give exactly one of task (the id of an existing task) and probe (a test '
+                         'text)')
     if task is not None and not (isinstance(task, str) and SAFE_ID.fullmatch(task)):
-        raise ValueError(f'{where} 的 task {show(task)} 不是合规的任务编号（字母、数字、_ 和 -，以字母或数字开头）')
+        raise ValueError(f'the task {show(task)} of {where} is not a valid task id (letters, digits, _ and -, '
+                         'starting with a letter or a digit)')
     if probe is not None and (not isinstance(probe, str) or not probe.strip() or len(probe) > PROBE_LIMIT):
-        raise ValueError(f'{where} 的 probe 必须是非空文本，最多 {PROBE_LIMIT} 个字符')
+        raise ValueError(f'the field probe of {where} must be non-empty text of at most {PROBE_LIMIT} characters')
     if probe is not None:
-        _utf8(probe, f'{where} 的 probe')
+        _utf8(probe, f'the field probe of {where}')
     return {'task': task, 'probe': probe, 'version': version}
 
 
 def _observation(value, number: int) -> dict:
-    where = f'observations 第 {number} 项'
+    where = f'observations item {number}'
     item = _keys(value, ('record', 'note'), where)
-    return {'record': _call_id(item['record'], 'observations'), 'note': _text(item['note'], f'{where} 的 note')}
+    return {'record': _call_id(item['record'], 'observations'),
+            'note': _text(item['note'], f'the field note of {where}')}
 
 
 def _application(value, number: int) -> dict:
-    where = f'applications 第 {number} 项'
+    where = f'applications item {number}'
     item = _keys(value, ('what', 'why', 'records'), where)
-    return {'what': _text(item['what'], f'{where} 的 what', filled=True), 'why': _text(item['why'], f'{where} 的 why'),
-            'records': _ids(item['records'], 'applications')}
+    return {'what': _text(item['what'], f'the field what of {where}', filled=True),
+            'why': _text(item['why'], f'the field why of {where}'), 'records': _ids(item['records'], 'applications')}
 
 
 def parse_decision(text: str) -> Decision:
-    """The decision in Meta's answer; ValueError with a one-line Chinese reason when it is not a valid one."""
+    """The decision in Meta's answer; ValueError with a one-line English reason when it is not a valid one."""
     if not isinstance(text, str):
-        raise ValueError('没有交回文本形式的决定')
+        raise ValueError('no decision was returned as text')
     if len(text) > MAX_TEXT:
-        raise ValueError(f'决定太长：{len(text)} 个字符，最多 {MAX_TEXT} 个字符')
+        raise ValueError(f'the decision is too long: {len(text)} characters; at most {MAX_TEXT} are allowed')
     try:
         data = json.loads(text.strip(), object_pairs_hook=_no_duplicates)
     except RecursionError:
-        raise ValueError('不是合法的 JSON：嵌套太深') from None
+        raise ValueError('it is not valid JSON: it is nested too deeply') from None
     except json.JSONDecodeError as error:
-        raise ValueError(f'不是合法的 JSON：{error.msg}（第 {error.lineno} 行第 {error.colno} 列）') from None
+        raise ValueError(f'it is not valid JSON: {error.msg} (line {error.lineno}, column {error.colno})') from None
     if not isinstance(data, dict):
-        raise ValueError('决定必须是一个 JSON 对象')
-    _keys(data, KEYS, '决定')
+        raise ValueError('the decision must be a JSON object')
+    _keys(data, KEYS, 'the decision')
     kind = data['decision']
     if kind not in KINDS:
-        raise ValueError(f'decision 只能是 {"、".join(KINDS)} 之一，现在是 {show(kind)}')
+        raise ValueError(f'the field decision must be one of {", ".join(KINDS)}; it is {show(kind)}')
     notes = {'observations': [_observation(item, number) for number, item in
                               enumerate(_list(data['observations'], 'observations', MAX_OBSERVATIONS), start=1)]}
     for key in NOTE_KEYS:
@@ -178,9 +184,9 @@ def parse_decision(text: str) -> Decision:
     applications = [_application(item, number)
                     for number, item in enumerate(_list(data['applications'], 'applications', MAX_ITEMS), start=1)]
     if kind == 'trial' and not trials:
-        raise ValueError('trial 决定至少要在 trials 里列一项试跑')
+        raise ValueError('a trial decision must list at least one trial in trials')
     if kind == 'release' and not evidence:
-        raise ValueError('release 决定至少要在 evidence 里引用一条运行记录')
+        raise ValueError('a release decision must cite at least one run record in evidence')
     decision = Decision(kind, notes, trials, evidence, applications)
-    _utf8(json.dumps(decision.as_dict(), ensure_ascii=False), '决定')      # every part can be recorded
+    _utf8(json.dumps(decision.as_dict(), ensure_ascii=False), 'the decision')      # every part can be recorded
     return decision
