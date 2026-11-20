@@ -262,22 +262,25 @@ def _dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: s
 
 def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, save, context: dict,
             problems: list[str]) -> None:
-    """Handle the sealed tree <root>/<entry>: make it storable (its lines go to problems), and unless it holds
-    `.codex`, save(tree), a commit or a tree id. Then _dispose: the tree is kept when save failed or was not done, or
-    when anything was left out of the version. A failure is a reason to keep it, never an exception."""
+    """Handle the sealed tree <root>/<entry>: make it storable (its lines go to problems), and save(tree), a commit
+    or a tree id, unless it holds `.codex` or something that must be left out could not be moved out of it: a version
+    never holds what the rules leave out. Then _dispose: the tree is kept when save failed or was not done, or when
+    anything was left out of the version. A failure is a reason to keep it, never an exception."""
     tree, reasons = layout.root / entry, []
     try:
-        lines, left = prepare_for_commit(tree, layout.sealed / label / 'left-out',
-                                         f'{layout.sealed.name}/{label}/left-out')
+        lines, moved, blocked = prepare_for_commit(tree, layout.sealed / label / 'left-out',
+                                                   f'{layout.sealed.name}/{label}/left-out')
         problems += lines
-        if left:
-            reasons.append(f'有 {left} 处内容没有存进版本')
+        if moved:
+            reasons.append(f'有 {moved} 处内容没有存进版本，已移到 {layout.sealed.name}/{label}/left-out/')
+        if blocked:
+            reasons.append(f'有 {blocked} 处应排除在版本之外的内容没能移出去，版本没有保存')
         if os.path.lexists(tree / '.codex'):
-            reasons.append('里面有 .codex，没有存成版本')
-        else:
+            reasons.append('里面有 .codex，版本没有保存')
+        elif not blocked:
             save(tree)
     except WORKSPACE_ERRORS as error:
-        reasons.append(f'没有存成版本（{type(error).__name__}: {error}）')
+        reasons.append(f'版本没有保存（{type(error).__name__}: {error}）')
     _dispose(layout, records, root_fd, entry, name, label, reasons, context, problems)
 
 
@@ -308,6 +311,17 @@ def _take_work(layout: Layout, records: Records, store: VersionStore, root_fd: i
             notes)
 
 
+def _restore_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, context: dict) -> str:
+    """After a refusal that came once work/ was sealed: stage main's head and move it into work/ again (best
+    effort), so the owner can keep opening the Lab Codex there. '' when that worked, else the sentence for the
+    refusal saying that there is no usable work/ now, and why."""
+    try:
+        _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, [])
+        return ''
+    except Exception as error:
+        return f'；work/ 也没能换回 main 的最新版本（{type(error).__name__}: {error}），现在没有可用的 work/'
+
+
 # The two runs.
 
 def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dict:
@@ -325,13 +339,16 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
         codex = _codex_version()
         notes = []
         _take_work(layout, records, store, root_fd, calls, context, notes)
-        with _refusing('版本库用不了'):
-            version_before = store.head()
-            fields = {'version_before': version_before, 'commit': store.resolve(version_before),
-                      'tree': store.tree_of(version_before)}
-            staged, settings = _stage(layout, store, version_before, task)
-        with _refusing('准备好的工作区放不进 work/'):
-            _move_in(layout, records, root_fd, staged, 'work', context, notes)
+        try:
+            with _refusing('版本库用不了'):
+                version_before = store.head()
+                fields = {'version_before': version_before, 'commit': store.resolve(version_before),
+                          'tree': store.tree_of(version_before)}
+                staged, settings = _stage(layout, store, version_before, task)
+            with _refusing('准备好的工作区放不进 work/'):
+                _move_in(layout, records, root_fd, staged, 'work', context, notes)
+        except Refused as refused:              # work/ is sealed by now: put main's head back for the owner
+            raise Refused(f'{refused}{_restore_work(layout, records, store, root_fd, context)}') from None
         write_home_config(layout, envelope, settings, resolve=resolve)
         config, settings_problems = _compose(layout, envelope, settings, trial=False, resolve=resolve)
         fields = {**_common_fields(codex, settings, config, limits), 'purpose': 'task', 'cost_class': 'online',

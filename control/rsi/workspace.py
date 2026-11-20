@@ -164,6 +164,17 @@ def _opened(name: str, dir_fd: int | None, path: str) -> int:
     return open_folder(name, dir_fd)
 
 
+def _retrying(action, path: str, info: os.stat_result) -> None:
+    """action() (an unlink, rmdir or rename of the entry at path); if an ACL on the entry refuses it, the ACL is
+    cleared on the entry itself and action() runs once more. A file with other hard links is never changed."""
+    try:
+        action()
+    except PermissionError:
+        if (not stat.S_ISDIR(info.st_mode) and info.st_nlink > 1) or not clear_acl(path):
+            raise
+        action()
+
+
 def _listed(name: str, dir_fd: int, path: str) -> tuple[int, list[str]]:
     """An fd of the folder (see _opened) and its entry names, sorted."""
     fd = _opened(name, dir_fd, path)
@@ -252,35 +263,36 @@ def remove(name: str, dir_fd: int, path: str) -> None:
     info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if not stat.S_ISDIR(info.st_mode):
         _unlock(name, dir_fd, path, info, 0)
-        os.unlink(name, dir_fd=dir_fd)
+        _retrying(lambda: os.unlink(name, dir_fd=dir_fd), path, info)
         return
     top = open_unlocked(name, dir_fd, path)
     try:
         empty(top, path)
     finally:
         os.close(top)
-    os.rmdir(name, dir_fd=dir_fd)
+    _retrying(lambda: os.rmdir(name, dir_fd=dir_fd), path, info)
 
 
 def empty(top: int, path: str) -> None:
     """Remove everything inside the open folder at path, never following a link. Entries are unlocked as needed; at
     most MAX_DEPTH folders are held open, and a folder deeper than that is first moved up into top and removed in a
-    later pass (at most MAX_PASSES passes)."""
+    later pass (at most MAX_PASSES passes). An ACL that refuses removing an entry is cleared (see _retrying)."""
     counters = {}
     for _ in range(MAX_PASSES):
         names = sorted(os.listdir(top))
         if not names:
             return
-        stack = [[top, iter(names), None, path]]
+        stack = [[top, iter(names), None, path, None]]
         try:
             while stack:
-                fd, pending, own_name, here = stack[-1]
+                fd, pending, own_name, here, own_info = stack[-1]
                 name = next(pending, None)
                 if name is None:
                     stack.pop()
                     if stack:
                         os.close(fd)
-                        os.rmdir(own_name, dir_fd=stack[-1][0])
+                        parent = stack[-1][0]
+                        _retrying(lambda: os.rmdir(own_name, dir_fd=parent), here, own_info)
                     continue
                 try:
                     info = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -289,14 +301,15 @@ def empty(top: int, path: str) -> None:
                 where = f'{here}/{name}'
                 if not stat.S_ISDIR(info.st_mode):
                     _unlock(name, fd, where, info, 0)
-                    os.unlink(name, dir_fd=fd)
+                    _retrying(lambda: os.unlink(name, dir_fd=fd), where, info)
                     continue
                 _unlock(name, fd, where, info, stat.S_IRWXU)    # macOS moves a folder elsewhere only if writable
                 if len(stack) >= MAX_DEPTH:
-                    os.rename(name, free_name(top, '.rsi-deep', counters), src_dir_fd=fd, dst_dir_fd=top)
+                    deep = free_name(top, '.rsi-deep', counters)
+                    _retrying(lambda: os.rename(name, deep, src_dir_fd=fd, dst_dir_fd=top), where, info)
                 else:
                     child, names = _listed(name, fd, where)
-                    stack.append([child, iter(names), name, where])
+                    stack.append([child, iter(names), name, where, info])
         finally:
             for frame in stack[1:]:
                 os.close(frame[0])
@@ -339,22 +352,30 @@ def is_dotgitmodules(name: str) -> bool:
 # Before versioning a sealed tree.
 
 class _Aside:
-    """Entries left out of the version: renamed (never copied) to <folder>/<n>-<name>. The folder is made when first
-    needed; only the control program writes there. shown is how lines name it."""
+    """Entries that must be left out of the version: renamed (never copied) to <folder>/<n>-<name>. The folder is
+    made when first needed; only the control program writes there. shown is how lines name it. moved counts what
+    was moved; blocked counts what had to be left out but could not be moved out of the tree."""
 
     def __init__(self, folder: Path, shown: str) -> None:
-        self.folder, self.shown, self.count, self.fd = folder, shown, 0, None
+        self.folder, self.shown, self.moved, self.blocked, self.fd = folder, shown, 0, 0, None
 
     def take(self, name: str, dir_fd: int, path: str, info: os.stat_result, relative: str, why: str,
              lines: Lines) -> None:
-        self.count += 1
-        if self.fd is None:
-            self.folder.mkdir(parents=True, exist_ok=True)
-            self.fd = open_folder(self.folder)
-        target = f'{self.count}-{os.fsdecode(os.fsencode(name)[:200])}'
-        if stat.S_ISDIR(info.st_mode):
-            _unlock(name, dir_fd, path, info, stat.S_IRWXU)  # macOS moves a folder to another parent only if writable
-        os.rename(name, target, src_dir_fd=dir_fd, dst_dir_fd=self.fd)
+        # A cut on a character boundary: APFS refuses a name that is not valid UTF-8 (EILSEQ).
+        target = f'{self.moved + 1}-{os.fsencode(name)[:200].decode("utf-8", "ignore")}'
+        try:
+            if self.fd is None:
+                self.folder.mkdir(parents=True, exist_ok=True)
+                self.fd = open_folder(self.folder)
+            if stat.S_ISDIR(info.st_mode):
+                _unlock(name, dir_fd, path, info, stat.S_IRWXU)  # macOS moves a folder elsewhere only if writable
+            _retrying(lambda: os.rename(name, target, src_dir_fd=dir_fd, dst_dir_fd=self.fd), path, info)
+        except OSError as error:
+            self.blocked += 1
+            lines.add(f'{show(relative)} {why}，应排除在版本之外，但移不出去（{error.strerror or error}），'
+                      '所以这次不存版本')
+            return
+        self.moved += 1
         lines.add(f'{show(relative)} {why}，没有存进版本，已移到 {show(self.shown + "/" + target)}')
 
 
@@ -402,9 +423,11 @@ def _visit(name: str, fd: int, prefix: str, depth: int, counters: dict, tree: st
             aside.take(name, fd, path, info, relative, '读不了', lines)
 
 
-def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str], int]:
-    """Make a sealed tree storable as a version. Returns the Chinese lines (capped) and how many entries were left
-    out of the version or could not be handled; OSError if the tree itself is not a folder that can be opened.
+def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str], int, int]:
+    """Make a sealed tree storable as a version. Returns the Chinese lines (capped), how many entries were moved
+    out of the tree (left out of the version), and how many are blocking: entries that had to be left out but could
+    not be moved out, or that could not be handled at all. When any entry is blocking, the tree must not be saved as
+    a version: it may hold what the rules leave out. OSError if the tree itself is not a folder that can be opened.
 
     The tree is walked without following links, at most MAX_DEPTH folders deep; its top-level .tmp, out and in
     (never versioned) are not entered. Every entry is unlocked on the entry itself (lock flags cleared, a folder
@@ -412,8 +435,9 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
     An entry git takes for `.git`, or a link git takes for `.gitmodules`, is renamed in place to `.git.rsi-kept`
     (`.gitmodules.rsi-kept`), -2, -3, ... when taken. Left out, i.e. renamed (never copied) to left_out/<n>-<name>
     (shown names left_out in the lines): a folder deeper than MAX_DEPTH or whose relative path is longer than
-    MAX_PATH_BYTES, a regular file bigger than BIG_FILE, and a folder or file that cannot be opened. Links, FIFOs
-    and sockets stay: git stores a link as a link and skips the other two.
+    MAX_PATH_BYTES, a regular file bigger than BIG_FILE, and a folder or file that cannot be opened; an ACL that
+    refuses the move is cleared first. Links, FIFOs and sockets stay: git stores a link as a link and skips the
+    other two.
     """
     tree = str(tree)
     lines, aside, failed = Lines(), _Aside(left_out, shown), 0
@@ -433,7 +457,7 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
                 _visit(name, fd, prefix, depth, counters, tree, aside, lines, stack)
             except OSError as error:
                 failed += 1
-                lines.add(f'{show(prefix + name)} 处理不了（{error.strerror or error}），可能没有存进版本')
+                lines.add(f'{show(prefix + name)} 处理不了（{error.strerror or error}），所以这次不存版本')
     finally:
         close(*(frame[0] for frame in stack), aside.fd)
-    return lines.done(), aside.count + failed
+    return lines.done(), aside.moved, aside.blocked + failed

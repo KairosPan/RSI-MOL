@@ -94,6 +94,8 @@ class LabRuns(unittest.TestCase):
             (root.layout.work / '.codex' / 'config.toml').write_text('x = 1\n')
             self.assertEqual(root.store.commit(root.layout.work, 'owner', 'with .codex'), 'V0002')
             with self.assertRaisesRegex(Refused, '.codex'): run_task(root.layout, 'T1')     # head holds .codex
+            self.assertFalse(os.path.lexists(root.layout.work))          # head cannot be staged back either ...
+            self.assertIn('现在没有可用的 work/', index(root, 'refusal')[0]['reason'])     # ... and it says so
             (root.layout.owner / 'limits.toml').write_text('[day]\ncalls = 0\n')
             with self.assertRaises(Refused): run_task(root.layout, 'T1')
             self.assertEqual(root.records.calls(), []); self.assertEqual(root.model.requests, [])
@@ -340,14 +342,16 @@ class SealFirst(unittest.TestCase):
                 os.symlink(outside, root.layout.root / name)
                 return original(staged, root_fd, name)
 
-            with mock.patch.object(labrun, '_rename_in', plant_then_rename):
+            with mock.patch.object(labrun, '_rename_in', plant_then_rename):     # the restore meets one too
                 with self.assertRaises(Refused): run_task(root.layout, 'T1')
             self.assertEqual((os.listdir(outside), (outside / 'x').read_text()), (['x'], 'x'))
             self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
-            self.assertEqual(len(index(root, 'refusal')), 1); self.assertTrue(root.layout.work.is_symlink())
+            [refusal] = index(root, 'refusal'); self.assertIn('现在没有可用的 work/', refusal['reason'])
+            self.assertTrue(root.layout.work.is_symlink())
+            [note] = index(root, 'sealed'); self.assertTrue((root.layout.root / note['path']).is_symlink())
             root.model.push(say('ok'))                                 # the next run seals the link and keeps it
             self.assertEqual(run_task(root.layout, 'T1')['status'], 'finished')
-            [note] = index(root, 'sealed'); self.assertTrue((root.layout.root / note['path']).is_symlink())
+            note = index(root, 'sealed')[-1]; self.assertTrue((root.layout.root / note['path']).is_symlink())
             self.assertEqual(os.listdir(outside), ['x'])
             original_stage, planted = labrun._stage, []
 
@@ -363,7 +367,7 @@ class SealFirst(unittest.TestCase):
             self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
             late = index(root, 'sealed')[-1]
             self.assertEqual(((root.layout.root / late['path'] / 'late.txt').read_text(), len(index(root, 'sealed'))),
-                             ('l', 2))
+                             ('l', 3))
             self.assertFalse((root.layout.work / 'late.txt').exists())
 
     def test_codex_in_a_sealed_tree_is_kept_and_never_versioned(self):     # in a version: test_refusals_...
@@ -440,6 +444,62 @@ class SealFirst(unittest.TestCase):
                                  'finished')
             self.assertEqual((os.listdir(root.layout.staging), leftovers(root)), ([], []))
             self.assertFalse(root.layout.sealed.exists()); self.assertEqual(root.store.head(), 'V0006')
+
+    def test_a_refusal_after_the_seal_puts_main_head_back_into_work(self):
+        with Root() as root:
+            root.add_task('T1'); (root.layout.work / 'mine.txt').write_text('an owner edit')
+            original, calls = labrun._stage, []
+
+            def fail_once(*args, **kwargs):
+                calls.append(args)
+                if len(calls) == 1:
+                    raise RuntimeError('git checkout failed (128)')
+                return original(*args, **kwargs)
+
+            with mock.patch.object(labrun, '_stage', fail_once):
+                with self.assertRaisesRegex(Refused, 'git checkout failed'): run_task(root.layout, 'T1')
+            self.assertEqual((root.store.head(), (root.layout.work / 'mine.txt').read_text()),
+                             ('V0002', 'an owner edit'))
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'mine.txt', 'out'])
+            self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
+
+    def test_an_oversize_file_with_a_long_chinese_name_never_reaches_a_version(self):
+        with Root() as root:
+            root.add_task('T1'); name = '数' * 70 + '.bin'                    # a cut at 200 bytes splits a 数
+            (root.layout.work / name).write_text('x' * 20); (root.layout.work / 'mine.txt').write_text('m')
+            root.model.push(say('ok'))
+            with mock.patch.object(workspace, 'BIG_FILE', 10):
+                call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0002'))
+            diff = root.store.diff('V0001', 'V0002')
+            self.assertIn('b/mine.txt', diff); self.assertNotIn('数', diff)
+            [note] = index(root, 'sealed')
+            [label] = os.listdir(root.layout.sealed)
+            self.assertEqual(os.listdir(root.layout.sealed / label / 'left-out'), ['1-' + '数' * 66])
+
+    def test_what_cannot_be_moved_out_blocks_the_version(self):
+        with Root() as root:
+            root.add_task('T1')
+            root.model.push(add_file('data/huge.bin', 'x' * 20), add_file('notes/n.md', 'x'),
+                            with_usage(say('ok'), 5, 2))
+            original = os.rename
+
+            def refuse(source, *args, **options):                    # the oversize file cannot be moved out
+                if source == 'huge.bin':
+                    raise OSError(92, 'Illegal byte sequence')
+                return original(source, *args, **options)
+
+            with mock.patch.object(workspace, 'BIG_FILE', 10), mock.patch.object(os, 'rename', refuse):
+                call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['usage']['input_tokens'], call['usage']['output_tokens']),
+                             ('finished', 5, 2))
+            self.assertEqual((call['version_after'], call['commit_failed'], root.store.head()), (None, True, 'V0001'))
+            self.assertTrue(any('版本没有保存' in line for line in call['problems']))
+            [note] = index(root, 'sealed')
+            self.assertEqual((note['call'], note['path']), (call['id'], f'sealed/{call["id"]}/work'))
+            self.assertTrue(any('版本没有保存' in reason for reason in note['reasons']))
+            self.assertTrue((root.layout.root / note['path'] / 'data' / 'huge.bin').is_file())
+            self.assertFalse(os.path.lexists(root.layout.work / 'data'))     # work/ is main's head again
 
     def test_a_trial_folder_replaced_by_a_link_is_removed_not_followed(self):
         with Root() as root:

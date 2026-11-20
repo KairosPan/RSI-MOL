@@ -29,7 +29,7 @@ def deny(path: Path, rights: str) -> None:
     subprocess.run(['/bin/chmod', '+a', f'{os.environ["USER"]} deny {rights}', str(path)], check=True)
 
 
-def prepare(root: Root, tree: Path) -> tuple[list[str], int]:
+def prepare(root: Root, tree: Path) -> tuple[list[str], int, int]:
     return prepare_for_commit(tree, root.layout.sealed / 'L' / 'left-out', 'sealed/L/left-out')
 
 
@@ -125,6 +125,9 @@ class Removal(unittest.TestCase):
             tree = root.layout.root / 'tree'; (tree / '.tmp' / 'sub').mkdir(parents=True)
             (tree / '.tmp' / 'sub' / 'f').write_text('f'); os.chflags(tree / '.tmp' / 'sub' / 'f', stat.UF_IMMUTABLE)
             os.chflags(tree / '.tmp' / 'sub', stat.UF_APPEND); deny(tree / '.tmp', 'list,search,delete_child')
+            (tree / 'out').mkdir(); (tree / 'out' / 'kept.txt').write_text('k')
+            deny(tree / 'out' / 'kept.txt', 'delete')                         # one deny-delete ACE on a file
+            deny(tree / 'out', 'delete')
             removed(self, root.layout.root, 'tree')
 
 
@@ -139,8 +142,8 @@ class BeforeCommit(unittest.TestCase):
             os.symlink('target', tree / 'odd' / '.gitmodules')
             (outside / '.git').mkdir(parents=True); os.symlink(outside, tree / 'linked')
             (tree / 'out').mkdir(); (tree / 'out' / '.git').mkdir()                # never versioned: left alone
-            lines, left = prepare(root, tree)
-            self.assertEqual((len(lines), left), (5, 0))
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (5, 0, 0))
             self.assertTrue(any('sub/.git' in line and 'sub/.git.rsi-kept-2' in line for line in lines))
             self.assertEqual((tree / 'sub' / '.git.rsi-kept-2' / 'config').read_text(), 'c')
             self.assertTrue((tree / 'a' / 'b' / '.git.rsi-kept').is_file())
@@ -148,7 +151,7 @@ class BeforeCommit(unittest.TestCase):
                              ['.git.rsi-kept', '.git.rsi-kept-2', '.gitmodules.rsi-kept'])
             self.assertTrue((outside / '.git').is_dir()); self.assertTrue((tree / 'out' / '.git').is_dir())
             self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'x'))   # versioning goes through
-            self.assertEqual(prepare(root, tree), ([], 0))
+            self.assertEqual(prepare(root, tree), ([], 0, 0))
 
     def test_thousands_of_look_alikes_are_quick_and_reported_in_few_lines(self):
         with Root() as root:
@@ -157,9 +160,10 @@ class BeforeCommit(unittest.TestCase):
             for name in names:
                 (many / name).write_text('x')
             started = time.monotonic()
-            lines, left = prepare(root, root.layout.work)
+            lines, moved, blocked = prepare(root, root.layout.work)
             self.assertLess(time.monotonic() - started, 3)
-            self.assertEqual((len(lines), left), (workspace.MAX_LINES + 1, 0)); self.assertIn('2900', lines[-1])
+            self.assertEqual((len(lines), moved, blocked), (workspace.MAX_LINES + 1, 0, 0))
+            self.assertIn('2900', lines[-1])
             self.assertEqual(sorted(os.listdir(many)),
                              sorted(['.git.rsi-kept'] + [f'.git.rsi-kept-{n}' for n in range(2, 3001)]))
 
@@ -168,8 +172,8 @@ class BeforeCommit(unittest.TestCase):
             tree = root.layout.work; (tree / '.git').mkdir(); (tree / '.git' / 'config').write_text('c')
             for number in range(1, 1001):
                 (tree / ('.git.rsi-kept' if number == 1 else f'.git.rsi-kept-{number}')).write_text('taken')
-            lines, left = prepare(root, tree)
-            self.assertEqual((len(lines), left), (1, 0)); self.assertFalse(os.path.lexists(tree / '.git'))
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (1, 0, 0)); self.assertFalse(os.path.lexists(tree / '.git'))
             self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'kept'))
 
     def test_a_deep_tree_is_left_out_with_few_open_files(self):
@@ -179,8 +183,8 @@ class BeforeCommit(unittest.TestCase):
             deep = tree / ('a/' * DEPTH); (deep / '.git').mkdir(parents=True)
             (deep / '.git' / 'config').write_text('c'); (tree / 'a' / 'keep.txt').write_text('k')
             (tree / ('a/' * workspace.MAX_DEPTH)).chmod(0)                       # unwritable at the limit
-            lines, left = prepare(root, tree)
-            self.assertEqual((len(lines), left), (1, 1)); self.assertIn('sealed/L/left-out/1-a', lines[0])
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (1, 1, 0)); self.assertIn('sealed/L/left-out/1-a', lines[0])
             moved = root.layout.sealed / 'L' / 'left-out' / '1-a' / ('a/' * (DEPTH - workspace.MAX_DEPTH - 1))
             self.assertTrue((moved / '.git' / 'config').is_file())
             self.assertIsNotNone(root.store.commit(tree, 'manual or leftover', 'deep'))
@@ -193,8 +197,8 @@ class BeforeCommit(unittest.TestCase):
             (tree / 'notes' / 'shared.txt').write_text('s')
             os.link(tree / 'notes' / 'shared.txt', root.layout.env / 's')
             (tree / 'notes' / 'shared.txt').chmod(0)
-            lines, left = prepare(root, tree)
-            self.assertEqual((len(lines), left), (1, 1)); self.assertIn('notes/shared.txt', lines[0])
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (1, 1, 0)); self.assertIn('notes/shared.txt', lines[0])
             self.assertEqual((tree / 'notes' / 'locked' / 'a.txt').read_text(), 'a')
             moved = root.layout.sealed / 'L' / 'left-out' / '1-shared.txt'
             self.assertEqual(os.stat(moved).st_mode & 0o777, 0)                 # a shared inode is never changed
@@ -208,16 +212,16 @@ class BeforeCommit(unittest.TestCase):
             (tree / 'secret.txt').write_text('s'); deny(tree / 'secret.txt', 'read')
             (tree / 'hidden').mkdir(); (tree / 'hidden' / 'h.txt').write_text('h'); deny(tree / 'hidden', 'list,search')
             deny(tree, 'list,search')
-            lines, left = prepare(root, tree)
-            self.assertEqual((len(lines), left), (1, 0)); self.assertIn('locked/.git.rsi-kept', lines[0])
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (1, 0, 0)); self.assertIn('locked/.git.rsi-kept', lines[0])
             self.assertEqual(root.store.commit(tree, 'manual or leftover', 'unlocked'), 'V0002')
             self.assertIn('b/hidden/h.txt', root.store.diff('V0001', 'V0002'))
             self.assertIn('b/secret.txt', root.store.diff('V0001', 'V0002'))
-            # An ACL that also denies reading itself cannot be cleared without following a link: it counts as left
-            # out (git would silently skip the folder), so the caller keeps the whole tree.
+            # An ACL that also denies reading itself cannot be cleared without following a link, and it denies
+            # moving the folder too: it blocks the version (git would silently skip the folder).
             (tree / 'vault').mkdir(); (tree / 'vault' / 'v.txt').write_text('v'); deny(tree / 'vault', DENY_ALL)
-            lines, left = prepare(root, tree)
-            self.assertGreaterEqual(left, 1); self.assertTrue(any('vault' in line for line in lines))
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((moved, blocked), (0, 1)); self.assertTrue(any('vault' in line for line in lines))
 
     def test_big_files_are_left_out(self):
         with Root() as root:
@@ -225,11 +229,48 @@ class BeforeCommit(unittest.TestCase):
             with open(tree / 'data' / 'huge.bin', 'wb') as stream:
                 stream.truncate(workspace.BIG_FILE + 1)                         # sparse: nothing allocated
             (tree / 'data' / 'small.txt').write_text('s')
-            lines, left = prepare(root, tree)
-            self.assertEqual((len(lines), left), (1, 1)); self.assertIn('data/huge.bin', lines[0])
+            lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (1, 1, 0)); self.assertIn('data/huge.bin', lines[0])
             self.assertEqual((root.layout.sealed / 'L' / 'left-out' / '1-huge.bin').stat().st_size,
                              workspace.BIG_FILE + 1)
             self.assertEqual(os.listdir(tree / 'data'), ['small.txt'])
+
+    def test_a_name_is_cut_on_a_character_boundary(self):
+        with Root() as root:
+            tree, name = root.layout.work, '数' * 70 + '.bin'                  # 214 bytes: a cut at 200 splits a 数
+            (tree / name).write_text('x' * 20)
+            with mock.patch.object(workspace, 'BIG_FILE', 10):
+                lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((moved, blocked), (1, 0)); self.assertFalse(os.path.lexists(tree / name))
+            self.assertEqual(os.listdir(root.layout.sealed / 'L' / 'left-out'), ['1-' + '数' * 66])
+
+    def test_what_cannot_be_moved_out_blocks_and_is_counted_once(self):
+        with Root() as root:
+            tree = root.layout.work; (tree / 'big.bin').write_text('x' * 20); (tree / 'ok.txt').write_text('ok')
+            original = os.rename
+
+            def refuse(source, *args, **options):
+                if source == 'big.bin':
+                    raise OSError(92, 'Illegal byte sequence')
+                return original(source, *args, **options)
+
+            with mock.patch.object(workspace, 'BIG_FILE', 10), mock.patch.object(os, 'rename', refuse):
+                lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((len(lines), moved, blocked), (1, 0, 1)); self.assertIn('所以这次不存版本', lines[0])
+            self.assertTrue((tree / 'big.bin').is_file())
+
+    @macos
+    def test_an_acl_or_a_flag_on_what_must_move_out(self):
+        with Root() as root:
+            tree = root.layout.work; (tree / 'denied.bin').write_text('x' * 20); deny(tree / 'denied.bin', 'delete')
+            (tree / 'shared.bin').write_text('x' * 20); os.link(tree / 'shared.bin', root.layout.env / 'shared')
+            os.chflags(tree / 'shared.bin', stat.UF_IMMUTABLE)               # uchg on an inode shared elsewhere
+            with mock.patch.object(workspace, 'BIG_FILE', 10):
+                lines, moved, blocked = prepare(root, tree)
+            self.assertEqual((moved, blocked), (1, 1))
+            self.assertEqual(os.listdir(root.layout.sealed / 'L' / 'left-out'), ['1-denied.bin'])
+            self.assertTrue((tree / 'shared.bin').is_file())
+            self.assertEqual(os.stat(root.layout.env / 'shared').st_flags & stat.UF_IMMUTABLE, stat.UF_IMMUTABLE)
 
     def test_a_tree_that_is_not_a_folder_is_an_error(self):
         with Root() as root:
