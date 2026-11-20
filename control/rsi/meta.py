@@ -117,6 +117,41 @@ def _bullets(title: str, lines: list[str]) -> str:
     return '\n'.join([title, *(f'- {line}' for line in lines)])
 
 
+def _recordable(value):
+    """value with every text UTF-8 cannot hold (a lone surrogate) escaped as \\udXXX, so that it can be recorded."""
+    if isinstance(value, str):
+        return value.encode('utf-8', 'backslashreplace').decode('utf-8')
+    if isinstance(value, dict):
+        return {_recordable(key): _recordable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_recordable(item) for item in value]
+    return value
+
+
+def _write(records: Records, relative: str, data: dict, problems: list[str]) -> bool:
+    """records/<relative> with data; whether it was written. It runs after main may have moved, so it never raises:
+    text UTF-8 cannot hold is escaped (with a problem line), and any other failure is a problem line (and, best
+    effort, an `unrecorded` index note)."""
+    for attempt in range(2):
+        try:
+            records.write_json(relative, data)
+            return True
+        except UnicodeEncodeError:
+            if attempt:
+                problems.append(f'没能写记录 {relative}：转义以后仍不能存成 UTF-8')
+                break
+            problems.append(f'{relative} 里有不能存成 UTF-8 的字符，已转义后保存')
+            data = _recordable(data)
+        except Exception as error:
+            problems.append(f'没能写记录 {relative}：{type(error).__name__}: {error}')
+            break
+    try:
+        records.note('unrecorded', {'path': relative, 'reason': problems[-1]})
+    except Exception:
+        pass
+    return False
+
+
 def _save_patch(records: Records, version: str, text: str) -> tuple[str, str]:
     """records/releases/<version>.patch, created once; its path relative to records/ and its sha256."""
     folder = records.root / 'releases'
@@ -170,7 +205,11 @@ def release_problems(store: VersionStore, records: Records, *, evidence: list[st
     out += list(problems)                                                          # 3
     if not evidence:                                                               # 4
         out.append('没有引用任何运行记录，至少要引用一条')
+    checked = []
     for call_id in evidence:
+        if call_id in checked:                                                     # each id once, in order
+            continue
+        checked.append(call_id)
         if not isinstance(call_id, str) or not CALL_ID.fullmatch(call_id):
             out.append(f'{show(call_id)} 不是调用编号')
             continue
@@ -242,6 +281,7 @@ class _Round:
     trials: list[dict] = field(default_factory=list)
     decisions: list[dict] = field(default_factory=list)
     applications: list[str] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)   # for the next prompt
     trials_run: int = 0
 
     def run(self, trigger: list[str], instructions: str) -> dict:
@@ -260,6 +300,9 @@ class _Round:
             if refused is not None:
                 outcome, reason = 'limit_reached', refused
                 break
+            if self.notices:                               # what the program had to do before this call
+                prompt = f'{prompt}\n\n{_bullets("另外：", self.notices)}'
+                self.notices = []
             call, text = self._call(prompt, schema)
             entry = {'call': call['id'], 'status': call['status'], 'decision': None}
             self.decisions.append(entry)
@@ -287,7 +330,7 @@ class _Round:
                   'limits': {'calls': self.limits.meta_calls, 'trials': self.limits.meta_trials,
                              'seconds_per_call': self.limits.meta_seconds},
                   'problems': self.problems}
-        self.records.write_json(f'rounds/{self.round_id}/round.json', record)
+        _write(self.records, f'rounds/{self.round_id}/round.json', record, self.problems)
         return record
 
     # The prompts.
@@ -332,21 +375,51 @@ class _Round:
     # One Meta call.
 
     def _refusal(self) -> str | None:
-        """Why no further Meta call may start (the gate, the owner's daily caps, an unusable meta/), noted; or
-        None. The first call was admitted when the round started."""
+        """Why no further Meta call may start, noted; or None. Checked before every call: the gate and the owner's
+        daily caps (the first call was admitted when the round started), then meta/ and candidate/ as real folders.
+        Meta's profile grants both by path, so a link Meta left at either name could point the next call's writes
+        elsewhere; when one cannot be made a real folder again, no further call starts."""
+        reason = None
         try:
             if self.calls:
                 admit(self.layout, self.records)
         except (Refused, ValueError) as error:                 # ValueError: owner/limits.toml has become invalid
             reason = str(error)
-        else:
+        for name, step in (('meta/', self._meta_folder), ('candidate/', self._candidate_folder)):
+            if reason is not None:
+                break
             try:
-                self._meta_folder()
-                return None
-            except OSError as error:
-                reason = f'meta/ 用不了：{type(error).__name__}: {error}'
-        self.records.note('refusal', {'reason': reason, **self.context})
+                step()
+            except (Refused, *WORKSPACE_ERRORS) as error:
+                reason = f'{name} 不是可用的文件夹，也没能换成一个（{type(error).__name__}: {error}），不再启动 Meta'
+        if reason is not None:
+            self.records.note('refusal', {'reason': reason, **self.context})
         return reason
+
+    def _candidate_folder(self) -> None:
+        """candidate/ as a real folder before a Meta call. A link or file there is sealed and kept under sealed/,
+        and (as when it is missing) candidate/ starts again from the round's last snapshot or the current version;
+        the next prompt tells Meta. Raises when that cannot be done: an entry that cannot be sealed (a lock flag on
+        a link), a failed checkout."""
+        root_fd = self.root_fd
+        found = kind('candidate', root_fd)
+        if found == 'folder':
+            return
+        what = '不见了' if found is None else '被换成了符号链接' if found == 'link' else '被换成了文件'
+        kept = ''
+        if found is not None:
+            label = stamp()
+            entry = seal(root_fd, 'candidate', label)
+            if entry is not None:
+                dispose(self.layout, self.records, root_fd, entry, 'candidate', label,
+                        [f'candidate/ 在两次 Meta 调用之间{what}'], self.context, self.problems)
+                kept = '控制程序没有跟着它走，已把它留档；'
+        _put_candidate(self.layout, self.records, self.store, root_fd, self.last or self.base,
+                       '它在控制程序处理候选版时出现，没有用它', self.context, self.problems)
+        source = '本轮上一次存的快照' if self.last is not None else f'当前版本（{self.version}）'
+        notice = f'candidate/ {what}，{kept}candidate/ 已换成{source}'
+        self.notices.append(notice)
+        self.problems.append(notice)
 
     def _meta_folder(self) -> None:
         """meta/ as a real folder, with meta/.tmp and meta/notes created when missing, by mkdir relative to
@@ -416,18 +489,23 @@ class _Round:
         """records/applications/<id>.json for each application of the decision, status pending; their ids."""
         ids = []
         for application in decision.applications:
+            fields = _recordable(application)          # parse_decision already refuses what UTF-8 cannot hold
             for _ in range(WRITE_TRIES):
                 app_id = self.records.new_id('A')
                 try:
                     self.records.write_json(f'applications/{app_id}.json',
                                             {'id': app_id, 'status': 'pending', 'round': self.round_id,
-                                             'call': call_id, **application})
+                                             'call': call_id, **fields})
                 except FileExistsError:
                     continue
+                except Exception as error:
+                    self.problems.append(f'{call_id} 的申请“{show(fields["what"])}”没能存下：{type(error).__name__}: '
+                                         f'{error}')
+                    break
                 ids.append(app_id)
                 break
             else:
-                self.problems.append(f'{call_id} 的申请“{show(application["what"])}”没能存下')
+                self.problems.append(f'{call_id} 的申请“{show(fields["what"])}”没能存下')
         self.applications += ids
         return ids
 
@@ -534,8 +612,7 @@ class _Round:
                   'call': call_id, 'author': f'meta {self.round_id}', 'time': now(), 'snapshot': taken.snapshot,
                   'tree': taken.tree, 'diff': diff, 'diff_sha256': digest, 'decision': decision.notes,
                   'evidence': decision.evidence, 'trials': self.trials, 'benefit': BENEFIT}
-        with problem(self.problems, f'没能写发布记录 releases/{version}.json'):
-            self.records.write_json(f'releases/{version}.json', record)
+        _write(self.records, f'releases/{version}.json', record, self.problems)
         return []
 
     # The candidate.
@@ -626,9 +703,9 @@ class _Round:
 
     def _start_over(self, taken: _Taken, context: dict) -> None:
         """candidate/ from the round's last snapshot, or the current version when there is none."""
-        what = '本轮上一次存的快照' if self.last is not None else f'当前版本 {self.version}'
+        what = '本轮上一次存的快照' if self.last is not None else f'当前版本（{self.version}）'
         if self._restage(self.last or self.base, taken.notes, context):
-            taken.problems.append(f'candidate/ 已换回{what}的内容，请在它上面重新改')
+            taken.problems.append(f'candidate/ 已换成{what}，请在它上面重新改')
 
 
 def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo) -> dict:
@@ -700,11 +777,13 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
         if settings is not None:
             with problem(problems, 'Lab 的 Codex 配置（codex-home/config.toml）没能更新'):
                 write_home_config(layout, envelope, settings, resolve=resolve)
-        diff = digest = None
+        diff = digest = tree = None                     # main has moved: from here on nothing raises
         with problem(problems, f'没能保存 {parent} 到 {new} 的差异'):
             diff, digest = _save_patch(records, new, store.diff(parent, new))
-        records.write_json(f'releases/{new}.json', {
+        with problem(problems, f'没能读出 {new} 的树'):
+            tree = store.tree_of(new)
+        _write(records, f'releases/{new}.json', {
             'kind': 'rollback', 'version': new, 'parent': parent, 'target': version, 'round': None, 'who': who,
-            'author': who, 'time': now(), 'tree': store.tree_of(new), 'diff': diff, 'diff_sha256': digest,
-            'decision': None, 'evidence': [], 'trials': [], 'benefit': BENEFIT, 'problems': problems})
+            'author': who, 'time': now(), 'tree': tree, 'diff': diff, 'diff_sha256': digest,
+            'decision': None, 'evidence': [], 'trials': [], 'benefit': BENEFIT, 'problems': problems}, problems)
     return new

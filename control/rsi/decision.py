@@ -2,9 +2,10 @@
 
 Meta is untrusted, so its answer is parsed strictly before anything is done with it: exactly the keys of SCHEMA, of
 the types it names, and the rules beyond it. A trial decision lists at least one trial, and each trial names exactly
-one of a task (a plain id, rsi.paths.safe_id) and a probe text; a release decision cites at least one record; every
-record id (observations, evidence, applications) is a call id. Anything else is a ValueError whose message is one
-Chinese line, which goes back to Meta as the reason.
+one of a task (a plain id, rsi.paths.safe_id) and a probe text; a release decision cites at least one record (each id
+is kept once); every record id (observations, evidence, applications) is a call id; every text can be encoded as
+UTF-8, so it can be recorded and sent on. Anything else is a ValueError whose message is one Chinese line, which goes
+back to Meta as the reason.
 """
 import json
 from dataclasses import dataclass, field
@@ -21,6 +22,7 @@ MAX_TEXT = 1 << 20          # characters of a whole decision
 MAX_ITEMS = 20              # entries of trials, evidence and applications
 MAX_OBSERVATIONS = 100
 MAX_ID = 16                 # characters of a record id
+MAX_PAIRS = 32              # keys of any one object (the decision itself has 12)
 
 
 def _object(properties: dict) -> dict:
@@ -59,11 +61,25 @@ class Decision:
 
 
 def _no_duplicates(pairs: list) -> dict:
-    keys = [key for key, _ in pairs]
-    repeated = sorted({key for key in keys if keys.count(key) > 1})
-    if repeated:
-        raise ValueError(f'决定里的键重复了：{show(", ".join(repeated))}')
-    return dict(pairs)
+    """One object of the JSON text, refused when it has more than MAX_PAIRS keys or a key twice; linear in size."""
+    if len(pairs) > MAX_PAIRS:
+        raise ValueError(f'决定里有一个对象有 {len(pairs)} 个键，最多只能有 {MAX_PAIRS} 个')
+    found = {}
+    for key, value in pairs:
+        if key in found:
+            raise ValueError(f'决定里的键重复了：{show(key)}')
+        found[key] = value
+    return found
+
+
+def _utf8(value: str, where: str) -> str:
+    """value, once it is known that UTF-8 can hold it: a lone surrogate (JSON lets one in as an escape) could be
+    neither recorded nor sent on."""
+    try:
+        value.encode('utf-8')
+    except UnicodeEncodeError:
+        raise ValueError(f'{where} 里有不能存成 UTF-8 的字符（例如单独的代理码位），请去掉') from None
+    return value
 
 
 def _keys(value, keys: tuple, where: str) -> dict:
@@ -82,7 +98,7 @@ def _keys(value, keys: tuple, where: str) -> dict:
 def _text(value, where: str, *, filled: bool = False) -> str:
     if not isinstance(value, str) or (filled and not value.strip()):
         raise ValueError(f'{where} 必须是{"非空" if filled else ""}文本')
-    return value
+    return _utf8(value, where)
 
 
 def _list(value, where: str, limit: int) -> list:
@@ -117,6 +133,8 @@ def _trial(value, number: int) -> dict:
         raise ValueError(f'{where} 的 task {show(task)} 不是合规的任务编号（字母、数字、_ 和 -，以字母或数字开头）')
     if probe is not None and (not isinstance(probe, str) or not probe.strip() or len(probe) > PROBE_LIMIT):
         raise ValueError(f'{where} 的 probe 必须是非空文本，最多 {PROBE_LIMIT} 个字符')
+    if probe is not None:
+        _utf8(probe, f'{where} 的 probe')
     return {'task': task, 'probe': probe, 'version': version}
 
 
@@ -156,11 +174,13 @@ def parse_decision(text: str) -> Decision:
     for key in NOTE_KEYS:
         notes[key] = _text(data[key], key)
     trials = [_trial(item, number) for number, item in enumerate(_list(data['trials'], 'trials', MAX_ITEMS), start=1)]
-    evidence = _ids(data['evidence'], 'evidence')
+    evidence = list(dict.fromkeys(_ids(data['evidence'], 'evidence')))           # each id once, in order
     applications = [_application(item, number)
                     for number, item in enumerate(_list(data['applications'], 'applications', MAX_ITEMS), start=1)]
     if kind == 'trial' and not trials:
         raise ValueError('trial 决定至少要在 trials 里列一项试跑')
     if kind == 'release' and not evidence:
         raise ValueError('release 决定至少要在 evidence 里引用一条运行记录')
-    return Decision(kind, notes, trials, evidence, applications)
+    decision = Decision(kind, notes, trials, evidence, applications)
+    _utf8(json.dumps(decision.as_dict(), ensure_ascii=False), '决定')      # every part can be recorded
+    return decision

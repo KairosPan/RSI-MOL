@@ -1,4 +1,5 @@
 import json
+import time
 import unittest
 
 from rsi.decision import SCHEMA, parse_decision
@@ -87,6 +88,37 @@ class DecisionTests(unittest.TestCase):
             self.assertNotIn('\n', reason); self.assertLess(len(reason), 400, reason)
         with self.assertRaises(ValueError): parse_decision(None)
         with self.assertRaises(ValueError): parse_decision(b'{}')
+
+    def test_text_that_cannot_be_recorded_is_refused(self):
+        lone = '\\ud800'                                  # a JSON escape for a lone surrogate: UTF-8 cannot hold it
+        trial = '{"task": null, "probe": "a%sb", "version": "current"}' % lone
+        cases = {decision('no_change').replace('"problem": "p"', f'"problem": "{lone}"'): 'problem',
+                 decision('no_change', applications=[{'what': 'WHAT', 'why': 'w', 'records': []}])
+                 .replace('"WHAT"', f'"x{lone}"'): 'what',
+                 decision('trial', trials=['TRIAL']).replace('"TRIAL"', trial): 'probe',
+                 decision('no_change', observations=[{'record': 'R0001', 'note': 'NOTE'}])
+                 .replace('"NOTE"', f'"{lone}"'): 'note'}
+        for text, word in cases.items():
+            with self.assertRaises(ValueError, msg=text) as caught:
+                parse_decision(text)
+            reason = str(caught.exception)
+            self.assertIn(word, reason); self.assertIn('UTF-8', reason); self.assertNotIn('\n', reason)
+            reason.encode('utf-8')                        # the reason itself can be recorded and sent
+
+    def test_duplicate_keys_are_found_in_linear_time_and_objects_are_capped(self):
+        many = '{' + ', '.join(f'"k{number}": 1' for number in range(80_000)) + '}'
+        started = time.monotonic()
+        with self.assertRaises(ValueError) as caught:
+            parse_decision(many)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertIn('键', str(caught.exception))
+        repeated = '{' + ', '.join(['"decision": "no_change"'] * 2) + '}'
+        with self.assertRaisesRegex(ValueError, '重复'):
+            parse_decision(repeated)
+
+    def test_repeated_evidence_is_kept_once_in_order(self):
+        parsed = parse_decision(decision('release', evidence=['R0003', 'R0002', 'R0003', 'R0002']))
+        self.assertEqual(parsed.evidence, ['R0003', 'R0002'])
 
 
 if __name__ == '__main__':

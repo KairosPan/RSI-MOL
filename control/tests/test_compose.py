@@ -227,6 +227,13 @@ class ComposeTests(unittest.TestCase):
         self.assertNotIn('network_proxy', c['features'])
         fs = c['permissions']['trial']['filesystem']
         self.assertEqual((fs[str(trial)], fs[str(trial / '.codex')]), ('write', 'read'))
+        # A trial (a probe Meta wrote) must not change the live Lab's shared environment or library.
+        for profile in ('trial', 'trial_net'):
+            fs = c['permissions'][profile]['filesystem']
+            self.assertEqual((fs[str(self.layout.library)], fs[str(self.layout.env)]), ('read', 'read'), profile)
+        for profile in ('lab', 'lab_net'):
+            fs = c['permissions'][profile]['filesystem']
+            self.assertEqual((fs[str(self.layout.library)], fs[str(self.layout.env)]), ('write', 'write'), profile)
 
     def wrapper(self, text='[tool_servers.t]\ncommand = "c"\n'):
         return lab_config(self.layout, self.envelope, self.settings(text), trial=False, resolve=no_lookup)
@@ -485,8 +492,29 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(c['shell_environment_policy']['set']['TMPDIR'], str(self.layout.meta / '.tmp'))
         self.assertEqual(c['shell_environment_policy']['set']['TMPPREFIX'], str(self.layout.meta / '.tmp/zsh'))
         self.assertNotIn('model', c); self.assertNotIn('model_reasoning_effort', c)
+        self.assertEqual(c['project_doc_max_bytes'], 0)          # Meta cannot write its own standing instructions
         self.assertEqual(meta_config(self.layout, self.envelope, {'model': 'm'})['model'], 'm')
         tomllib.loads(render_file(c))
+
+    @needs_codex
+    def test_the_real_sandbox_keeps_trials_off_library_and_env(self):
+        os.environ.pop('RSI_CODEX', None)
+        for folder in (self.layout.trial / '.tmp', self.layout.work / '.tmp', self.layout.library, self.layout.env,
+                       self.layout.lab_home):
+            folder.mkdir(parents=True, exist_ok=True)
+        config = lab_config(self.layout, self.envelope, self.settings(), trial=True)
+
+        def sandboxed(profile, workspace, command):
+            return subprocess.run([native_codex(self.layout), 'sandbox',
+                                   *render_flags({'permissions': config['permissions']}), '-P', profile, '--',
+                                   '/bin/sh', '-c', command], cwd=workspace, capture_output=True, timeout=60,
+                                  env={**os.environ, 'CODEX_HOME': str(self.layout.lab_home)}).returncode
+        for folder in (self.layout.library, self.layout.env):
+            self.assertNotEqual(sandboxed('trial', self.layout.trial, f'echo x > {folder}/t.txt'), 0, folder)
+            self.assertFalse((folder / 't.txt').exists(), folder)
+            self.assertEqual(sandboxed('trial', self.layout.trial, f'ls {folder}'), 0, folder)
+            self.assertEqual(sandboxed('lab', self.layout.work, f'echo x > {folder}/l.txt'), 0, folder)
+        self.assertEqual(sandboxed('trial', self.layout.trial, 'echo x > t.txt'), 0)
 
     @needs_codex
     def test_the_real_sandbox_lets_meta_write_the_candidate_and_its_notes_only(self):

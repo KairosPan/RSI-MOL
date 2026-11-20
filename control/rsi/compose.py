@@ -147,10 +147,11 @@ def _tool_folders() -> list[str]:
     return [folder for folder in TOOL_FOLDERS if os.path.exists(folder)]
 
 
-def _filesystem(layout: Layout, envelope: dict, workspace: Path) -> dict:
-    """One Lab profile's filesystem table: deny the root, then open the workspace, library and env."""
+def _filesystem(layout: Layout, envelope: dict, workspace: Path, shared: str) -> dict:
+    """One Lab profile's filesystem table: deny the root, then open the workspace (write), and library and env with
+    the access `shared`."""
     table = {':minimal': 'read', str(layout.root): 'deny', str(workspace): 'write', str(workspace / '.codex'): 'read',
-             str(layout.library): 'write', str(layout.env): 'write', str(layout.lab_home / 'plugins' / 'cache'): 'read'}
+             str(layout.library): shared, str(layout.env): shared, str(layout.lab_home / 'plugins' / 'cache'): 'read'}
     for folder in _tool_folders() + _extra_read(layout, envelope):
         table.setdefault(folder, 'read')
     for closed in temp_folders() + list(_homes()):
@@ -159,10 +160,13 @@ def _filesystem(layout: Layout, envelope: dict, workspace: Path) -> dict:
 
 
 def profiles(layout: Layout, envelope: dict) -> dict:
-    """The `permissions` table: lab and trial (write work/ or trial/), each also as a _net variant."""
+    """The `permissions` table: lab and trial (write work/ or trial/), each also as a _net variant.
+
+    Only lab writes library/ and env/. A trial runs a candidate Meta has not released, or a probe text Meta wrote,
+    so it may read them but not change the live Lab's shared environment (env/bin is first on its PATH) or library."""
     out = {}
-    for name, workspace in (('lab', layout.work), ('trial', layout.trial)):
-        filesystem = _filesystem(layout, envelope, workspace)
+    for name, workspace, shared in (('lab', layout.work, 'write'), ('trial', layout.trial, 'read')):
+        filesystem = _filesystem(layout, envelope, workspace, shared)
         out[name] = {'filesystem': filesystem, 'network': copy.deepcopy(NETWORK_OFF)}
         out[name + '_net'] = {'filesystem': dict(filesystem), 'network': copy.deepcopy(NETWORK_ON)}
     return out
@@ -443,7 +447,10 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
 def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
     """The complete Codex configuration of a Meta call: reads records, work, library and env; writes meta/ (its
     notes) and candidate/ only; no apps, no plugins, live web search, commands offline. Only model and
-    model_reasoning_effort are taken from meta_settings. The envelope is the Lab's and does not widen Meta."""
+    model_reasoning_effort are taken from meta_settings. The envelope is the Lab's and does not widen Meta.
+
+    No project document is loaded (project_doc_max_bytes = 0): Meta works in meta/, which it writes, so an AGENTS.md
+    there would be standing instructions Meta wrote for itself; its duties are the owner's, sent in the prompt."""
     filesystem = {':minimal': 'read', str(layout.root): 'deny', str(layout.records): 'read', str(layout.work): 'read',
                   str(layout.library): 'read', str(layout.env): 'read', str(layout.meta): 'write',
                   str(layout.candidate): 'write', str(layout.meta / '.codex'): 'read',
@@ -452,7 +459,7 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
         filesystem.setdefault(folder, 'read')
     for closed in temp_folders() + list(_homes()):
         filesystem[closed] = 'deny'
-    config = {'approval_policy': 'never', 'default_permissions': 'meta'}
+    config = {'approval_policy': 'never', 'default_permissions': 'meta', 'project_doc_max_bytes': 0}
     for key in ('model', 'model_reasoning_effort'):
         value = meta_settings.get(key)
         if value is None:

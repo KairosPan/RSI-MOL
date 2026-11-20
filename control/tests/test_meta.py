@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import tomllib
 import unittest
 from unittest import mock
@@ -373,6 +374,100 @@ class MoreMetaRounds(unittest.TestCase):
             for version in ('V0003', 'V0009', 'HEAD', '0' * 40):
                 with self.assertRaises(ValueError, msg=version): rollback(root.layout, version, 'owner')
             self.assertEqual((root.store.head(), (root.layout.work / 'AGENTS.md').read_text()), ('V0003', 'hello\n'))
+
+
+def after_each_meta_call(root: Root, plant):
+    """A stand-in for meta.run_codex that notes, when each Meta call starts, whether candidate/ is a real folder, and
+    calls plant(number) after call `number` (what Meta could do while it ran). Returns (the patch, the notes)."""
+    original, real = meta.run_codex, []
+
+    def run(**options):
+        real.append(root.layout.candidate.is_dir() and not root.layout.candidate.is_symlink())
+        result = original(**options)
+        plant(len(real))
+        return result
+    return mock.patch.object(meta, 'run_codex', run), real
+
+
+@needs_codex
+class FixRound1(unittest.TestCase):
+    """Review fix round 1: candidate/ before every Meta call, text that cannot be recorded, Meta's own AGENTS.md."""
+    TRIAL = MetaRounds.TRIAL
+
+    def link_candidate(self, root: Root, outside, immutable=False):
+        os.rename(root.layout.candidate, root.layout.root / 'moved'); os.symlink(outside, root.layout.candidate)
+        if immutable:                                 # support.force_remove clears the flag when the root goes
+            os.chflags(root.layout.candidate, stat.UF_IMMUTABLE, follow_symlinks=False)
+
+    def test_a_link_planted_before_an_invalid_answer_is_sealed_before_the_next_call(self):
+        with Root() as root:
+            outside = SealedCandidate.outside(self, root)
+            patch, real = after_each_meta_call(root, lambda number: number == 1 and self.link_candidate(root, outside))
+            root.model.push(say('not json'), say(decision('no_change')))
+            with patch:
+                rnd = run_round(root.layout, [])
+            self.assertEqual((rnd['outcome'], real), ('no_change', [True, True]))
+            self.assertEqual(sorted(os.listdir(outside)), ['RULES.md', 'x'])
+            [note] = [note for note in index(root, 'sealed') if note['workspace'] == 'candidate']
+            self.assertTrue((root.layout.root / note['path']).is_symlink())
+            self.assertIn('符号链接', str(root.model.requests[-1]['input'][-1]))          # Meta is told
+            self.assertEqual(root.store.tree_of_dir(root.layout.candidate), root.store.tree_of('V0001'))
+
+    def test_an_immutable_link_that_cannot_be_sealed_stops_the_round_before_another_call(self):
+        with Root() as root:
+            root.add_task('T1'); outside = SealedCandidate.outside(self, root)
+            patch, real = after_each_meta_call(
+                root, lambda number: number == 1 and self.link_candidate(root, outside, immutable=True))
+            root.model.push(say(decision('trial', trials=self.TRIAL)), say(decision('no_change')))
+            with patch:
+                rnd = run_round(root.layout, [])
+            self.assertEqual((rnd['outcome'], rnd['calls'], real, len(root.model.requests)),
+                             ('limit_reached', ['R0001'], [True], 1))
+            self.assertIn('candidate/', rnd['reason']); self.assertEqual(purposes(root), ['meta'])
+            [note] = index(root, 'refusal'); self.assertEqual((note['round'], note['reason']), ('M0001', rnd['reason']))
+            self.assertEqual(sorted(os.listdir(outside)), ['RULES.md', 'x'])
+            self.assertTrue((root.layout.records / 'rounds' / 'M0001' / 'round.json').is_file())
+
+    def test_an_answer_with_text_that_cannot_be_recorded_is_not_carried_out(self):
+        with Root() as root:
+            root.add_task('T1')
+            bad = decision('release', evidence=['R0002']).replace('"problem": "p"', '"problem": "\\ud800"')
+            root.model.push(add_file('../candidate/RULES.md', 'r'), say(decision('trial', trials=self.TRIAL)),
+                            say('lab'), say(bad), say(decision('no_change')))
+            rnd = run_round(root.layout, [])
+            self.assertEqual((rnd['outcome'], root.store.head()), ('no_change', 'V0001'))
+            self.assertIn('UTF-8', rnd['decisions'][1]['invalid'])
+            saved = json.loads((root.layout.records / 'rounds' / 'M0001' / 'round.json').read_text())
+            self.assertEqual(saved, rnd)
+
+    def test_records_written_after_a_release_are_escaped_never_lost(self):
+        with Root() as root:
+            root.add_task('T1'); real = meta.parse_decision
+
+            def unrecordable(text):                       # as if a lone surrogate had got past parse_decision
+                parsed = real(text)
+                parsed.notes['problem'] = '坏\ud800'
+                return parsed
+
+            root.model.push(add_file('../candidate/RULES.md', 'r'), say(decision('trial', trials=self.TRIAL)),
+                            say('lab'), say(decision('release', evidence=['R0002'])))
+            with mock.patch.object(meta, 'parse_decision', unrecordable):
+                rnd = run_round(root.layout, [])
+            self.assertEqual((rnd['outcome'], root.store.head()), ('released', 'V0002'))
+            release = json.loads((root.layout.records / 'releases' / 'V0002.json').read_text())
+            self.assertEqual((release['decision']['problem'], release['evidence']), ('坏\\ud800', ['R0002']))
+            saved = json.loads((root.layout.records / 'rounds' / 'M0001' / 'round.json').read_text())
+            self.assertEqual((saved['outcome'], saved['version_after']), ('released', 'V0002'))
+            self.assertTrue(any('UTF-8' in line for line in rnd['problems']), rnd['problems'])
+
+    def test_meta_never_loads_standing_instructions_from_its_own_folder(self):
+        with Root() as root:
+            for name in ('AGENTS.md', 'AGENTS.override.md'):
+                (root.layout.meta / name).write_text(f'Meta 自己写的指示 MARKER-7f3a-{name}\n')
+            root.model.push(say('not json'), say(decision('no_change')))
+            self.assertEqual(run_round(root.layout, [])['outcome'], 'no_change')
+            self.assertEqual(len(root.model.requests), 2)
+            self.assertNotIn('MARKER-7f3a', json.dumps(root.model.requests, ensure_ascii=False))
 
 
 if __name__ == '__main__':
