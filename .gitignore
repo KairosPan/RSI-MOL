@@ -8,6 +8,7 @@
 /library/
 /env/
 /versions/
+/owner/
 /.rsi.lock
 /.superpowers/
 __pycache__/
