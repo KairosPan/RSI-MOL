@@ -394,7 +394,7 @@ def _init(layout: Layout) -> int:
         lines.append(f'新建的文件夹：{"、".join(report["folders"])}')
     if report['files']:
         lines.append(f'新写的文件：{"、".join(report["files"])}')
-    envelope = {'imported': f'从负责人原来的 Codex 配置导入（备份在 {safe(report["envelope_source"])}）',
+    envelope = {'imported': f'从主人原来的 Codex 配置导入（备份在 {safe(report["envelope_source"])}）',
                 'default': '按默认值新写（没有可用的原 Codex 配置备份）', 'kept': '已有，没有改'}
     lines.append(f'Lab 的对外范围 owner/lab-envelope.toml：{envelope[report["envelope"]]}')
     first = f'，其中 {report["first_version"]} 是这次用种子文件建的' if report['first_version'] else ''

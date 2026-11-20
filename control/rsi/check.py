@@ -891,7 +891,7 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
         config.pop(table, None)
     features = context.envelope.get('features', {})
     context.info.append(_info('edit_layer_without_apps_and_plugins', which, ALLOWED,
-                              f'这一层的 codex exec 关掉了 apps 和 plugins，也没有带 apps、plugins 表（负责人的信封里 '
+                              f'这一层的 codex exec 关掉了 apps 和 plugins，也没有带 apps、plugins 表（主人的信封里 '
                               f'features.apps = {json.dumps(features.get("apps"))}，features.plugins = '
                               f'{json.dumps(features.get("plugins"))}）；命令层和权限表仍按信封'))
     (home / 'rules').mkdir(parents=True, exist_ok=True)              # the saved command rules of SHELLS

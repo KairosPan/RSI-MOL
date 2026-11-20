@@ -61,7 +61,7 @@ DEFAULT_INSTRUCTIONS = """你是 Meta Codex：在任务之间改进 Lab Codex �
 - 一次只做一个小改动。
 - 不把某个任务的答案写进 Lab 的指示。
 - 写明可能的退化和拿不准的地方；不声称收益。
-- 要扩大 Lab 的外部范围（连接器、插件、工作区以外的文件、预算上限），写申请，由负责人决定。
+- 要扩大 Lab 的外部范围（连接器、插件、工作区以外的文件、预算上限），写申请，由主人决定。
 """
 DECISION_GUIDE = """每次调用最后只交回一个 JSON 对象（格式见输出约束），decision 三选一：
 
@@ -74,7 +74,7 @@ DECISION_GUIDE = """每次调用最后只交回一个 JSON 对象（格式见输
 运行，跑的内容和现在的候选版完全一样（改了候选版之后，之前的试跑就不再算）。结果好不好由你判断。
 
 observations 的 record、evidence 和 applications 的 records 都只能是调用编号（R 加数字，例如 R0002）。\
-要扩大 Lab 的外部范围，写在 applications 里，由负责人决定。"""
+要扩大 Lab 的外部范围，写在 applications 里，由主人决定。"""
 
 
 def _owner_text(path: Path) -> str | None:

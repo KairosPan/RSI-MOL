@@ -515,10 +515,10 @@ def keep_owner_config(layout: Layout) -> tuple[Path | None, bool]:
         except FileExistsError:
             continue
         except OSError as error:
-            raise Refused(f'{path} 是负责人自己的配置，没能可靠地备份到 {target}（{error.strerror or error}），'
+            raise Refused(f'{path} 是主人自己的配置，没能可靠地备份到 {target}（{error.strerror or error}），'
                           '所以没有改写它') from None
         return target, True
-    raise Refused(f'{path} 是负责人自己的配置，但 {OWNER_BACKUP} 到 {OWNER_BACKUP}-{BACKUP_NAMES} 都被占用了，'
+    raise Refused(f'{path} 是主人自己的配置，但 {OWNER_BACKUP} 到 {OWNER_BACKUP}-{BACKUP_NAMES} 都被占用了，'
                   '没能备份，所以没有改写它')
 
 

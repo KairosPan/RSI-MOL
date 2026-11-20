@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import sys
@@ -10,25 +11,43 @@ from unittest import mock
 from rsi import init as init_module
 from rsi.codexrun import RECORD_FILES
 from rsi.init import init
+from rsi.labrun import run_task
 from rsi.limits import Limits, load_limits
+from rsi.meta import DECISION_GUIDE, DEFAULT_INSTRUCTIONS
+from rsi.mockmodel import add_file, say
 from rsi.paths import Layout
-from rsi.records import CALL_FILE
+from rsi.records import CALL_FILE, KINDS
 from rsi.settings import SETTINGS, Settings, load_settings, workspace_problems
 from rsi.tasks import SECTIONS, load_task, run_check
 from rsi.versions import VersionStore
-from tests.support import force_remove
+from tests.support import ENVELOPE, PASS_CHECK, Root, force_remove, needs_codex, write_passing_check
 
 SEED = Path(__file__).resolve().parents[1] / 'seed'
 TASKS = SEED.parents[1] / 'tasks'
+META_TEXT = SEED / 'owner' / 'meta' / 'AGENTS.md'
 WORK_FILES = ['AGENTS.md', 'codex/agents/literature.toml', 'codex/settings.toml', 'notes/README.md']
 OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
+LAB_LEAD_FILES = ['control/seed/work/AGENTS.md', 'control/seed/work/codex/agents/literature.toml']
 # A commented-out example line of the seed's settings.toml: a table header or `key = value`, after '# '.
 EXAMPLE = re.compile(r'# (\[[a-z_.]+\]|[a-z_]+ = .+)')
+IDS = '\n[apps.conn_a]\nenabled = true\n\n[plugins."pdf@x"]\nenabled = true\n'     # allowed connector and plugin
 
 
 def files(folder: Path) -> list[str]:
     """The regular files under folder, as sorted relative paths."""
     return sorted(path.relative_to(folder).as_posix() for path in folder.rglob('*') if path.is_file())
+
+
+def observe_step(text: str) -> str:
+    """Step 1 of Meta's standing instructions: what a run record holds."""
+    return text[text.index('1. 观察'):text.index('2. 诊断')]
+
+
+def meta_paths() -> tuple[str, str]:
+    """A call's record folder and the candidate as seen from Meta's working folder, from the layout itself."""
+    layout = Layout(Path('/RSI'))
+    return (f'{os.path.relpath(layout.records, layout.meta)}/{KINDS["R"]}/<编号>/',
+            f'{os.path.relpath(layout.candidate, layout.meta)}/')
 
 
 class Seed(unittest.TestCase):
@@ -71,6 +90,9 @@ class Seed(unittest.TestCase):
         self.assertEqual(tomllib.loads(text), {})
         self.assertEqual(load_settings(SEED / 'work').problems, [])
         examples = [match.group(1) for line in text.splitlines() if (match := EXAMPLE.fullmatch(line))]
+        loose = [line for line in text.splitlines() if re.match(r'#\s*(\[|[a-z_]+\s*=)', line)
+                 and not EXAMPLE.fullmatch(line)]
+        self.assertEqual(loose, [])                     # an example spelled otherwise would be skipped below
         with tempfile.TemporaryDirectory() as folder:
             (Path(folder) / 'codex').mkdir()
             (Path(folder) / SETTINGS).write_text('\n'.join(examples) + '\n', encoding='utf-8')
@@ -88,11 +110,48 @@ class Seed(unittest.TestCase):
         self.assertEqual(load_limits(SEED / 'owner'), Limits())
         self.assertEqual(tomllib.loads((SEED / 'owner' / 'meta' / 'settings.toml').read_text(encoding='utf-8')), {})
 
-    def test_the_meta_instructions_name_the_files_a_call_record_holds(self):
-        text = (SEED / 'owner' / 'meta' / 'AGENTS.md').read_text(encoding='utf-8')
+    def test_the_meta_instructions_name_the_record_files_and_the_paths_of_the_layout(self):
+        text = META_TEXT.read_text(encoding='utf-8')
+        runs, candidate = meta_paths()
+        self.assertIn(f'`{runs}`', observe_step(text)); self.assertIn(f'`{candidate}`', text)
         named = set(re.findall(r'`([\w.-]+\.(?:json|jsonl|txt|patch))`', text))
         self.assertIn(CALL_FILE, named); self.assertLessEqual(named, {CALL_FILE, *RECORD_FILES, 'diff.patch'})
-        self.assertIn('`../candidate/`', text)
+
+    @needs_codex
+    def test_what_meta_is_told_a_record_holds_is_in_a_lab_run_record(self):
+        """Every name of step 1 but the path is an entry of a real task run's record folder or a key of its
+        call.json, and the connector and plugin ids are where the [disable] line says."""
+        text = META_TEXT.read_text(encoding='utf-8')
+        runs, _ = meta_paths()
+        with Root() as root:
+            (root.layout.owner / 'lab-envelope.toml').write_text(ENVELOPE + IDS, encoding='utf-8')
+            write_passing_check(root.layout)                # the envelope changed since the check
+            root.add_task('T1', check=PASS_CHECK)
+            root.model.push(add_file('out/T1/answer.json', '{"x": 3, "y": -1}'), say('done'))
+            call = run_task(root.layout, 'T1')
+            folder = root.records.call_dir(call['id'])
+            self.assertEqual(os.path.normpath(root.layout.meta / runs.replace('<编号>', call['id'])), str(folder))
+            entries = {path.name + ('/' if path.is_dir() else '') for path in folder.iterdir()}
+        named = set(re.findall(r'`([^`]+)`', observe_step(text))) - {runs}
+        self.assertEqual(call['status'], 'finished'); self.assertLessEqual({'out/', 'sessions/', 'stderr.txt'}, named)
+        for name in sorted(named):
+            self.assertTrue(name in entries or name in call, name)
+        for word in ('`[disable]`', '`call.json`', '`command`', '`apps=`', '`plugins=`'):
+            self.assertIn(word, text)
+        flags = [flag for flag in call['command'] if flag.startswith(('apps=', 'plugins='))]
+        self.assertEqual([(flag.split('=')[0], 'conn_a' in flag or 'pdf@x' in flag) for flag in flags],
+                         [('apps', True), ('plugins', True)])
+
+    def test_the_lab_leads_word_is_never_used_for_the_owner(self):
+        """负责人 is only the Lab lead, in the Lab's own seed files; the owner is 主人 wherever Meta reads it."""
+        repo = SEED.parents[1]
+        paths = [repo / 'rsi', *(path for top in ('control/rsi', 'control/seed', 'tasks')
+                                 for path in (repo / top).rglob('*'))]
+        found = sorted(path.relative_to(repo).as_posix() for path in paths
+                       if path.is_file() and '__pycache__' not in path.parts and '负责人'.encode() in path.read_bytes())
+        self.assertEqual(found, LAB_LEAD_FILES)
+        for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS, META_TEXT.read_text(encoding='utf-8')):
+            self.assertIn('由主人决定', text)
 
     def test_a_root_initialised_from_the_seed_has_it_as_v0001(self):
         tmp = Path(tempfile.mkdtemp()).resolve()

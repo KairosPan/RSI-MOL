@@ -61,8 +61,8 @@ VENV_SECONDS = 600
 # of the recorded start time (process.json): the pid may since have been reused by an unrelated process.
 SAME_PROCESS_SECONDS = 2
 STOP_GRACE = 5                  # seconds recover waits for a call's process group after SIGTERM, before SIGKILL
-ENVELOPE_HEADER = ('# Lab 的对外范围。负责人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
-                   '# 取自负责人原来的 codex-home/config.toml 的备份（config.toml.before-rsi…），[rsi] 是控制程序的设置。\n')
+ENVELOPE_HEADER = ('# Lab 的对外范围。主人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
+                   '# 取自主人原来的 codex-home/config.toml 的备份（config.toml.before-rsi…），[rsi] 是控制程序的设置。\n')
 
 
 @contextmanager
