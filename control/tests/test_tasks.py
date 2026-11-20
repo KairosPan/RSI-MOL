@@ -1,7 +1,8 @@
 import os
 import unittest
 
-from rsi.tasks import SECTIONS, clear, collect_out, load_task, place_inputs, prompt_for, run_check
+from rsi.tasks import (SECTIONS, clear, collect_out, load_task, place_inputs, prompt_for, real_folder, run_check,
+                       set_aside_git)
 from tests.support import PASS_CHECK, Root
 
 
@@ -25,8 +26,10 @@ class TaskFiles(unittest.TestCase):
         with Root() as root:
             out = root.layout.work / 'out' / 'T1'; out.mkdir(parents=True); secret = root.layout.owner / 'limits.toml'
             os.symlink(secret, out / 'link'); (out / 'a.txt').write_text('a'); dest = root.layout.root / 'dest'
-            self.assertEqual(collect_out(root.layout.work, 'T1', dest), [])
-            self.assertTrue(os.path.islink(dest / 'link')); self.assertFalse((root.layout.work / 'out' / 'T1').exists())
+            problems = collect_out(root.layout.work, 'T1', dest)          # ruling: links are dropped, not kept
+            self.assertEqual(len(problems), 1); self.assertIn('link', problems[0])
+            self.assertFalse(os.path.lexists(dest / 'link')); self.assertEqual((dest / 'a.txt').read_text(), 'a')
+            self.assertFalse((root.layout.work / 'out' / 'T1').exists()); self.assertTrue(secret.is_file())
             (root.layout.work / 'out').mkdir(exist_ok=True)
             os.symlink(root.layout.owner, root.layout.work / 'out' / 'T2')
             self.assertTrue(collect_out(root.layout.work, 'T2', root.layout.root / 'dest2'))
@@ -96,6 +99,59 @@ class MoreTaskFiles(unittest.TestCase):
             self.assertEqual(place_inputs(load_task(root.layout.tasks, 'T1'), work), [])
             self.assertEqual(sorted(os.listdir(work / 'in' / 'T1')), ['data.txt', 'link'])
             self.assertEqual(clear(work, 'in', 'T1'), []); self.assertFalse(os.path.lexists(work / 'in'))
+
+    def test_collected_results_hold_only_regular_files_and_folders(self):
+        with Root() as root:
+            work = root.layout.work; out = work / 'out' / 'T1'; (out / 'sub' / 'deeper').mkdir(parents=True)
+            (out / 'sub' / 'deeper' / 'kept.txt').write_text('k')
+            os.symlink(root.layout.owner, out / 'sub' / 'to-owner')
+            os.mkfifo(out / 'sub' / 'pipe')
+            (work / 'notes').mkdir(); (work / 'notes' / 'h.txt').write_text('shared')
+            os.link(work / 'notes' / 'h.txt', out / 'h.txt')
+            dest = root.layout.root / 'dest'
+            problems = collect_out(work, 'T1', dest)
+            self.assertEqual(len(problems), 2)
+            self.assertTrue(any('out/T1/sub/to-owner' in line and '符号链接' in line for line in problems))
+            self.assertTrue(any('out/T1/sub/pipe' in line and '命名管道' in line for line in problems))
+            found = sorted(os.path.relpath(os.path.join(top, name), dest)
+                           for top, folders, files in os.walk(dest) for name in folders + files)
+            self.assertEqual(found, ['h.txt', 'sub', 'sub/deeper', 'sub/deeper/kept.txt'])
+            self.assertEqual(os.stat(dest / 'h.txt').st_nlink, 1)           # copied by content, not shared
+            (work / 'notes' / 'h.txt').write_text('changed later')
+            self.assertEqual((dest / 'h.txt').read_text(), 'shared')
+            self.assertFalse(os.path.lexists(out)); self.assertTrue(root.layout.owner.is_dir())
+
+    def test_control_folders_are_made_real(self):
+        with Root() as root:
+            work, outside = root.layout.work, root.layout.root / 'outside'
+            outside.mkdir(); (outside / 'x').write_text('x')
+            os.symlink(outside, work / '.tmp')
+            self.assertEqual(len(real_folder(work, '.tmp')), 1)
+            self.assertTrue((work / '.tmp').is_dir()); self.assertFalse((work / '.tmp').is_symlink())
+            self.assertEqual(os.listdir(outside), ['x']); self.assertEqual(real_folder(work, '.tmp'), [])
+            (work / '.tmp' / 'y').write_text('kept')                            # a real folder is left as it is
+            self.assertEqual(real_folder(work, '.tmp'), []); self.assertTrue((work / '.tmp' / 'y').is_file())
+
+    def test_nested_git_entries_are_set_aside(self):
+        with Root() as root:
+            work, outside = root.layout.work, root.layout.root / 'outside'
+            (work / 'sub' / '.git').mkdir(parents=True); (work / 'sub' / '.git' / 'config').write_text('c')
+            (work / 'sub' / '.git.rsi-kept').mkdir()                           # the name is taken: -2
+            (work / 'a' / 'b').mkdir(parents=True); (work / 'a' / 'b' / '.GIT').write_text('gitdir: x')
+            (work / 'odd').mkdir(); (work / 'odd' / 'git~1').write_text('x'); (work / 'odd' / '.git ').mkdir()
+            os.symlink('target', work / 'odd' / '.gitmodules')
+            (outside / '.git').mkdir(parents=True); os.symlink(outside, work / 'linked')
+            (work / 'out').mkdir(); (work / 'out' / '.git').mkdir()                # never versioned: left alone
+            problems = set_aside_git(work)
+            self.assertEqual(len(problems), 5)
+            self.assertTrue(any('sub/.git' in line and 'sub/.git.rsi-kept-2' in line for line in problems))
+            self.assertEqual((work / 'sub' / '.git.rsi-kept-2' / 'config').read_text(), 'c')
+            self.assertTrue((work / 'a' / 'b' / '.git.rsi-kept').is_file())
+            self.assertEqual(sorted(os.listdir(work / 'odd')),
+                             ['.git.rsi-kept', '.git.rsi-kept-2', '.gitmodules.rsi-kept'])
+            self.assertTrue((outside / '.git').is_dir()); self.assertTrue((work / 'out' / '.git').is_dir())
+            self.assertIsNotNone(root.store.commit(work, 'owner (manual)', 'x'))   # versioning goes through now
+            self.assertEqual(set_aside_git(work), [])
 
     def test_collected_results_are_made_readable(self):
         with Root() as root:

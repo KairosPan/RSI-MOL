@@ -163,6 +163,29 @@ class MoreLabRuns(unittest.TestCase):
             self.assertFalse(call['check']['passed'])
             self.assertTrue(any('out/T1' in problem for problem in call['problems']))
 
+    def test_a_linked_tmp_is_replaced_by_a_real_folder(self):
+        with Root() as root:
+            root.add_task('T1'); outside = root.layout.root / 'outside'; outside.mkdir()
+            (outside / 'x').write_text('x'); os.symlink(outside, root.layout.work / '.tmp'); root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], os.listdir(outside)), ('finished', ['x']))
+            self.assertTrue((root.layout.work / '.tmp').is_dir())
+            self.assertFalse((root.layout.work / '.tmp').is_symlink())
+            self.assertTrue(any('.tmp' in problem for problem in call['problems']))
+
+    def test_a_nested_git_never_blocks_a_run(self):
+        with Root() as root:
+            root.add_task('T1'); (root.layout.work / 'sub' / '.git').mkdir(parents=True)
+            (root.layout.work / 'sub' / '.git' / 'config').write_text('[core]\n')
+            root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0002'))
+            self.assertEqual(root.store.log()[0]['author'], 'owner (manual)')
+            self.assertIn('b/sub/.git.rsi-kept/config', root.store.diff('V0001', 'V0002'))
+            self.assertTrue(any('sub/.git' in line and 'sub/.git.rsi-kept' in line for line in call['problems']))
+            root.model.push(say('again'))
+            self.assertEqual(run_task(root.layout, 'T1')['status'], 'finished')
+
     def test_an_interrupted_run_is_finished_as_interrupted(self):
         with Root() as root:
             root.add_task('T1', inputs={'data.txt': 'd'})

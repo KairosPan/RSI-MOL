@@ -20,8 +20,11 @@ KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL of a call's process group
 RECORD_FILES = ('prompt.txt', 'events.jsonl', 'stderr.txt', 'last-message.txt')
 LOCAL_HOSTS = '127.0.0.1,localhost'
 # The only variables of the control program's own environment that Codex gets, besides LC_* and the owner's tool
-# secrets RSI_TOOL_* (bearer tokens of URL tool servers, see settings.BEARER).
-KEPT_VARIABLES = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR')
+# secrets RSI_TOOL_* (bearer tokens of URL tool servers, see settings.BEARER). The proxy variables are kept so that
+# model calls work behind the owner's proxy.
+PROXY_VARIABLES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+                   'no_proxy')
+KEPT_VARIABLES = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', *PROXY_VARIABLES)
 
 
 @dataclass
@@ -46,6 +49,13 @@ def codex_environment(home: Path, *, secrets: bool = True) -> dict:
            if key in KEPT_VARIABLES or key.startswith('LC_') or (secrets and key.startswith('RSI_TOOL_'))}
     env['CODEX_HOME'] = str(home)
     return env
+
+
+def _with_local_hosts(value: str | None) -> str:
+    """A NO_PROXY value that also names LOCAL_HOSTS, keeping what it named before."""
+    hosts = [host.strip() for host in (value or '').split(',') if host.strip()]
+    hosts += [host for host in LOCAL_HOSTS.split(',') if host not in hosts]
+    return ','.join(hosts)
 
 
 def codex_version() -> str:
@@ -137,7 +147,8 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
     endpoint = os.environ.get('RSI_TEST_MODEL_ENDPOINT')
     if endpoint:
         config = _merge(config, provider_config(endpoint))
-        env['NO_PROXY'] = LOCAL_HOSTS
+        for key in ('NO_PROXY', 'no_proxy'):              # the endpoint is local: never through a proxy
+            env[key] = _with_local_hosts(env.get(key))
     if resume is not None:
         safe_id(resume, 'thread id')
     last_message = record_dir / 'last-message.txt'

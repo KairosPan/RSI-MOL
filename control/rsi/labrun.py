@@ -12,7 +12,8 @@ it is Meta's evidence, cost class `meta`.
 A refusal before a call is noted in records/index.jsonl and raised as Refused; a bad request is a ValueError. Once a
 call has started it is always finished: what goes wrong while collecting its results becomes a line in its
 `problems`. The workspace is the Lab's and the control program runs outside every sandbox, so nothing in it is
-followed through a link (see rsi.tasks).
+followed through a link (see rsi.tasks). Before every commit of the workspace, whatever git would refuse to store
+(a nested .git, say) is renamed and reported, so the workspace can never block a run.
 """
 import os
 import socket
@@ -30,7 +31,8 @@ from rsi.paths import Layout, Refused, safe_id
 from rsi.records import Records
 from rsi.sessions import collect_sessions
 from rsi.settings import Settings, load_settings
-from rsi.tasks import Task, clear, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
+from rsi.tasks import (Task, clear, collect_out, load_task, place_inputs, prompt_for, real_folder, results_sentence,
+                       run_check, set_aside_git)
 from rsi.versions import VersionStore
 
 MANUAL = 'owner (manual)'
@@ -139,9 +141,10 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
         limits = _admit(layout, records)
         _no_codex_entry(layout.work)
         store = _store(layout)
+        notes = set_aside_git(layout.work)                  # a nested .git never blocks a run
         try:
             store.commit(layout.work, MANUAL, '运行前发现的人工改动')
-        except (ValueError, RuntimeError) as error:       # e.g. a nested .git, or a file git cannot read
+        except (ValueError, RuntimeError) as error:       # e.g. a file git cannot read
             raise Refused(f'work/ 里有改动，但存不成版本：{error}。请处理后再运行。') from None
         version_before = store.head()
         envelope = load_envelope(layout.owner)
@@ -153,7 +156,7 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
                   'task': task.id, 'probe': None, 'round': None, 'workspace': 'work',
                   'version_before': version_before, 'commit': store.resolve(version_before),
                   'tree': store.tree_of(version_before), 'settings_problems': settings_problems}
-    run = _Run(layout.work, False, task, task.id, prompt_for(task), config, limits.lab_seconds, fields,
+    run = _Run(layout.work, False, task, task.id, prompt_for(task), config, limits.lab_seconds, fields, notes,
                version_before=version_before)
     return _execute(layout, records, store, run)
 
@@ -203,11 +206,9 @@ def _end_interrupted(records: Records, call_id: str) -> None:
 
 
 def _prepare(run: _Run) -> None:
-    """Make the workspace ready: its TMPDIR, no stale results, the task's inputs."""
-    try:
-        os.mkdir(run.workspace / '.tmp')
-    except FileExistsError:
-        pass
+    """Make the workspace ready: a real .tmp folder (TMPDIR and TMPPREFIX point into it), no stale results, the
+    task's inputs."""
+    run.notes += real_folder(run.workspace, '.tmp')
     run.notes += clear(run.workspace, 'out', run.out_name, report=True)
     if run.task is not None:
         run.notes += place_inputs(run.task, run.workspace)
@@ -265,6 +266,10 @@ def _collect(layout: Layout, store: VersionStore, run: _Run, call_id: str, call_
     end = {'status': result.status, 'exit_code': result.exit_code, 'thread_id': result.thread_id,
            'usage': result.usage, 'command': result.command, 'ended': _now(), 'check': check,
            'subagent_threads': subagents, 'version_after': None}
+    try:
+        problems += set_aside_git(run.workspace)
+    except OSError as error:
+        problems.append(f'没能把嵌套的 .git 改名：{error}')
     if run.trial:
         try:
             end['tree_after'] = store.tree_of_dir(run.workspace)

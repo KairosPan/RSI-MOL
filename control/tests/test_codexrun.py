@@ -171,15 +171,34 @@ class FakeCodex(unittest.TestCase):
                            timeout=30, schema=Path('s.json'))
         seen = self.seen(); env = seen['env']
         self.assertEqual((env['CODEX_HOME'], seen['cwd']), (str(self.tmp / 'home'), str(self.tmp / 'work')))
-        self.assertEqual((env['RSI_TOOL_FAR'], env['LC_CTYPE'], env['NO_PROXY']),
-                         ('secret', 'UTF-8', '127.0.0.1,localhost'))
+        self.assertEqual((env['RSI_TOOL_FAR'], env['LC_CTYPE']), ('secret', 'UTF-8'))
         for gone in ('SSH_AUTH_SOCK', 'OPENAI_API_KEY', 'PYTHONPATH', 'RSI_TEST_MODEL_ENDPOINT', 'RSI_CODEX'):
             self.assertNotIn(gone, env)
-        allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', 'CODEX_HOME', 'NO_PROXY',
-                   '__CF_USER_TEXT_ENCODING'}
+        allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', 'CODEX_HOME',
+                   'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+                   'no_proxy', '__CF_USER_TEXT_ENCODING'}
         self.assertEqual([key for key in env if key not in allowed and not key.startswith(('LC_', 'RSI_TOOL_'))], [])
         self.assertEqual(result.command[result.command.index('-o') + 1], str(self.tmp / 'r' / 'last-message.txt'))
         self.assertEqual(result.command[result.command.index('--output-schema') + 1], str(self.tmp / 's.json'))
+
+    def test_proxy_variables_are_kept_and_the_test_endpoint_bypasses_them(self):
+        self.fake('')
+        for key in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
+                    'no_proxy'):
+            os.environ.pop(key, None)
+        os.environ.update(HTTPS_PROXY='http://proxy.example:3128', all_proxy='socks5://proxy.example:1080',
+                          NO_PROXY='example.org,localhost')
+        os.environ.pop('RSI_TEST_MODEL_ENDPOINT', None)
+        run_codex(home=self.tmp / 'h1', cwd=self.tmp, prompt='go', config={}, record_dir=self.tmp / 'r1', timeout=30)
+        env = self.seen()['env']
+        self.assertEqual((env['HTTPS_PROXY'], env['all_proxy'], env['NO_PROXY']),
+                         ('http://proxy.example:3128', 'socks5://proxy.example:1080', 'example.org,localhost'))
+        self.assertNotIn('no_proxy', env)
+        os.environ['RSI_TEST_MODEL_ENDPOINT'] = 'http://127.0.0.1:9/v1'
+        run_codex(home=self.tmp / 'h2', cwd=self.tmp, prompt='go', config={}, record_dir=self.tmp / 'r2', timeout=30)
+        env = self.seen()['env']
+        self.assertEqual((env['NO_PROXY'], env['no_proxy']), ('example.org,localhost,127.0.0.1', '127.0.0.1,localhost'))
+        self.assertEqual(env['HTTPS_PROXY'], 'http://proxy.example:3128')
 
     def test_stop_survives_a_group_it_may_not_signal(self):
         process = subprocess.Popen(['/bin/sleep', '0'], start_new_session=True); process.wait()
