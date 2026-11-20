@@ -68,7 +68,6 @@ from rsi.workspace import kind, open_folder, remove
 
 CHECK_FILE = 'check.json'                       # in records/: the last check, the one record file that is replaced
 ALLOWED, BLOCKED, UNKNOWN = 'allowed', 'blocked', 'unknown'
-WORDS = {ALLOWED: '能做到', BLOCKED: '被拦住', UNKNOWN: '没有明确结果'}
 PROBE_SECONDS = 60                              # one `codex sandbox` probe or one tool server
 EXEC_SECONDS = 180                              # one `codex exec` of the edit layer
 LAB_PROFILES = ('lab', 'lab_net', 'trial', 'trial_net')
@@ -199,7 +198,7 @@ def answer(conn):
             break
         data += chunk
     if TOKEN not in data:
-        raise Blocked('代理没有接通：' + data[:100].decode('latin-1'))
+        raise Blocked('the proxy did not connect: ' + data[:100].decode('latin-1'))
 
 
 def tcp(port):
@@ -218,7 +217,7 @@ def proxy(variable, schemes):
     parts = urlsplit(value or '')
     if not value or parts.scheme not in schemes or not parts.hostname or not parts.port:
         if NET:                                         # a network profile must have its proxy: an untried route
-            raise RuntimeError(f'{variable} 不可用（{value!r}），这条代理路线没有试')   # is no evidence
+            raise RuntimeError(f'{variable} is not usable ({value!r}); this proxy route was not tried')  # no evidence
         raise Skipped()
     return socket.create_connection((parts.hostname, parts.port), timeout=5)
 
@@ -241,11 +240,11 @@ def socks_proxy(port):
         conn.settimeout(5)
         conn.sendall(b'\x05\x01\x00')
         if conn.recv(2) != b'\x05\x00':
-            raise Blocked('SOCKS 代理不接受')
+            raise Blocked('the SOCKS proxy did not accept')
         conn.sendall(b'\x05\x01\x00\x01\x7f\x00\x00\x01' + port.to_bytes(2, 'big'))
         reply = conn.recv(10)
         if len(reply) < 2 or reply[1] != 0:
-            raise Blocked('SOCKS 代理拒绝连接 127.0.0.1')
+            raise Blocked('the SOCKS proxy refused to connect to 127.0.0.1')
         answer(conn)
 
 
@@ -257,7 +256,7 @@ def produced(command, target, expected):
     except OSError:
         data = b''
     if done.returncode != 0 or expected not in data:
-        raise Blocked(f'退出码 {done.returncode}：' + done.stderr.decode(errors='replace')[-200:])
+        raise Blocked(f'exit code {done.returncode}: ' + done.stderr.decode(errors='replace')[-200:])
 
 
 def zsh(target):
@@ -290,9 +289,9 @@ for case in SPEC['cases']:
         else:
             outcome, why = 'allowed', ''
         seen.append(outcome)
-        details.append(f'{step} {outcome}' + (f'（{why}）' if why else ''))
+        details.append(f'{step} {outcome}' + (f' ({why})' if why else ''))
     observed = 'allowed' if 'allowed' in seen else 'unknown' if 'unknown' in seen or not seen else 'blocked'
-    print('RSI-CHECK ' + json.dumps({'name': case['name'], 'observed': observed, 'detail': '；'.join(details)}),
+    print('RSI-CHECK ' + json.dumps({'name': case['name'], 'observed': observed, 'detail': '; '.join(details)}),
           flush=True)
 '''
 
@@ -340,7 +339,7 @@ def _writable(layout: Layout, profile: str) -> list[Path]:
 
 
 def _no_lookup(*args, **kwargs):
-    raise OSError('rsi check 不解析主机名')
+    raise OSError('rsi check does not resolve host names')
 
 
 def _kill_group(process: subprocess.Popen) -> None:
@@ -388,7 +387,8 @@ def _make_scratch(layout: Layout) -> Path:
         if found is None:
             os.mkdir('staging', 0o755, dir_fd=root_fd)
         elif found != 'folder':
-            raise Refused(f'{layout.staging} 不是文件夹（可能是符号链接），rsi check 不在里面工作')
+            raise Refused(f'{layout.staging} is not a folder (it may be a symbolic link), so rsi check does not '
+                          'work in it')
         staging_fd = open_folder('staging', root_fd)
         try:
             name = f'check-{_stamp()}'
@@ -413,7 +413,8 @@ def _remove_scratch(layout: Layout, scratch: Path) -> str | None:
         finally:
             os.close(root_fd)
     except OSError as error:
-        return f'临时检查目录 {scratch} 没能删掉（{error.strerror or error}）；rsi recover 会把它移到 sealed/'
+        return (f'The scratch folder of the check {scratch} could not be removed ({error.strerror or error}); '
+                'rsi recover will move it to sealed/')
     return None
 
 
@@ -670,22 +671,24 @@ def _sandbox(context: _Context, config: dict, profile: str, home: Path, cwd: Pat
             found[item['name']] = (item['observed'], item['detail'])
         except (ValueError, KeyError, TypeError):
             continue
-    why = (f'{PROBE_SECONDS} 秒内没有结束' if code is None else f'退出码 {code}') + f'：{_tail(err)}'
+    ended = f'it did not end within {PROBE_SECONDS} seconds' if code is None else f'exit code {code}'
+    why = f'{ended}: {_tail(err)}'
     return found, why
 
 
 def _judge(case: _Case, found: dict, why: str, accepted: dict) -> tuple[str, str]:
     """A case's observed result and detail: the probe's word, overridden by what is on disk or what a listener
     accepted when that shows that something went through."""
-    observed, detail = found.get(case.name, (UNKNOWN, f'探测没有给出结果（{why}）'))
+    observed, detail = found.get(case.name, (UNKNOWN, f'the probe gave no result ({why})'))
     if observed not in (ALLOWED, BLOCKED, UNKNOWN):
-        observed, detail = UNKNOWN, f'探测给出了看不懂的结果 {show(observed)}'
-    evidence = [f'{path} 出现了' for path in case.written if os.path.lexists(path)]
-    evidence += [f'{path} 不再是原来的文件夹' for path in case.kept if not (path.is_dir() and not path.is_symlink())]
+        observed, detail = UNKNOWN, f'the probe gave a result that cannot be understood: {show(observed)}'
+    evidence = [f'{path} appeared' for path in case.written if os.path.lexists(path)]
+    evidence += [f'{path} is no longer the folder it was' for path in case.kept
+                 if not (path.is_dir() and not path.is_symlink())]
     if case.listener is not None and accepted.get(case.listener):
-        evidence.append(f'本机监听端收到了 {accepted[case.listener]} 个连接')
+        evidence.append(f'the local listener accepted {accepted[case.listener]} connections')
     if evidence:
-        return ALLOWED, f'{detail}；{"；".join(evidence)}'
+        return ALLOWED, f'{detail}; {"; ".join(evidence)}'
     return observed, detail
 
 
@@ -719,7 +722,8 @@ def _command_layer(context: _Context, scratch: Path, profile: str) -> list[dict]
             if case.name in OUTSIDE:                    # the check removes nothing outside its own folders
                 left = [str(path) for path in case.written if os.path.lexists(path)]
                 if left:
-                    context.notes.append(f'{profile} 的 {case.name} 在临时文件夹里留下了文件，请手动删除：{"、".join(left)}')
+                    context.notes.append(f'{case.name} of {profile} left files in a temporary folder; remove them by '
+                                         f'hand: {", ".join(left)}')
         results.append(_dot_codex_link(context, layout, profile, config, home, workspace))
         if profile == 'lab':
             created = next(result for result in results if result['name'] == 'create_dot_agents')
@@ -727,8 +731,8 @@ def _command_layer(context: _Context, scratch: Path, profile: str) -> list[dict]
             context.info.append(_existing_agents(context, layout, config, home, workspace))
     except Exception as error:
         done = {result['name'] for result in results}
-        results += [_result(name, profile, COMMANDS[name][family], UNKNOWN, f'检查没能做完：{type(error).__name__}: '
-                            f'{error}') for name in names if name not in done]
+        results += [_result(name, profile, COMMANDS[name][family], UNKNOWN, f'the check could not be completed: '
+                            f'{type(error).__name__}: {error}') for name in names if name not in done]
     return results
 
 
@@ -743,7 +747,7 @@ def _dot_codex_link(context: _Context, layout: Layout, profile: str, config: dic
             os.symlink(layout.owner, folder / '.codex')
         except OSError as error:
             return _result('dot_codex_link', profile, expected, UNKNOWN,
-                           f'没能在 {folder} 里放 .codex 链接（{error.strerror or error}）')
+                           f'could not put a .codex link in {folder} ({error.strerror or error})')
     target = 'limits.toml'
     case = _Case('dot_codex_link', [['read', str(folder / '.codex' / target)] for folder in folders]
                  + [['read', str(layout.owner / target)]])
@@ -783,13 +787,13 @@ def _edit_script(edits: list[tuple[str, str]], commands: list[tuple[str, str]] =
     tools.exec_command (no login shell), one output line each, then DONE."""
     lines, shown = [], 'String({}).slice(0, 300).replace(/\\s+/g, " ")'
     for name, patch in edits:
-        applied, refused = json.dumps(name + ' 已应用\n'), json.dumps(name + ' 被拒绝：')
+        applied, refused = json.dumps(name + ' applied\n'), json.dumps(name + ' refused: ')
         lines.append(f'try {{ await tools.apply_patch({json.dumps(patch)}); text({applied}); }} catch (error) '
                      f'{{ text({refused} + {shown.format("error")} + "\\n"); }}')
     for name, command in commands:
-        ran, refused = json.dumps(name + ' 退出码 '), json.dumps(name + ' 被拒绝：')
+        ran, refused = json.dumps(name + ' exit code '), json.dumps(name + ' refused: ')
         lines.append(f'try {{ const r = await tools.exec_command({json.dumps({"cmd": command, "login": False})}); '
-                     f'text({ran} + r.exit_code + "：" + {shown.format("r.output")} + "\\n"); }} catch (error) '
+                     f'text({ran} + r.exit_code + ": " + {shown.format("r.output")} + "\\n"); }} catch (error) '
                      f'{{ text({refused} + {shown.format("error")} + "\\n"); }}')
     lines.append(f'text({json.dumps(DONE)} + "\\n");')
     return '\n'.join(lines) + '\n'
@@ -829,7 +833,7 @@ def _edit_layer(context: _Context, scratch: Path, which: str) -> list[dict]:
     try:
         return _edit_run(context, scratch, which, model, model.start())
     except Exception as error:
-        detail = f'检查没能做完：{type(error).__name__}: {error}'
+        detail = f'the check could not be completed: {type(error).__name__}: {error}'
         return [_result(name, which, expected, UNKNOWN, detail) for name, expected in names]
     finally:
         model.stop()
@@ -847,11 +851,12 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
         path.write_text(PLANTED, encoding='utf-8')
     agents, skills = f'rsi-check-agents-{secrets.token_hex(6)}', f'rsi-check-skill-{secrets.token_hex(6)}'
     for name in ('AGENTS.md', 'AGENTS.override.md'):
-        (workspace / name).write_text(f'检查用的说明 {agents}\n', encoding='utf-8')
+        (workspace / name).write_text(f'Instructions for the check {agents}\n', encoding='utf-8')
     if meta:            # info: would Codex load a skill someone else put in meta/? (edit_dot_agents uses candidate/)
         skill = workspace / '.agents' / 'skills' / 'x' / 'SKILL.md'
         skill.parent.mkdir(parents=True)
-        skill.write_text(f'---\nname: {skills}\ndescription: 检查用的技能 {skills}\n---\n\n检查用。\n', encoding='utf-8')
+        skill.write_text(f'---\nname: {skills}\ndescription: a skill for the check {skills}\n---\n\nFor the check.\n',
+                         encoding='utf-8')
     fresh = layout.candidate if meta else workspace                 # a writable root without .agents
     add = '*** Add File: {}\n+rsi-check\n'
     update = '*** Update File: {}\n@@\n-rsi-check\n+changed\n'
@@ -891,41 +896,46 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
         config.pop(table, None)
     features = context.envelope.get('features', {})
     context.info.append(_info('edit_layer_without_apps_and_plugins', which, ALLOWED,
-                              f'这一层的 codex exec 关掉了 apps 和 plugins，也没有带 apps、plugins 表（主人的信封里 '
-                              f'features.apps = {json.dumps(features.get("apps"))}，features.plugins = '
-                              f'{json.dumps(features.get("plugins"))}）；命令层和权限表仍按信封'))
+                              f'The codex exec of this layer runs with apps and plugins off and without the apps '
+                              f"and plugins tables (the owner's envelope has features.apps = "
+                              f'{json.dumps(features.get("apps"))}, features.plugins = '
+                              f'{json.dumps(features.get("plugins"))}); the command layer and the permission tables '
+                              'follow the envelope'))
     (home / 'rules').mkdir(parents=True, exist_ok=True)              # the saved command rules of SHELLS
     (home / 'rules' / 'default.rules').write_text(RULES, encoding='utf-8')
     first = len(model.requests)
     model.push(run_js(_edit_script([(name, _patch(body)) for name, body, _ in edits],
                                    [(name, command) for name, command, _ in commands])), say('rsi check'))
     with _scripted(url):
-        result = run_codex(home=home, cwd=workspace, prompt='rsi check：按脚本逐项尝试修改文件。', config=config,
+        result = run_codex(home=home, cwd=workspace, prompt='rsi check: try each change of the script, one by one.',
+                           config=config,
                            record_dir=layout.root / 'call', timeout=EXEC_SECONDS, root=context.root)
     requests = model.requests[first:]
     outputs = '\n'.join(model.tool_outputs()) if len(requests) > 1 else ''
     complete = result.status == 'finished' and DONE in outputs
     stderr = (layout.root / 'call' / 'stderr.txt').read_text(encoding='utf-8', errors='replace')
-    why = f'Codex 运行{"" if complete else "没有跑完脚本"}（状态 {result.status}，退出码 {result.exit_code}）'
+    why = (f'Codex {"ran the script" if complete else "did not finish the script"} (status {result.status}, '
+           f'exit code {result.exit_code})')
     results = []
     for table, cases in ((EDITS, edits), (SHELLS, commands)):
         for name, _, changed in cases:
-            said = next((line for line in outputs.splitlines() if line.startswith(name + ' ')), '没有输出')
+            said = next((line for line in outputs.splitlines() if line.startswith(name + ' ')), 'no output')
             observed = ALLOWED if changed() else BLOCKED if complete else UNKNOWN
-            detail = said if complete else f'{said}；{why}：{_tail(stderr)}'
+            detail = said if complete else f'{said}; {why}: {_tail(stderr)}'
             results.append(_result(name, which, table[name][column], observed, detail))
     body = json.dumps(requests, ensure_ascii=False)
 
     def reached(marker: str) -> tuple[str, str]:
         observed = ALLOWED if marker in body else BLOCKED if requests else UNKNOWN
-        return observed, f'模型收到的请求里{"有" if marker in body else "没有"} {marker}（共 {len(requests)} 次请求）'
+        held = 'hold' if marker in body else 'do not hold'
+        return observed, f'the requests the model received {held} {marker} ({len(requests)} requests in all)'
     for name, (profile, expected) in LOADING.items():
         if profile == which:
             results.append(_result(name, which, expected, *reached(agents)))
     if meta:
         observed, detail = reached(skills)
         context.info.append(_info('meta_planted_skill_loaded', which, observed,
-                                  f'一个别人放进 meta/.agents/skills/ 的技能：{detail}'))
+                                  f'A skill someone else put in meta/.agents/skills/: {detail}'))
     return results
 
 
@@ -938,7 +948,7 @@ def _tool_layer(context: _Context, scratch: Path) -> list[dict]:
     try:
         return _tool_run(context, scratch)
     except Exception as error:
-        detail = f'检查没能做完：{type(error).__name__}: {error}'
+        detail = f'the check could not be completed: {type(error).__name__}: {error}'
         return [_result(name, profile, expected, UNKNOWN, detail) for profile in TOOL_PROFILES
                 for name, expected in TOOLS.items()]
 
@@ -959,7 +969,7 @@ def _tool_run(context: _Context, scratch: Path) -> list[dict]:
     (layout.work / 'codex' / 'settings.toml').write_text(text, encoding='utf-8')
     settings = load_settings(layout.work)
     if settings.problems:
-        raise ValueError('；'.join(settings.problems))
+        raise ValueError('; '.join(settings.problems))
     write_role_files(layout, settings, trial=False)                 # as before a run: the wrapper's empty home
     config = lab_config(layout, context.envelope, settings, trial=False, resolve=_no_lookup, codex=context.codex)
     results = []
@@ -969,8 +979,9 @@ def _tool_run(context: _Context, scratch: Path) -> list[dict]:
                             env={'HOME': str(Path.home()), **server['env']})
         ran = (folder / f'done-{profile}.txt').is_file()
         wrote = os.path.lexists(layout.records / f'rsi-check-tool-{profile}.txt')
-        detail = (f'{"超时" if code is None else f"退出码 {code}"}；工作区{"写进了" if ran else "没写进"}；'
-                  f'records/{"写进了" if wrote else "没写进"}：{_tail(err)}')
+        detail = (f'{"timed out" if code is None else f"exit code {code}"}; the workspace '
+                  f'{"was written" if ran else "was not written"}; records/ '
+                  f'{"was written" if wrote else "was not written"}: {_tail(err)}')
         results.append(_result('tool_server_workspace', profile, TOOLS['tool_server_workspace'],
                                ALLOWED if ran else BLOCKED, detail))
         results.append(_result('tool_server_wrapper', profile, TOOLS['tool_server_wrapper'],
@@ -981,12 +992,13 @@ def _tool_run(context: _Context, scratch: Path) -> list[dict]:
 # The static checks on the real root.
 
 def _static_problems(layout: Layout, envelope: dict | None) -> list[str]:
-    """What is wrong with the real root itself, one Chinese line each; reads nothing an agent can write."""
+    """What is wrong with the real root itself, one English line each; reads nothing an agent can write."""
     from rsi.init import UNSAFE_IN_ROOT, loaded_at_root     # rsi.init imports rsi.labrun, which imports this module
     problems = []
     bad = sorted({char for char in str(layout.root) if char in UNSAFE_IN_ROOT})
     if bad:
-        problems.append(f'RSI 文件夹的路径 {str(layout.root)!r} 里有 {"".join(bad)!r}，Codex 的沙箱处理不了这样的路径')
+        problems.append(f'The path of the RSI folder {str(layout.root)!r} holds {"".join(bad)!r}; the Codex sandbox '
+                        'cannot handle such a path')
     problems += loaded_at_root(layout)
     path = layout.lab_home / 'config.toml'
     try:
@@ -995,17 +1007,18 @@ def _static_problems(layout: Layout, envelope: dict | None) -> list[str]:
         fd = None
     except OSError as error:
         fd = None
-        problems.append(f'{path} 打不开（{error.strerror or error}；可能是符号链接）')
+        problems.append(f'{path} cannot be opened ({error.strerror or error}; it may be a symbolic link)')
     if fd is not None:
         try:
             with os.fdopen(fd, 'rb') as stream:
                 if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                    raise ValueError('不是普通文件')
+                    raise ValueError('not a regular file')
                 table = tomllib.loads(stream.read().decode('utf-8'))
             if 'projects' in table:
-                problems.append(f'{path} 里有 projects 表：受信任的项目会让那个文件夹里的 .codex/config.toml 覆盖配置')
+                problems.append(f'{path} has a projects table: a trusted project lets the .codex/config.toml in '
+                                'that folder override the configuration')
         except (OSError, ValueError, RecursionError) as error:
-            problems.append(f'{path} 读不了或不是合法的 TOML（{" ".join(str(error).split())}）')
+            problems.append(f'{path} cannot be read or is not valid TOML ({" ".join(str(error).split())})')
     if envelope is not None:
         try:
             profiles(layout, envelope)
@@ -1025,13 +1038,13 @@ def _cases(layout: Layout, envelope: dict, problems: list[str], notes: list[str]
     try:
         scratch = _make_scratch(layout)
     except (Refused, OSError) as error:
-        problems.append(f'没能建临时检查目录：{error}')
+        problems.append(f'Could not make the scratch folder of the check: {error}')
         return []
     sockets = None
     try:
         python = shutil.which('python3', path=SYSTEM_PATH)
         if python is None:
-            problems.append(f'在 {SYSTEM_PATH} 里找不到 python3，命令层的检查没法运行')
+            problems.append(f'There is no python3 in {SYSTEM_PATH}, so the command layer of the check cannot run')
             return []
         sockets = _Sockets()
         context = _Context(layout.root, codex, python, envelope, f'RSI-CHECK-TOKEN-{secrets.token_hex(8)}', sockets,
@@ -1048,7 +1061,8 @@ def _cases(layout: Layout, envelope: dict, problems: list[str], notes: list[str]
             try:
                 sockets.remove()
             except OSError as error:
-                notes.append(f'放本机套接字的临时文件夹 {sockets.folder} 没能删掉（{error.strerror or error}）')
+                notes.append(f'The temporary folder of the local sockets {sockets.folder} could not be removed '
+                             f'({error.strerror or error})')
         why = _remove_scratch(layout, scratch)
         if why is not None:
             notes.append(why)
@@ -1105,9 +1119,9 @@ def program_fingerprints() -> dict[str, str]:
         if stat.S_ISREG(mode) and path.name.endswith(suffixes):
             out[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
         elif stat.S_ISDIR(mode):
-            out[path.name] = '文件夹'
+            out[path.name] = 'folder'
         elif stat.S_ISLNK(mode):
-            out[path.name] = '符号链接'
+            out[path.name] = 'link'
     return out
 
 
@@ -1116,7 +1130,7 @@ def run_check(layout: Layout) -> dict:
     {'codex_version', 'owner_files' (owner_fingerprints when the check started), 'program' (program_fingerprints),
     'passed', 'at',
     'results': [{'name', 'profile', 'expected', 'observed', 'ok', 'detail'}],
-    'problems': [Chinese lines: what keeps the check from passing besides a case], 'notes': [Chinese lines],
+    'problems': [English lines: what keeps the check from passing besides a case], 'notes': [English lines],
     'info': [{'name', 'profile', 'value', 'detail'}: observations that pass or fail nothing]}.
     expected is `allowed` or `blocked`; observed also `unknown` (no clear result, e.g. a probe that ran out of time).
     passed: there are results, every one is ok, and there is no problem. Makes no model call."""
@@ -1125,12 +1139,12 @@ def run_check(layout: Layout) -> dict:
         program = program_fingerprints()
     except OSError as error:
         program = {}
-        problems.append(f'控制程序的代码读不了（{error.strerror or error}）')
+        problems.append(f'The code of the control program cannot be read ({error.strerror or error})')
     try:
         version = codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         version = None
-        problems.append(f'Codex 报不出版本：{error}')
+        problems.append(f'Codex reports no version: {error}')
     try:
         envelope = load_envelope(layout.owner)
     except Refused as error:
@@ -1147,18 +1161,19 @@ def run_check(layout: Layout) -> dict:
 
 
 def _load(layout: Layout) -> tuple[dict | None, str | None]:
-    """records/check.json (never followed if it is a link) as a dict, or None and why not (Chinese)."""
+    """records/check.json (never followed if it is a link) as a dict, or None and why not (English)."""
     path = layout.records / CHECK_FILE
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, 'rb') as stream:
             data = json.loads(stream.read().decode('utf-8'))
     except FileNotFoundError:
-        return None, '还没有做过隔离检查，agent 不能启动：请先运行 rsi check（每次 Codex 换了版本都要重新运行）'
+        return None, ('No isolation check has been run yet, so no agent can start. Run rsi check first (and again '
+                      'whenever Codex changes version).')
     except (OSError, ValueError, RecursionError):
-        return None, f'{path} 读不出来（或是符号链接），agent 不能启动：请重新运行 rsi check'
+        return None, f'{path} cannot be read (or it is a symbolic link), so no agent can start. Run rsi check again.'
     if not isinstance(data, dict):
-        return None, f'{path} 不是一份检查记录，agent 不能启动：请重新运行 rsi check'
+        return None, f'{path} is not a check record, so no agent can start. Run rsi check again.'
     return data, None
 
 
@@ -1172,31 +1187,33 @@ def _changed(then, now: dict) -> list[str]:
 def gate(layout: Layout) -> str | None:
     """None when records/check.json says a check passed for the Codex version installed now, for the owner files as
     they are now (owner_fingerprints) and for the control program's code as it is now (program_fingerprints);
-    otherwise why no agent may start (Chinese, naming `rsi check`). The file is never followed if it is a link."""
+    otherwise why no agent may start (English, naming `rsi check`). The file is never followed if it is a link."""
     data, reason = _load(layout)
     if data is None:
         return reason
     if data.get('passed') is not True:
-        return '上一次 rsi check 没有通过，agent 不能启动：请按它列出的项目修好，再运行 rsi check'
+        return 'The last rsi check did not pass, so no agent can start. Fix what it listed, then run rsi check again.'
     changed = _changed(data.get('owner_files'), owner_fingerprints(layout))
     if changed:
-        return (f'{"、".join("owner/" + name for name in changed)} 在上一次 rsi check 之后改过（或那次检查没有记下它），'
-                'agent 不能启动：请重新运行 rsi check')
+        return (f'{", ".join("owner/" + name for name in changed)} changed after the last rsi check (or that check '
+                'did not record it), so no agent can start. Run rsi check again.')
     try:
         changed = _changed(data.get('program'), program_fingerprints())
     except OSError as error:
-        return f'控制程序的代码读不了（{error.strerror or error}），不能确认 rsi check 的结果对它有效'
+        return (f'The code of the control program cannot be read ({error.strerror or error}), so it cannot be '
+                'confirmed that the result of rsi check holds for it')
     if changed:
-        names = '、'.join(changed[:5]) + (f' 等 {len(changed)} 个文件' if len(changed) > 5 else '')
-        return (f'控制程序的代码（{PROGRAM.name}/ 里的 {names}）在上一次 rsi check 之后改过、新增或删除了，'
-                'agent 不能启动：请重新运行 rsi check')
+        names = ', '.join(changed[:5]) + (f' and others, {len(changed)} files in all' if len(changed) > 5 else '')
+        return (f'The code of the control program ({names} in {PROGRAM.name}/) was changed, added or removed after '
+                'the last rsi check, so no agent can start. Run rsi check again.')
     try:
         installed = codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        return f'Codex 程序用不了（{error}），不能确认 rsi check 的结果对它有效'
+        return (f'The Codex program cannot be used ({error}), so it cannot be confirmed that the result of rsi '
+                'check holds for it')
     if data.get('codex_version') != installed:
-        return (f'上一次通过的 rsi check 是在 Codex {show(data.get("codex_version"))} 上做的，现在装的是 {show(installed)}：'
-                '请重新运行 rsi check')
+        return (f'The last rsi check that passed was made on Codex {show(data.get("codex_version"))}, and '
+                f'{show(installed)} is installed now. Run rsi check again.')
     return None
 
 

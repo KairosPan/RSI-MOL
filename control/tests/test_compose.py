@@ -478,7 +478,7 @@ class ComposeTests(unittest.TestCase):
             layouts.append(Layout(root))
             with self.assertRaises(Refused, msg=linked) as refusal:
                 write_role_files(Layout(root), self.settings(), trial=False)
-            self.assertIn('符号链接', str(refusal.exception))
+            self.assertIn('symbolic link', str(refusal.exception))
             self.assertEqual(sorted(p.name for p in target.iterdir()), ['keep.txt'], linked)
 
     def test_meta_settings_are_checked(self):

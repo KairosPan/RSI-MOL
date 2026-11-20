@@ -142,7 +142,7 @@ class Init(unittest.TestCase):
         report = init(layout, SEED)
         self.assertEqual((layout.lab_home / 'config.toml.before-rsi').read_text(), 'model = [unclosed\n')
         self.assertEqual((report['envelope'], report['original']), ('default', None))
-        self.assertTrue(any('before-rsi 不是合法的 TOML' in line for line in report['problems']), report['problems'])
+        self.assertTrue(any('before-rsi is not valid TOML' in line for line in report['problems']), report['problems'])
         self.assertTrue(tomllib.loads((layout.lab_home / 'config.toml').read_text())['permissions'])
         init(layout, SEED)
         self.assertEqual((layout.lab_home / 'config.toml.before-rsi').read_text(), 'model = [unclosed\n')
@@ -160,7 +160,8 @@ class Init(unittest.TestCase):
         (lone.lab_home / 'config.toml.before-rsi').write_bytes(b'')
         report = init(lone, SEED)
         self.assertEqual(report['envelope'], 'default')
-        self.assertTrue(any('config.toml.before-rsi 是空的' in line for line in report['problems']), report['problems'])
+        self.assertTrue(any('config.toml.before-rsi is empty' in line for line in report['problems']),
+                        report['problems'])
 
     def test_a_deleted_envelope_is_imported_again_from_the_kept_original_never_from_the_generated_file(self):
         layout = bare(self); layout.lab_home.mkdir()
@@ -181,8 +182,8 @@ class Init(unittest.TestCase):
         (layout.lab_home / 'config.toml').write_text(CONFIG)
         with mock.patch.dict(os.environ, {'RSI_ROOT': str(layout.root)}):
             code, out, _ = run('init')
-        line = next(line for line in out.splitlines() if '没有带进' in line)
-        self.assertEqual(code, 0); self.assertIn('projects、tui', line)
+        line = next(line for line in out.splitlines() if 'were not carried into' in line)
+        self.assertEqual(code, 0); self.assertIn('config.toml: projects, tui (', line)
         self.assertNotIn('trusted', out); self.assertNotIn('/somewhere', out)
 
     def test_a_refused_seal_of_work_leaves_nothing_half_done(self):
@@ -401,15 +402,15 @@ class Commands(unittest.TestCase):
             root.add_task('T1')
             with locked(root.layout):
                 code, _, err = run('task', 'T1')
-                self.assertEqual((code, '另一个 rsi 正在运行' in err), (3, True))
+                self.assertEqual((code, 'Another rsi is running' in err), (3, True))
                 self.assertEqual(run('status')[0], 0)
             self.assertEqual(root.records.calls(), [])
 
     def test_status(self):
         with Root() as root:
             root.records.write_json('applications/A0001.json', {'id': 'A0001', 'status': 'pending', 'round': 'M0001',
-                                                                 'call': 'R0001', 'what': '开放连接器', 'why': 'w',
-                                                                 'records': []})
+                                                                 'call': 'R0001', 'what': 'open a connector',
+                                                                 'why': 'w', 'records': []})
             root.records.write_json('applications/A0002.json', {'id': 'A0002', 'status': 'granted', 'what': 'x'})
             code, out, _ = run('status', '--json')
             status = json.loads(out)
@@ -419,9 +420,10 @@ class Commands(unittest.TestCase):
             self.assertEqual((status['check'] or {}).get('passed'), True if HAS_CODEX else None)   # Root's check.json
             self.assertEqual(status['usage']['online']['calls'], 0)
             code, out, _ = run('status')
-            self.assertEqual(code, 0); self.assertIn('当前版本：V0001', out); self.assertIn('A0001', out)
+            self.assertEqual(code, 0); self.assertIn('Current version: V0001', out)
+            self.assertIn('Pending applications: A0001 open a connector', out)
             code, out, _ = run('meta')                                  # no Lab task call yet: no round
-            self.assertEqual((code, '没有新的任务运行' in out), (0, True))
+            self.assertEqual((code, 'There are no new task runs; Meta was not started.' in out), (0, True))
             self.assertFalse((root.layout.records / 'rounds').exists())
 
     def test_only_a_request_that_fails_its_checks_is_refused(self):
@@ -430,10 +432,11 @@ class Commands(unittest.TestCase):
             for args in (('task', 'no-such-task'), ('task', '..'), ('rollback', '../x'), ('rollback', 'V0009'),
                          ('rollback', 'V0001')):                     # V0001 is already the current content
                 self.assertEqual(run(*args)[0], 3, args)
-            for error in (ValueError('内部出错'), UnicodeEncodeError('ascii', '中', 0, 1, 'x')):
+            # The error text of a UnicodeEncodeError holds the character it could not encode: a Chinese one here.
+            for error in (ValueError('an internal error'), UnicodeEncodeError('ascii', '中', 0, 1, 'x')):
                 with mock.patch.object(cli, 'run_task', side_effect=error):
                     code, out, err = run('task', 'T1')
-                self.assertEqual((code, '出错了' in err, 'Traceback' in err + out), (1, True, False), error)
+                self.assertEqual((code, err.startswith('Error: '), 'Traceback' in err + out), (1, True, False), error)
             self.assertEqual(root.records.calls(), [])
 
     def test_text_status_survives_odd_and_unreadable_records(self):
@@ -445,7 +448,7 @@ class Commands(unittest.TestCase):
             (folder / 'call.json').write_text('{not json\x1b[2J')
             code, out, _ = run('status')
             self.assertEqual(code, 0); self.assertNotIn('None None', out); self.assertNotIn('\x1b', out)
-            self.assertIn('R0002：记录读不出来（', out); self.assertIn("['finished']", out)
+            self.assertIn('R0002: the record cannot be read (', out); self.assertIn("['finished']", out)
             self.assertEqual(run('status', '--json')[0], 0)
             lines = cli._round_lines(root.layout, {'id': 'M0001', 'outcome': ['x'], 'trials': 5, 'calls': [1]})
             self.assertIn("['x']", lines[0])
@@ -499,7 +502,7 @@ class Commands(unittest.TestCase):
             root.model.push(say('lab done'))
             code, out, err = run('task', 'T1')
             self.assertEqual((code, err), (0, ''))
-            self.assertIn('R0001（Lab 任务 T1）：完成', out)
+            self.assertIn('R0001 (Lab task T1): finished\n', out)
             line = next(line for line in out.splitlines() if 'Meta' in line)
             self.assertIn('day.calls', line)
             self.assertEqual(len(root.records.calls()), 1); self.assertFalse((root.layout.records / 'rounds').exists())
@@ -513,10 +516,23 @@ class Commands(unittest.TestCase):
                 self.assertEqual(run('task', 'T1', '--no-meta')[0], 0)
             self.assertEqual(run('meta')[0], 0)
             code, out, _ = run('meta')
-            self.assertEqual((code, '没有新的任务运行' in out), (0, True))
+            self.assertEqual((code, 'There are no new task runs' in out), (0, True))
             self.assertEqual(os.listdir(root.layout.records / 'rounds'), ['M0001'])
             round_record = json.loads((root.layout.records / 'rounds' / 'M0001' / 'round.json').read_text())
             self.assertEqual(round_record['trigger'], ['R0001', 'R0002'])
+
+
+class CheckWords(unittest.TestCase):
+    def test_a_message_that_only_repeats_the_verdict_is_not_shown_again(self):
+        """Input data in Chinese: the messages the check scripts printed before the program spoke English, which the
+        records of an older root still hold."""
+        for message in ('passed', '通过'):
+            self.assertEqual(cli._check_words({'passed': True, 'message': message}), 'check passed')
+        for message in ('not passed', '没通过'):
+            self.assertEqual(cli._check_words({'passed': False, 'message': message}), 'check not passed')
+        self.assertEqual(cli._check_words({'passed': False, 'message': 'answer.json is missing'}),
+                         'check not passed: answer.json is missing')
+        self.assertEqual(cli._check_words(None), '')
 
 
 if __name__ == '__main__':

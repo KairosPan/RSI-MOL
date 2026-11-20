@@ -23,9 +23,9 @@ NATIVE_TARGETS = {('Darwin', 'arm64'): ('codex-darwin-arm64', 'aarch64-apple-dar
                   ('Linux', 'x86_64'): ('codex-linux-x64', 'x86_64-unknown-linux-musl'),
                   ('Linux', 'aarch64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl'),
                   ('Linux', 'arm64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl')}
-HOW_TO_SET_CODEX = ('请把 $RSI_CODEX 设成 Codex 原生程序的绝对路径（npm 安装的在 '
-                    '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），'
-                    '它不能在 RSI 文件夹或 /tmp 这类公用临时文件夹里')
+HOW_TO_SET_CODEX = ('Set $RSI_CODEX to the absolute path of the native Codex program (an npm install has it at '
+                    '.../@openai/codex/node_modules/@openai/codex-<platform>/vendor/<target>/bin/codex); it must not '
+                    'be inside the RSI folder or in a shared temporary folder such as /tmp.')
 GIT_PROGRAMS = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')     # tried in this order
 
 
@@ -113,7 +113,7 @@ def native_codex(root: Path) -> str:
     """
     program = os.environ.get('RSI_CODEX')
     if program is not None and not os.path.isabs(program):
-        raise Refused(f'$RSI_CODEX 必须是绝对路径，现在是 {program!r}。{HOW_TO_SET_CODEX}')
+        raise Refused(f'$RSI_CODEX must be an absolute path, but it is {program!r}. {HOW_TO_SET_CODEX}')
     found = program if program is not None else shutil.which('codex', path=clean_path(root))
     reachable = _reachable(root)
 
@@ -121,14 +121,15 @@ def native_codex(root: Path) -> str:
         return not any(inside(path, folder) for folder in reachable)
 
     if not found or not os.path.isfile(found) or not outside(found):
-        raise Refused(f'找不到可用的 Codex 程序（{program or "codex"!r}）。{HOW_TO_SET_CODEX}')
+        raise Refused(f'No usable Codex program was found ({program or "codex"!r}). {HOW_TO_SET_CODEX}')
     real = os.path.realpath(found)
     candidates = _shim_targets(real) if _script(real) else [real]
     for candidate in candidates:
         if (os.path.isabs(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK)
                 and outside(candidate) and not _script(candidate)):
             return os.path.realpath(candidate)
-    raise Refused(f'{found} 不是 Codex 的原生程序，也找不到它对应的原生程序。{HOW_TO_SET_CODEX}')
+    raise Refused(f'{found} is not the native Codex program, and no native program was found for it. '
+                  f'{HOW_TO_SET_CODEX}')
 
 
 @functools.cache
@@ -138,4 +139,4 @@ def git_program() -> str:
     for program in GIT_PROGRAMS:
         if os.path.isfile(program) and os.access(program, os.X_OK):
             return program
-    raise RuntimeError(f'找不到 git（试过 {"、".join(GIT_PROGRAMS)}）')
+    raise RuntimeError(f'git was not found (tried {", ".join(GIT_PROGRAMS)})')

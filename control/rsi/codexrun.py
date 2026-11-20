@@ -70,7 +70,7 @@ def _with_local_hosts(value: str | None) -> str:
 
 
 def codex_version(root: Path | None = None) -> str:
-    """The version Codex reports, e.g. '0.170.0'; RuntimeError (in Chinese) when it reports none or there is no
+    """The version Codex reports, e.g. '0.170.0'; RuntimeError (in English) when it reports none or there is no
     usable Codex program (codex_program).
 
     Codex writes helper files into its home even for --version, so this runs with a throwaway home, in its own
@@ -89,13 +89,14 @@ def codex_version(root: Path | None = None) -> str:
         except subprocess.TimeoutExpired:
             _kill_group(process)
             process.wait()
-            raise RuntimeError(f'`{program} --version` 60 秒内没有结束') from None
+            raise RuntimeError(f'`{program} --version` did not end within 60 seconds') from None
         finally:
             _kill_group(process)
     words = out.split()
     if process.returncode != 0 or not words:
         detail = ' '.join(err.split())[:300]
-        raise RuntimeError(f'`{program} --version` 没有报出版本号（退出码 {process.returncode}）：{detail}')
+        raise RuntimeError(f'`{program} --version` reported no version number (exit code {process.returncode}): '
+                           f'{detail}')
     return words[-1]
 
 

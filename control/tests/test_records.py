@@ -117,7 +117,8 @@ class RecordsTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.records.finish_call('R0003', {'status': 'interrupted'})
         now = datetime.now().astimezone()
         self.assertIsNone(refusal(Limits(day_calls=5), calls, now))       # only the four unreadable count today
-        self.assertIn('其中 4 份调用记录读不出来', refusal(Limits(day_calls=4), calls, now))
+        self.assertIn("Unreadable call records among them, counted as today's: 4.",
+                      refusal(Limits(day_calls=4), calls, now))
         summary = usage_by_class(calls)
         self.assertEqual(summary['unknown'], {'calls': 4, 'input_tokens': 0, 'output_tokens': 0,
                                               'unknown_usage_calls': 4})
@@ -136,15 +137,17 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual(sorted(path.name for path in applications.iterdir()), ['A0001.json', 'A0004'])
 
     def test_write_json_and_notes_are_indexed(self):
+        # A key and a value in Chinese: records are written as UTF-8 text, never as escapes.
         path = self.records.write_json('rounds/M0001/decision-1.json', {'decision': 'no_change', '诊断': '无'})
         self.assertEqual(path, self.records.root / 'rounds' / 'M0001' / 'decision-1.json')
         self.assertEqual(json.loads(path.read_text(encoding='utf-8')), {'decision': 'no_change', '诊断': '无'})
-        self.records.note('refusal', {'reason': '今天的调用次数到了上限'})
+        self.assertIn('"诊断": "无"', path.read_text(encoding='utf-8'))
+        self.records.note('refusal', {'reason': 'The calls of today reached the limit'})
         lines = self.index()
         self.assertEqual([line['kind'] for line in lines], ['file', 'refusal'])
         self.assertEqual((lines[0]['path'], lines[0]['sha256']), ('rounds/M0001/decision-1.json',
                                                                   sha(path.read_bytes())))
-        self.assertEqual(lines[1]['reason'], '今天的调用次数到了上限')
+        self.assertEqual(lines[1]['reason'], 'The calls of today reached the limit')
         self.assertIsNotNone(datetime.fromisoformat(lines[1]['at']).utcoffset())
         with self.assertRaises(ValueError): self.records.note('refusal', {'kind': 'call'})
         for bad in ('../x', 'call', 'file', ''):

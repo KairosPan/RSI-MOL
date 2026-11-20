@@ -95,7 +95,7 @@ class Launcher(unittest.TestCase):
         self.assertIn('planted bytecode', plain.stdout)                 # the forged file is loadable bytecode
         done = launch('--help', env={**os.environ, 'RSI_PYTHON': sys.executable}, launcher=tmp / 'rsi')
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertNotIn('planted bytecode', done.stdout); self.assertIn('用法：rsi', done.stdout)
+        self.assertNotIn('planted bytecode', done.stdout); self.assertIn('Usage: rsi', done.stdout)
         self.assertEqual(os.listdir(cache.parent), [cache.name])
 
     def test_nothing_the_launcher_or_the_program_starts_comes_from_the_path(self):
@@ -110,7 +110,7 @@ class Launcher(unittest.TestCase):
             for args in (['--help'], ['status']):
                 done = launch(*args, env=env)
                 self.assertEqual(done.returncode, 0, done.stderr)
-            self.assertIn('当前版本：V0001', done.stdout)
+            self.assertIn('Current version: V0001', done.stdout)
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else '')
 
     def test_the_python_must_be_absolute_outside_the_root_and_new_enough(self):

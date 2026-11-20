@@ -202,7 +202,7 @@ class Gate(unittest.TestCase):
             self.assertIsNone(gate(root.layout))
             envelope, settings = root.layout.owner / 'lab-envelope.toml', root.layout.owner / 'meta' / 'settings.toml'
             before = envelope.read_text()
-            envelope.write_text(before + '# 负责人改过\n')
+            envelope.write_text(before + '# changed by hand\n')
             reason = gate(root.layout)
             self.assertIn('owner/lab-envelope.toml', reason); self.assertIn('rsi check', reason)
             with self.assertRaises(Refused): run_task(root.layout, 'T1')
@@ -292,44 +292,47 @@ class Command(unittest.TestCase):
             with mock.patch.object(cli, 'run_check', return_value=self.report(self.RESULT)) as check:
                 code, out, _ = run('check')
             self.assertEqual((code, check.call_args.args[0].root), (0, root.layout.root))
-            self.assertIn('全部通过', out); self.assertIn('meta meta_planted_skill_loaded = 是', out)
-            hole = dict(self.RESULT, observed='allowed', ok=False, detail='读到了\x1b[2J')
-            gone = dict(self.RESULT, name='local_tcp', profile='lab_net', observed='unknown', ok=False, detail='超时')
+            self.assertIn('All passed (Codex 9.9.9, 1 cases)', out)
+            self.assertIn('Information (not a case): meta meta_planted_skill_loaded = yes (d)', out)
+            hole = dict(self.RESULT, observed='allowed', ok=False, detail='read it\x1b[2J')
+            gone = dict(self.RESULT, name='local_tcp', profile='lab_net', observed='unknown', ok=False,
+                        detail='timed out')
             with mock.patch.object(cli, 'run_check', return_value=self.report(self.RESULT, hole, gone,
-                                                                              problems=['根路径不合规'])):
+                                                                              problems=['the root path is bad'])):
                 code, out, _ = run('check')
-            self.assertEqual(code, 1); self.assertNotIn('全部通过', out); self.assertNotIn('\x1b', out)
+            self.assertEqual(code, 1); self.assertNotIn('All passed', out); self.assertNotIn('\x1b', out)
             failed = [line for line in out.splitlines() if 'read_records' in line or 'local_tcp' in line]
             self.assertEqual(len(failed), 2, out)
-            self.assertIn('lab read_records', failed[0]); self.assertIn('lab_net local_tcp', failed[1])
-            self.assertIn('根路径不合规', out)
+            self.assertEqual(failed, ['lab read_records: expected blocked, observed allowed (read it\\x1b[2J)',
+                                      'lab_net local_tcp: expected blocked, observed unknown (timed out)'])
+            self.assertIn('Problem: the root path is bad', out)
 
     def test_status_shows_the_gates_verdict_not_the_files_word(self):
         with Root(passed_check=False) as root:
             self.assertIsNone(json.loads(run('status', '--json')[1])['check'])
-            self.assertIn('隔离检查：还没有运行 rsi check', run('status')[1])
+            self.assertIn('Isolation check: rsi check has not been run yet', run('status')[1])
             # It says passed, but not for these owner files, this code or this Codex: the gate's reason is shown.
             (root.layout.records / CHECK_FILE).write_text(json.dumps(self.report(self.RESULT)))
             check = json.loads(run('status', '--json')[1])['check']
             self.assertEqual((check['codex_version'], check['passed']), ('9.9.9', False))
             self.assertIn('rsi check', check['reason'])
             out = run('status')[1]
-            self.assertIn('隔离检查：没通过：', out); self.assertNotIn('隔离检查：通过', out)
+            self.assertIn('Isolation check: not passed: ', out); self.assertNotIn('Isolation check: passed', out)
             (root.layout.records / CHECK_FILE).write_text('{not json')
-            self.assertIn('隔离检查：没通过：', run('status')[1])
+            self.assertIn('Isolation check: not passed: ', run('status')[1])
 
     @needs_codex
     def test_status_says_passed_only_when_the_gate_does_and_never_follows_a_link(self):
         with Root() as root:
             check = json.loads(run('status', '--json')[1])['check']
             self.assertEqual((check['passed'], check['reason'], check['codex_version']), (True, None, codex_version()))
-            self.assertIn(f'隔离检查：通过（Codex {codex_version()}', run('status')[1])
+            self.assertIn(f'Isolation check: passed (Codex {codex_version()}, ', run('status')[1])
             path = root.layout.records / CHECK_FILE
             elsewhere = root.path / 'elsewhere.json'; elsewhere.write_text(path.read_text())
             path.unlink(); path.symlink_to(elsewhere)
             check = json.loads(run('status', '--json')[1])['check']
             self.assertEqual((check['passed'], check['codex_version']), (False, None))
-            self.assertIn('隔离检查：没通过：', run('status')[1])
+            self.assertIn('Isolation check: not passed: ', run('status')[1])
 
 
 if __name__ == '__main__':

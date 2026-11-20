@@ -46,18 +46,18 @@ class LimitsTests(unittest.TestCase):
         limits = Limits(1800, 8, 4, 900, 2, 0)
         self.assertIsNone(refusal(limits, [self.call(), self.call(-1), self.call(-1)], self.NOW))
         message = refusal(limits, [self.call(), self.call(), self.call(), self.call(-1)], self.NOW)
-        self.assertIn('已经开始了 3 次调用', message)                    # the count, not a digit of the date
-        self.assertIn('每天 2 次的上限', message)
-        self.assertNotIn('读不出来', message)
+        self.assertRegex(message, r'^Calls started today \([0-9-]+\): 3\. ')     # the count, not a digit of the date
+        self.assertIn('the limit of 2 a day (day.calls in owner/limits.toml)', message)
+        self.assertNotIn('Unreadable', message)
         self.assertIsNotNone(refusal(Limits(1800, 8, 4, 900, 60, 15), [self.call(tokens=20)], self.NOW))
 
     def test_an_unreadable_record_counts_today_whatever_its_date(self):
-        unreadable = {'id': 'R0002', 'status': 'unreadable', 'problem': '调用记录 x 读不出来'}
+        unreadable = {'id': 'R0002', 'status': 'unreadable', 'problem': 'The call record x cannot be read'}
         limits = Limits(1800, 8, 4, 900, 2, 0)
         self.assertIsNone(refusal(limits, [self.call(-1), unreadable], self.NOW))
         message = refusal(limits, [self.call(), unreadable], self.NOW)
-        self.assertIn('已经开始了 2 次调用', message)
-        self.assertIn('其中 1 份调用记录读不出来', message)
+        self.assertRegex(message, r'^Calls started today \([0-9-]+\): 2\. ')
+        self.assertTrue(message.endswith(" Unreadable call records among them, counted as today's: 1."), message)
         self.assertIsNotNone(refusal(limits, [self.call(), None], self.NOW))     # not even a dict
         summary = usage_by_class([unreadable, None, self.call(tokens=4)])
         self.assertEqual(summary['unknown'], {'calls': 2, 'input_tokens': 0, 'output_tokens': 0,
@@ -89,10 +89,11 @@ class LimitsTests(unittest.TestCase):
         mixed = [self.call(tokens=10), self.call(tokens=None), self.call(tokens=6), self.call(tokens=None),
                  self.call(-1, tokens=None)]
         message = refusal(limits, mixed, self.NOW)
-        self.assertIn('已用 18 个 token', message)                      # (10 + 1) + (6 + 1), known usage only
-        self.assertIn('每天 15 个的上限', message)
-        self.assertIn('另有 2 次调用的用量不明，没有算进去', message)      # yesterday's unknown call is not today's
-        self.assertNotIn('用量不明', refusal(limits, [self.call(tokens=20)], self.NOW))
+        self.assertRegex(message, r"^Tokens used by today's calls \([0-9-]+\): 18\. ")   # (10+1) + (6+1): known only
+        self.assertIn('the limit of 15 a day (day.tokens in owner/limits.toml)', message)
+        # yesterday's unknown call is not today's
+        self.assertTrue(message.endswith(' Calls of today with unknown usage, not counted: 2.'), message)
+        self.assertNotIn('unknown usage', refusal(limits, [self.call(tokens=20)], self.NOW))
 
     def test_unknown_usage_is_not_zero(self):
         summary = usage_by_class([self.call(tokens=10), self.call(tokens=None), self.call(tokens=5, cls='meta')])

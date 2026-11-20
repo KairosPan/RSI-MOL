@@ -39,7 +39,7 @@ class Limits:
 
 
 def load_limits(owner: Path) -> Limits:
-    """owner/limits.toml over the defaults; ValueError (in Chinese, listing every problem) for anything else."""
+    """owner/limits.toml over the defaults; ValueError (in English, listing every problem) for anything else."""
     path = Path(owner) / FILE
     try:
         text = path.read_bytes().decode('utf-8')
@@ -47,27 +47,27 @@ def load_limits(owner: Path) -> Limits:
     except FileNotFoundError:
         return Limits()
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
-        raise ValueError(f'{path} 不是合法的 UTF-8 TOML 文件：{error}') from error
+        raise ValueError(f'{path} is not a valid UTF-8 TOML file: {error}') from error
     values, problems = {}, []
     for name, body in table.items():
         if name not in TABLES:
-            problems.append(f'不认识的项 {name}')
+            problems.append(f'unknown item {name}')
             continue
         if not isinstance(body, dict):
-            problems.append(f'{name} 应写成 [{name}] 表')
+            problems.append(f'{name} must be written as the table [{name}]')
             continue
         for key, value in body.items():
             if (name, key) not in KEYS:
-                problems.append(f'不认识的键 {name}.{key}')
+                problems.append(f'unknown key {name}.{key}')
                 continue
             field, smallest = KEYS[(name, key)]
             if type(value) is not int or value < smallest:
-                problems.append(f'{name}.{key} 应为不小于 {smallest} 的整数，现在是 {value!r}')
+                problems.append(f'{name}.{key} must be an integer of at least {smallest}, not {value!r}')
             else:
                 values[field] = value
     if problems:
-        allowed = '、'.join(f'{name}.{key}' for name, key in KEYS)
-        raise ValueError(f'{path} 有问题：{"；".join(problems)}。能写的键只有：{allowed}。')
+        allowed = ', '.join(f'{name}.{key}' for name, key in KEYS)
+        raise ValueError(f'{path} has problems: {"; ".join(problems)}. The only keys allowed are {allowed}.')
     return Limits(**values)
 
 
@@ -95,7 +95,7 @@ def _usage(call):
 
 
 def refusal(limits: Limits, calls: list[dict], now: datetime) -> str | None:
-    """Why no new call may start today, in Chinese, or None.
+    """Why no new call may start today, in English, or None.
 
     Today is the local calendar day of now; a call belongs to the day it started, whatever its status. An
     unreadable record counts as today's, whatever its date, since its date is not known; a readable call without a
@@ -115,17 +115,17 @@ def refusal(limits: Limits, calls: list[dict], now: datetime) -> str | None:
             todays.append(call)
     if len(todays) >= limits.day_calls:
         unreadable = sum(map(_unreadable, todays))
-        note = f'其中 {unreadable} 份调用记录读不出来，按今天的算。' if unreadable else ''
-        return (f'今天（{today}）已经开始了 {len(todays)} 次调用，到了每天 {limits.day_calls} 次的上限'
-                f'（owner/limits.toml 的 day.calls）。{note}')
+        note = f" Unreadable call records among them, counted as today's: {unreadable}." if unreadable else ''
+        return (f'Calls started today ({today}): {len(todays)}. That reaches the limit of {limits.day_calls} a day '
+                f'(day.calls in owner/limits.toml).{note}')
     if limits.day_tokens:
         known = [counts for call in todays if (counts := _tokens(_usage(call))) is not None]
         used = sum(i + o for i, o in known)
         if used >= limits.day_tokens:
             unknown = len(todays) - len(known)
-            note = f'另有 {unknown} 次调用的用量不明，没有算进去。' if unknown else ''
-            return (f'今天（{today}）的调用已用 {used} 个 token，到了每天 {limits.day_tokens} 个的上限'
-                    f'（owner/limits.toml 的 day.tokens）。{note}')
+            note = f' Calls of today with unknown usage, not counted: {unknown}.' if unknown else ''
+            return (f"Tokens used by today's calls ({today}): {used}. That reaches the limit of {limits.day_tokens} "
+                    f'a day (day.tokens in owner/limits.toml).{note}')
     return None
 
 

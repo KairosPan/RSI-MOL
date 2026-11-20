@@ -3,11 +3,11 @@
 # agent writes first on it (<RSI root>/env/bin, after activating that venv). The Python is $RSI_PYTHON (an absolute
 # path outside the RSI folder) or the first Python 3.11 or newer of a fixed list, started with -I (no PYTHONPATH, no
 # user site-packages, not the script's folder) and -B (no bytecode written) on control/rsi/__main__.py beside this
-# file's real path. Besides the shell's own built-ins, only /usr/bin/readlink is run here. Every variable next to
-# non-ASCII text is written in braces: in a Latin-1 locale, bash 3.2 would read a following byte as part of its name.
+# file's real path. Besides the shell's own built-ins, only /usr/bin/readlink is run here. Every variable in a
+# message is written in braces, so that no character after it is read as part of its name.
 
 refuse() {
-    printf '%s\n' "rsi：${1}" >&2
+    printf '%s\n' "rsi: ${1}" >&2
     exit 2
 }
 
@@ -25,22 +25,23 @@ usable() {              # whether $1 is an executable Python 3.11 or newer (it i
     [ -f "$1" ] && [ -x "$1" ] && "$1" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1
 }
 
-self=$(real "$0") || refuse "找不到启动脚本本身（${0}）"
+self=$(real "$0") || refuse "the launcher itself cannot be found (${0})"
 here=${self%/*}
 
 if [ -n "${RSI_PYTHON+set}" ]; then
     case $RSI_PYTHON in
         /*) ;;
-        *) refuse "\$RSI_PYTHON 必须是 Python 3.11 或更新版本的绝对路径，现在是“${RSI_PYTHON}”" ;;
+        *) refuse "\$RSI_PYTHON must be the absolute path of Python 3.11 or newer, but it is '${RSI_PYTHON}'" ;;
     esac
-    python=$(real "$RSI_PYTHON") || refuse "\$RSI_PYTHON 指向的 ${RSI_PYTHON} 不存在"
+    python=$(real "$RSI_PYTHON") || refuse "\$RSI_PYTHON names ${RSI_PYTHON}, which does not exist"
     spelled=$(real "${RSI_PYTHON%/*}")/${RSI_PYTHON##*/}       # the path as given, its folder's links followed
     for root in "$here" "$(real "${RSI_ROOT:-$here}")"; do
         if inside "$python" "$root" || inside "$spelled" "$root"; then
-            refuse "\$RSI_PYTHON（${RSI_PYTHON}）在 RSI 文件夹 ${root} 里，agent 改得到，不能用它运行 rsi"
+            refuse "\$RSI_PYTHON (${RSI_PYTHON}) is inside the RSI folder ${root}, where agents can change it, \
+so it cannot run rsi"
         fi
     done
-    usable "$python" || refuse "\$RSI_PYTHON（${RSI_PYTHON}）不是 Python 3.11 或更新的版本"
+    usable "$python" || refuse "\$RSI_PYTHON (${RSI_PYTHON}) is not Python 3.11 or newer"
 else
     python=
     for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
@@ -49,8 +50,8 @@ else
             break
         fi
     done
-    [ -n "$python" ] || refuse "找不到 Python 3.11 或更新的版本（试过 /opt/homebrew/bin/python3、/usr/local/bin/python3、\
-/usr/bin/python3）；请把 \$RSI_PYTHON 设成它的绝对路径"
+    [ -n "$python" ] || refuse "no Python 3.11 or newer was found (tried /opt/homebrew/bin/python3, \
+/usr/local/bin/python3, /usr/bin/python3); set \$RSI_PYTHON to its absolute path"
 fi
 
 exec "$python" -I -B "$here/control/rsi/__main__.py" "$@"

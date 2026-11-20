@@ -90,7 +90,7 @@ class Records:
         application is the single file applications/<id>.json, and write_json, which never overwrites, claims it.
         """
         if prefix not in KINDS:
-            raise ValueError(f'不认识的记录编号前缀：{prefix!r}。只能是 R、M 或 A。')
+            raise ValueError(f'Unknown record id prefix: {prefix!r}. It can only be R, M or A.')
         folder = self.root / KINDS[prefix]
         pattern = re.compile(rf'{prefix}([0-9]{{4,}})(?:\..*)?')
         names = os.listdir(folder) if folder.is_dir() else []
@@ -109,7 +109,8 @@ class Records:
 
     def call_dir(self, call_id: str) -> Path:
         if not isinstance(call_id, str) or not CALL_ID.fullmatch(call_id):
-            raise ValueError(f'调用编号不合规：{call_id!r}。应为 R 加至少四位数字，例如 R0001。')
+            raise ValueError(f'The call id {call_id!r} is not valid. A call id is R and at least four digits, for '
+                             'example R0001.')
         return self.root / KINDS['R'] / call_id
 
     def start_call(self, call_id: str, fields: dict) -> None:
@@ -130,10 +131,12 @@ class Records:
         record = self.load_call(call_id)
         self._same_id(call_id, fields)
         if record.get('status') != STARTED:
-            raise ValueError(f'调用 {call_id} 已经结束（{record.get("status")}），它的记录不能再改。')
+            raise ValueError(f'The call {call_id} has already ended ({record.get("status")}); its record cannot be '
+                             'changed any more.')
         record.update(fields)
         if record.get('status') not in ENDED:
-            raise ValueError(f'调用 {call_id} 的结束状态不合规：{record.get("status")!r}。应为 {"、".join(ENDED)} 之一。')
+            raise ValueError(f'The end status of the call {call_id} is not valid: {record.get("status")!r}. It must '
+                             f'be one of {", ".join(ENDED)}.')
         folder = self.call_dir(call_id)
         record['files'], record['links'] = _hashes(folder)
         content = _encode(record)
@@ -143,7 +146,7 @@ class Records:
         return record
 
     def load_call(self, call_id: str) -> dict:
-        """The call's call.json. KeyError if the call was never started; ValueError, in Chinese and naming the
+        """The call's call.json. KeyError if the call was never started; ValueError, in English and naming the
         file, if it cannot be read or is not a JSON object."""
         path = self.call_dir(call_id) / CALL_FILE
         try:
@@ -151,16 +154,16 @@ class Records:
         except FileNotFoundError:
             raise KeyError(call_id) from None
         except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:
-            raise ValueError(f'调用记录 {path} 读不出来：{error}') from error
+            raise ValueError(f'The call record {path} cannot be read: {error}') from error
         if not isinstance(record, dict):
-            raise ValueError(f'调用记录 {path} 不是 JSON 对象，而是 {json.dumps(record)[:80]}。')
+            raise ValueError(f'The call record {path} is not a JSON object but {json.dumps(record)[:80]}.')
         return record
 
     def calls(self) -> list[dict]:
         """Every started call, oldest (lowest number) first, whatever its status; reserved ids are left out.
 
         A call.json that cannot be read stands in the list as {'id', 'status': 'unreadable', 'problem'}, the problem
-        being load_call's Chinese message, so one bad record never hides the others.
+        being load_call's English message, so one bad record never hides the others.
         """
         folder = self.root / KINDS['R']
         if not folder.is_dir():
@@ -181,7 +184,7 @@ class Records:
         parts = relative.split('/') if isinstance(relative, str) else []
         if not parts or not all(COMPONENT.fullmatch(part) for part in parts) or relative == INDEX \
                 or (len(parts) == 3 and parts[0] == KINDS['R'] and parts[2] == CALL_FILE):
-            raise ValueError(f'记录路径不合规：{relative!r}。')
+            raise ValueError(f'The record path {relative!r} is not valid.')
         folder = self.root
         for part in parts[:-1]:
             folder = folder / part
@@ -189,7 +192,8 @@ class Records:
                 os.mkdir(folder)
             except FileExistsError:
                 if folder.is_symlink() or not folder.is_dir():
-                    raise ValueError(f'记录路径不合规：{relative!r}，其中 {part} 不是普通文件夹。') from None
+                    raise ValueError(f'The record path {relative!r} is not valid: {part} in it is not a plain '
+                                     'folder.') from None
         content = _encode(data)
         target = folder / parts[-1]
         self._create(target, content)
@@ -199,15 +203,15 @@ class Records:
     def note(self, kind: str, data: dict) -> None:
         """Append one index line {kind, at, **data}, e.g. kind 'refusal'."""
         if not isinstance(kind, str) or not NOTE_KIND.fullmatch(kind) or kind in ('call', 'file'):
-            raise ValueError(f'记录种类不合规：{kind!r}。')
+            raise ValueError(f'The record kind {kind!r} is not valid.')
         if 'kind' in data or 'at' in data:
-            raise ValueError('记录内容不能带 kind 或 at 键，它们由记录程序填写。')
+            raise ValueError('A record cannot have the keys kind or at; the records program fills them in.')
         self._append({'kind': kind, 'at': _now(), **data})
 
     @staticmethod
     def _same_id(call_id: str, fields: dict) -> None:
         if fields.get('id', call_id) != call_id:
-            raise ValueError(f'调用 {call_id} 的记录里写了另一个编号：{fields["id"]!r}。')
+            raise ValueError(f'The record of the call {call_id} names another id: {fields["id"]!r}.')
 
     @staticmethod
     def _staged(target: Path, content: bytes) -> str:

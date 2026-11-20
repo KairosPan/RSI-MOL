@@ -167,7 +167,7 @@ class FakeCodex(unittest.TestCase):
 
     def test_version_without_output_is_a_clear_error(self):
         self.fake('')
-        with self.assertRaisesRegex(RuntimeError, '版本号'):
+        with self.assertRaisesRegex(RuntimeError, 'reported no version number'):
             codex_version()
 
     def test_codex_gets_a_minimal_environment_and_absolute_paths(self):

@@ -53,14 +53,14 @@ def _tool_secrets(envelope: dict, source: str = ENVELOPE) -> dict[str, str]:
     """envelope['rsi']['tool_secrets']: environment-variable name → the one host its value may be sent to."""
     secrets = envelope.get('rsi', {}).get('tool_secrets', {})
     if not isinstance(secrets, dict) or not all(isinstance(value, str) and value for value in secrets.values()):
-        raise Refused(f'{source} 的 rsi.tool_secrets 必须是“环境变量名 = 主机名”的表')
+        raise Refused(f'rsi.tool_secrets in {source} must be a table of "variable name = host name"')
     return secrets
 
 
 def _extra_read_list(envelope: dict, source: str) -> list[str]:
     folders = envelope.get('rsi', {}).get('extra_read', [])
     if not isinstance(folders, list) or not all(isinstance(item, str) and os.path.isabs(item) for item in folders):
-        raise Refused(f'{source} 的 rsi.extra_read 必须是绝对路径的列表')
+        raise Refused(f'rsi.extra_read in {source} must be a list of absolute paths')
     return folders
 
 
@@ -73,21 +73,22 @@ def load_envelope(owner: Path) -> dict:
     try:
         data = tomllib.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
-        raise Refused(f'找不到 {path}，Lab 的对外范围没有定义') from None
+        raise Refused(f'{path} does not exist, so what the Lab may reach outside is not defined') from None
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
-        raise Refused(f'{path} 读不了：{" ".join(str(error).split())}') from None
+        raise Refused(f'{path} cannot be read: {" ".join(str(error).split())}') from None
     if 'projects' in data:
-        raise Refused(f'{path} 里不能有 projects 表：受信任的项目会让那个文件夹里的 .codex/config.toml 覆盖 Lab 的配置')
+        raise Refused(f'{path} must not have a projects table: a trusted project lets the .codex/config.toml in that '
+                      "folder override the Lab's configuration")
     unknown = sorted(set(data) - {'approval_policy', *ENVELOPE_TABLES})
     if unknown:
-        raise Refused(f'{path} 里有不认识的键：{"、".join(unknown)}')
+        raise Refused(f'{path} has unknown keys: {", ".join(unknown)}')
     envelope = {'approval_policy': data.get('approval_policy', 'on-request')}
     if not isinstance(envelope['approval_policy'], str):
-        raise Refused(f'{path} 的 approval_policy 必须是文本')
+        raise Refused(f'approval_policy in {path} must be text')
     for key in ENVELOPE_TABLES:
         envelope[key] = data.get(key, {})
         if not isinstance(envelope[key], dict):
-            raise Refused(f'{path} 的 {key} 必须是一个表')
+            raise Refused(f'{key} in {path} must be a table')
     _extra_read_list(envelope, str(path))
     _tool_secrets(envelope, str(path))
     return envelope
@@ -104,7 +105,8 @@ def _extra_read(layout: Layout, envelope: dict) -> list[str]:
     for folder in _extra_read_list(envelope, ENVELOPE):
         for forbidden in (str(layout.root), *_homes()):
             if _inside(folder, forbidden):
-                raise Refused(f'{ENVELOPE} 的 rsi.extra_read 里 {folder!r} 在 {forbidden} 里面，不能放开')
+                raise Refused(f'{folder!r} in rsi.extra_read of {ENVELOPE} is inside {forbidden}, so it cannot be '
+                              'opened')
         out.append(os.path.normpath(folder))
     return out
 
@@ -197,7 +199,7 @@ def _disabled(table: dict, ids: list[str], key: str, problems: list[str]) -> dic
         if isinstance(out.get(item), dict):
             out[item] = {**out[item], 'enabled': False}
         else:
-            message = f'{SETTINGS}：disable.{key} 里的 {item!r} 不在允许的范围里，忽略'
+            message = f'{SETTINGS}: {item!r} in disable.{key} is not among the allowed ones; it is ignored'
             if message not in problems:
                 problems.append(message)
     return out
@@ -231,7 +233,8 @@ def prepare_wrapper_home(layout: Layout) -> None:
     home = wrapper_home(layout)
     for folder in (layout.lab_home, home.parent, home):
         if folder.is_symlink():
-            raise Refused(f'{folder} 是符号链接；控制程序不会跟着它去清空别处，请改成普通文件夹')
+            raise Refused(f'{folder} is a symbolic link; the control program does not follow it to empty another '
+                          'folder. Make it a plain folder.')
         folder.mkdir(exist_ok=True)
     for entry in home.iterdir():
         if entry.name == 'tmp' and entry.is_dir() and not entry.is_symlink():
@@ -290,40 +293,43 @@ def _url_server_problems(envelope: dict, settings: Settings, resolve) -> dict[st
         server = settings.tool_servers[name]
         if 'url' not in server:
             continue
-        where, problems = f'{SETTINGS}：工具服务 {show(name)}', []
+        where, problems = f'{SETTINGS}: tool server {show(name)}', []
         try:
             parts = urlsplit(server['url'])
             host, port = parts.hostname, parts.port or 443
         except ValueError:
             host, port = None, None
         if not host:
-            problems.append(f'{where} 的网址没有主机名')
+            problems.append(f'{where}: the url has no host name')
         else:
             try:
                 addresses = sorted({str(info[4][0]) for info in resolve(host, port, type=socket.SOCK_STREAM)})
             except (OSError, UnicodeError, ValueError, TypeError, IndexError) as error:
                 addresses = None
-                problems.append(f'{where} 的主机 {show(host)} 解析不了（{" ".join(str(error).split())}）')
+                problems.append(f'{where}: the host {show(host)} cannot be resolved ({" ".join(str(error).split())})')
             if addresses is not None and not addresses:
-                problems.append(f'{where} 的主机 {show(host)} 解析不到任何地址')
+                problems.append(f'{where}: the host {show(host)} resolves to no address')
             local = [address for address in addresses or [] if _local_address(address)]
             if local:
-                problems.append(f'{where} 的主机 {show(host)} 解析到本机、局域网或保留地址 {show(", ".join(local))}；'
-                                'Codex 在沙箱外连它，不允许')
+                problems.append(f'{where}: the host {show(host)} resolves to an address of this machine, the local '
+                                f'network or a reserved range ({show(", ".join(local))}); Codex connects to it outside '
+                                'the sandbox, so this is not allowed')
         variable = server.get('bearer_token_env_var')
         if variable is not None:
             allowed = secrets.get(variable)
             if allowed is None:
-                problems.append(f'{where} 用了密钥 {show(variable)}，但 {ENVELOPE} 的 rsi.tool_secrets 没有把它绑定到主机')
+                problems.append(f'{where} uses the secret {show(variable)}, but rsi.tool_secrets in {ENVELOPE} does '
+                                'not tie it to a host')
             elif host is None or allowed.lower() != host.lower():
-                problems.append(f'{where} 用了密钥 {show(variable)}，它只能发给 {show(allowed)}，不能发给 {show(host)}')
+                problems.append(f'{where} uses the secret {show(variable)}, which may be sent only to '
+                                f'{show(allowed)}, not to {show(host)}')
         if problems:
             out[name] = problems
     return out
 
 
 def tool_server_problems(envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo) -> list[str]:
-    """Problems of the tool servers reached by URL, one Chinese line each, naming the server: a host that does not
+    """Problems of the tool servers reached by URL, one English line each, naming the server: a host that does not
     resolve, or resolves to any loopback, private, link-local, multicast, reserved or unspecified address; a bearer
     token whose variable the owner did not tie to exactly that host in rsi.tool_secrets."""
     return [line for lines in _url_server_problems(envelope, settings, resolve).values() for line in lines]
@@ -395,7 +401,8 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
             continue
         valid = (isinstance(value, str) and MODEL.fullmatch(value)) if key == 'model' else value in EFFORTS
         if not valid:
-            raise Refused(f'Meta 的设置里 {key} 不合规：{show(value)}（规则和 Lab 的 settings.toml 相同）')
+            raise Refused(f"{key} in the Meta settings is not valid: {show(value)} (the rules are those of the Lab's "
+                          'settings.toml)')
         config[key] = value
     config.update({
         'features': {'apps': False, 'plugins': False},
@@ -423,7 +430,7 @@ def read_regular(path: Path) -> bytes | None:
         return None
     with os.fdopen(fd, 'rb') as stream:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-            raise OSError(errno.EINVAL, '不是普通文件', str(path))
+            raise OSError(errno.EINVAL, 'not a regular file', str(path))
         return stream.read()
 
 
@@ -472,7 +479,7 @@ def _copy_verified(source: Path, target: Path, data: bytes) -> None:
         os.unlink(temporary)
     try:
         if read_regular(target) != data or read_regular(source) != data:
-            raise OSError(errno.EIO, '备份读回来和原文件不一致', str(target))
+            raise OSError(errno.EIO, 'the backup read back differs from the original', str(target))
     except BaseException:
         try:
             os.unlink(target)
@@ -498,7 +505,8 @@ def keep_owner_config(layout: Layout) -> tuple[Path | None, bool]:
     try:
         data = read_regular(path)
     except OSError as error:
-        raise Refused(f'{path} 读不了（{error.strerror or error}），没能备份，所以没有改写它') from None
+        raise Refused(f'{path} cannot be read ({error.strerror or error}), so it could not be backed up and was not '
+                      'rewritten') from None
     if data is None or data.startswith(MARKER):
         return None, False
     for target in backup_names(layout):
@@ -515,11 +523,11 @@ def keep_owner_config(layout: Layout) -> tuple[Path | None, bool]:
         except FileExistsError:
             continue
         except OSError as error:
-            raise Refused(f'{path} 是主人自己的配置，没能可靠地备份到 {target}（{error.strerror or error}），'
-                          '所以没有改写它') from None
+            raise Refused(f"{path} is the owner's own configuration and could not be backed up reliably to {target} "
+                          f'({error.strerror or error}), so it was not rewritten') from None
         return target, True
-    raise Refused(f'{path} 是主人自己的配置，但 {OWNER_BACKUP} 到 {OWNER_BACKUP}-{BACKUP_NAMES} 都被占用了，'
-                  '没能备份，所以没有改写它')
+    raise Refused(f"{path} is the owner's own configuration, but {OWNER_BACKUP} to {OWNER_BACKUP}-{BACKUP_NAMES} are "
+                  'all taken, so it could not be backed up and was not rewritten')
 
 
 def _write_config(path: Path, text: str) -> None:
@@ -544,7 +552,7 @@ def write_home_config(layout: Layout, envelope: dict, settings: Settings, *, res
     when that cannot be done."""
     config = lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve)
     if 'projects' in config:
-        raise Refused('Lab 的 Codex 配置里不能有 projects 表')
+        raise Refused("The Lab's Codex configuration must not have a projects table")
     text = render_file(config)
     write_role_files(layout, settings, trial=False)
     keep_owner_config(layout)

@@ -32,6 +32,9 @@ OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
 NAMES = re.compile(r'\bthe (owner|lead)\b', re.IGNORECASE)
 NAMED = {'AGENTS.md': ['lead'], 'codex/agents/literature.toml': ['lead'], 'codex/settings.toml': ['owner'],
          'notes/README.md': []}
+# The ranges no file of the program, the tasks or the seed may use a character of: CJK symbols and punctuation, CJK
+# ideographs, and halfwidth and fullwidth forms.
+CJK = re.compile('[\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]')
 # The rule of Meta's standing instructions that keeps the Lab workspace in English (one bullet, its lines joined
 # by a space), and the bullet it follows.
 ENGLISH_RULE = ('- Every file kept in the Lab workspace is written in English, with English file and folder names: '
@@ -215,15 +218,25 @@ class Seed(unittest.TestCase):
         self.assertEqual([(flag.split('=')[0], 'conn_a' in flag or 'pdf@x' in flag) for flag in flags],
                          [('apps', True), ('plugins', True)])
 
-    def test_the_lab_leads_word_is_never_used_for_the_owner(self):
-        """负责人 (the Lab lead) appears nowhere in the program, the tasks or the seed: the owner is 主人 wherever Meta
-        reads it. In the English Lab seed the owner is "the owner", and "the lead" is only ever the Lab lead."""
+    def test_no_chinese_in_the_program_the_tasks_or_the_seed(self):
+        """No character of U+3000-U+303F, U+4E00-U+9FFF or U+FF00-U+FFEF (CJK punctuation, ideographs, fullwidth
+        forms) is in the launcher or in any file under control/rsi, control/seed or tasks. Other non-ASCII characters
+        the program needs (the long s of `.agentſ`) are not looked for."""
         repo = SEED.parents[1]
         paths = [repo / 'rsi', *(path for top in ('control/rsi', 'control/seed', 'tasks')
                                  for path in (repo / top).rglob('*'))]
-        found = sorted(path.relative_to(repo).as_posix() for path in paths
-                       if path.is_file() and '__pycache__' not in path.parts and '负责人'.encode() in path.read_bytes())
-        self.assertEqual(found, [])
+        found = {}
+        for path in paths:
+            if path.is_file() and '__pycache__' not in path.parts:
+                text = path.read_bytes().decode('utf-8')
+                lines = [number for number, line in enumerate(text.splitlines(), 1) if CJK.search(line)]
+                if lines:
+                    found[path.relative_to(repo).as_posix()] = lines
+        self.assertEqual(found, {})
+        self.assertGreater(len(paths), 30)                   # the folders were found and walked
+
+    def test_the_owner_decides_and_the_lead_is_only_the_lab_lead(self):
+        """In the English Lab seed the owner is "the owner", and "the lead" is only ever the Lab lead."""
         for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS, META_TEXT.read_text(encoding='utf-8')):
             self.assertIn('the owner decides', text)
         texts = {name: (SEED / 'work' / name).read_text(encoding='utf-8') for name in WORK_FILES}
