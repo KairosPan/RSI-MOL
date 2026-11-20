@@ -71,7 +71,8 @@ The tests drive the real Codex CLI against a scripted local model endpoint, so t
 
 Real-model runs cover the planted-fault recovery and the Literature service. The Stage L acceptance record in
 [Plan 2](docs/plan2.md#acceptance-record-november-20-2026) identifies the child run, paper, passage and hashes.
-The [P4 acceptance record](docs/design.md#13-p4-真实科研任务验收2026-11-20) documents the real pilot analysis,
-the log-level check of five passages from two papers and Meta's decision to keep V0006. The task checks behind
-these records verify the format of the results only.
+The P4 audit matches each quoted passage to the archived original, the Literature child's
+`read_document` response and the controller's copy of the tool log. Replay the five passages from the two
+papers in the original run with `python3 tasks/lit-service/audit.py records/runs/R0010 library --task paired-validation`.
+The decision memo and Meta's review are described in the [P4 acceptance record](docs/design.md#13-p4-真实科研任务验收2026-11-20).
 Open work is tracked in the issues.

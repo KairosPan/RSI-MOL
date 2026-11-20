@@ -296,6 +296,11 @@ class Runtime:
                "evidence": evidence, "next_cursor": _clean((result.get("continuation") or {}).get("next_cursor"))}
         if truncated:
             row["evidence_truncated"] = True
+        if downloads := provenance.get("download_attempts"):
+            row["download_attempts"] = _clean(downloads)
+            if len(downloads) > len(row["download_attempts"]) or len(_json(row["download_attempts"])) > _MAX_LOG // 4:
+                row["download_attempts"] = _clean([downloads[0], downloads[-1]])
+                row["download_attempts_total"] = len(downloads)
         if len(_json(row)) >= _MAX_LOG:
             row["inputs"] = {"omitted": "Inputs exceed the log row limit",
                              "sha256": hashlib.sha256(_json(row["inputs"])).hexdigest()}

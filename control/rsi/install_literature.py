@@ -30,6 +30,10 @@ class NotInWork(Exception):
     """The new version was saved, but it could not be put into work/: the command failed, and says why."""
 
 
+class ConfigNotUpdated(Exception):
+    """work/ holds the saved version, but refreshing the Lab's configuration failed."""
+
+
 def _no_links(staged: Path, relative: Path) -> Path:
     """staged/relative, after refusing a link in any of its components. The checkout is private and static."""
     path = staged
@@ -102,7 +106,9 @@ def _install_package(staged: Path, seed: Path) -> list[str]:
     if 'server.py' not in wanted:
         raise Refused('The Literature service entry point is missing from the seed')
     folder = _no_links(staged, Path(PACKAGE))
-    found, aside = {}, staged / ('.rsi-kept-' + SOURCES)
+    found = {}
+    # stage() created an empty .tmp/ in this private checkout. No versioned file can occupy this path.
+    aside = staged / '.tmp' / SOURCES
     if os.path.lexists(folder):
         if not folder.is_dir():
             raise Refused(f'Literature install expected a folder at {PACKAGE}')
@@ -177,19 +183,17 @@ def _install_files(staged: Path, seed: Path) -> list[str]:
 
 
 def _restage(layout: Layout, records: Records, store, envelope: dict, root_fd: int,
-             context: dict) -> tuple[list[str], bool]:
-    """Put the newest version back into work/ (sealed before the install) and, once it is there, rewrite the Lab
-    home's config.toml for it; (one line per problem, whether work/ holds the newest version now). Never raises an
-    Exception, so it cannot hide the install's own error."""
-    lines, settings, placed = [], None, False
+             context: dict) -> tuple[list[str], str | None]:
+    """Restore work/ and refresh its Lab configuration. Return problem lines and the failed step, if any."""
+    lines = []
     with problem(lines, 'work/ could not be replaced by the newest version'):
-        staged, head_settings = stage(layout, store, store.head())
+        staged, settings = stage(layout, store, store.head())
         move_in(layout, records, root_fd, staged, 'work', context, lines)
-        settings, placed = head_settings, True
-    if placed:
         with problem(lines, "The Lab's Codex configuration (codex-home/config.toml) could not be updated"):
             write_home_config(layout, envelope, settings)
-    return lines, placed
+            return lines, None
+        return lines, 'config_not_updated'
+    return lines, 'not_in_work'
 
 
 def _note(records: Records, data: dict, lines: list[str]) -> None:
@@ -203,10 +207,9 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
 
     lines, if given, gets one English line for each entry of tools/literature/ that was removed, replaced or kept
     (sources.json), and for each problem met while putting the newest version back into work/. Each outcome
-    (installed, unchanged, either `_but_not_in_work`, refused, failed) is noted in records/index.jsonl as a
-    `literature_install` line with those lines, and a refusal also as every command's is (`refusal`). A refusal whose
-    clean-up met problems names them too. NotInWork when the version was saved (or already there) but could not be
-    put into work/."""
+    is noted in records/index.jsonl as a `literature_install` line. Installed and unchanged versions record the
+    suffix `_but_not_in_work` or `_but_config_not_updated` when the corresponding step fails. A refusal also
+    records the usual `refusal` note, including problems met restoring work/ and its configuration."""
     lines = [] if lines is None else lines
     records = Records(layout.records)
     context = {'command': 'install-literature'}
@@ -238,14 +241,19 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
             if isinstance(error, Refused) and restaged:
                 raise Refused(f'{error} Afterwards: {"; ".join(restaged)}') from None
             raise
-        restaged, placed = _restage(layout, records, store, envelope, root_fd, context)
+        restaged, failure = _restage(layout, records, store, envelope, root_fd, context)
         lines += changed + restaged
-        outcome = ('installed' if version != baseline else 'unchanged') + ('' if placed else '_but_not_in_work')
+        outcome = 'installed' if version != baseline else 'unchanged'
+        if failure:
+            outcome += '_but_' + failure
         _note(records, {'outcome': outcome, 'baseline': baseline, 'version': version, 'lines': changed + restaged,
                         **context}, lines)
-        if not placed:
+        if failure:
             saved = (f'Literature was installed in {version} (roll back with: rsi rollback {baseline})'
                      if version != baseline else f'Literature was already installed in {version}')
+            if failure == 'config_not_updated':
+                raise ConfigNotUpdated(f'{saved}. work/ holds {version}. Fix the configuration error below and run '
+                                       'rsi install-literature again to refresh codex-home/config.toml.')
             raise NotInWork(f'{saved}, but work/ could not be replaced by that version, so there is no usable work/ '
                             f'now: {"; ".join(restaged)}. Run rsi recover to put the newest version into work/.')
     return baseline, version

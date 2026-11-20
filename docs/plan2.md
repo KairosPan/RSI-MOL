@@ -165,7 +165,7 @@ endpoints, credentials or executables. [Upstream dispatch and acquisition](https
 ## Acceptance record, November 20, 2026
 
 The owner installation captured the existing workspace as **V0005** and installed the server in **V0006**.
-A second installation reported the same version. All 334 tests passed in the full offline suite.
+A second installation reported the same version. The original V0006 acceptance run passed all 334 tests then in the offline suite.
 Codex CLI 0.170.0 passed 223 isolation checks, including 18
 specific to the Literature wrapper. The 18 `literature_*` cases in `records/check.json` run a stand-in script through the
 composed wrapper, not the server code. They allow writes in the workspace and library, and block writes to the other
@@ -192,3 +192,27 @@ To replay it in the installation that holds the records, run `python3 tasks/lit-
 Europe PMC supplied the article in the delegated run. In a separate model-free check through the same sandbox
 wrapper, PubMed and OpenAlex each returned the SAMtools paper, and Asta listed four allowed tools. PDF
 extraction and PNG delivery were tested with local fixtures and real Poppler.
+
+### Review fixes and verification
+
+When a provider offers several full-text locations, the service tries matching mirrors within a shared download
+time budget. For XML it parses the entire article before archiving, compares the primary article identifiers
+with the provider's resolved record and lists the identifiers it could verify in the response. Conflicting
+identifiers or malformed XML reject that candidate. Each attempted mirror contributes its outcome to the log.
+The Asta tool log also records the host contacted during discovery or a tool call.
+
+On upgrade, the installer preserves the workspace's source list while it replaces the package. If the version
+is saved but the Lab configuration cannot be refreshed, the command records that outcome and exits nonzero.
+After correcting the configuration error, run `./rsi install-literature` again. Meta receives the instructions
+for checking Literature receipts from the controller, including on installations with custom owner instructions.
+
+On the existing installation, a repeat install of **V0008** kept that version and **243/243** isolation
+checks passed under Codex 0.170.0. Stage L run **R0012** passed both the task check and the receipt audit.
+The successful Europe PMC download matched DOI, PMCID and PMID. Its original SHA-256 and quoted passage at
+`block:000013` match R0009. A separate live Asta discovery through the installed wrapper returned four tools.
+The matching log row recorded `asta-tools.allen.ai` after three HTTP requests.
+
+The full offline suite passed **384/384**, including 16 new regression tests. Eight representative tests
+covering the eight review findings also ran against commit `55ddd3c`. Each reproduced its reported failure
+on that commit and passed with the fixes. The [P4 record](design.md#13-p4-真实科研任务验收2026-11-20)
+documents the separate live task and Meta review on V0008.

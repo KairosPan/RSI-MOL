@@ -24,7 +24,8 @@ from server import serve
 from rsi_literature import providers
 
 root = Path(__file__).resolve().parents[2]
-paper = {'source': 'MED', 'id': '123', 'pmcid': 'PMC456', 'isOpenAccess': 'Y', 'title': 'A paper',
+paper = {'source': 'MED', 'id': '123', 'pmcid': 'PMC456', 'doi': '10.1234/Example', 'isOpenAccess': 'Y',
+         'title': 'A paper',
          'fullTextUrlList': {'fullTextUrl': [{'availability':'Free', 'url':'https://paper.example/file.pdf',
                                               'documentStyle':'pdf'}]}}
 
@@ -47,6 +48,8 @@ def http(method, url, headers, body, timeout, maximum):
         return {'status':200, 'headers':{'content-type':'application/xml'}, 'body':(root/'article.xml').read_bytes()}
     msg = json.loads(body)
     name = msg['method']
+    if (root/'asta_denied').exists():
+        return {'status':503, 'headers':{}, 'body':b''}
     if name == 'initialize':
         value = {'protocolVersion':'2025-03-26', 'capabilities':{'tools':{}}}
     elif name == 'notifications/initialized':
@@ -116,6 +119,51 @@ class LiteratureServer(unittest.TestCase):
     def payload(self, name, **arguments):
         return json.loads(self.call(name, **arguments)['content'][0]['text'])
 
+    def rows(self):
+        return {row['invocation_id']: row for path in (self.work / '.tmp/literature/calls').glob('*.jsonl')
+                for row in map(json.loads, path.read_text().splitlines())}
+
+    def test_wrong_article_ids_are_refused_before_archiving(self):
+        self.initialize()
+        for kind, other in [('doi', '10.1234/other'), ('pmid', '999'), ('pmc', '999'), ('pmcid', 'PMC999')]:
+            with self.subTest(kind=kind):
+                article = (f'<article><front><article-meta><article-id pub-id-type="{kind}">{other}</article-id>'
+                           '</article-meta></front><body><p>Another paper.</p></body></article>')
+                (self.work / 'article.xml').write_text(article)
+                response = self.payload('acquire_fulltext', paper_ref='MED:123', preferred_format='xml')
+                self.assertEqual(response['errors'][0]['code'], 'identity_mismatch')
+                self.assertNotIn('document_id', response['data'])
+                self.assertEqual(list((self.work.parent / 'library').iterdir()), [])
+
+    def test_fulltext_compares_only_identifiers_of_the_article_itself(self):
+        self.initialize()
+        article = ('<article-set xmlns="urn:jats"><article><front><article-meta>'
+                   '<article-id pub-id-type="DOI">https://doi.org/10.1234/EXAMPLE</article-id>'
+                   '<article-id pub-id-type="pmid">123</article-id>'
+                   '<article-id pub-id-type="pmcaid">456</article-id>'
+                   '<article-id pub-id-type="pmcid">pmc456</article-id></article-meta></front>'
+                   '<body><p>Original article.</p></body><back><ref-list><ref><element-citation>'
+                   '<pub-id pub-id-type="doi">10.1234/other</pub-id></element-citation></ref></ref-list></back>'
+                   '<sub-article><front-stub><article-id pub-id-type="pmid">999</article-id></front-stub>'
+                   '</sub-article></article></article-set>')
+        (self.work / 'article.xml').write_text(article)
+        response = self.payload('acquire_fulltext', paper_ref='MED:123', preferred_format='xml')
+        self.assertEqual(response['status'], 'ok', response)
+        self.assertEqual(response['coverage']['verified_paper_identifiers'], ['doi', 'pmcid', 'pmid'])
+        self.assertEqual(response['data']['source_sha256'], hashlib.sha256(article.encode()).hexdigest())
+
+    def test_asta_records_contacted_hosts_on_success_and_failure(self):
+        self.initialize()
+        listed = self.payload('provider_tools', provider='asta')
+        called = self.payload('call_provider_tool', provider='asta', tool='get_paper', arguments={'paper_id': '123'})
+        (self.work / 'asta_denied').touch()
+        denied = self.payload('provider_tools', provider='asta')
+        rows = self.rows()
+        for result, expected_attempts in ((listed, 3), (called, 3), (denied, 1)):
+            self.assertEqual(result['provenance']['attempt_count'], expected_attempts)
+            self.assertEqual(rows[result['invocation_id']]['contacted_hosts'], ['asta-tools.allen.ai'])
+        self.assertNotEqual(denied['status'], 'ok')
+
     def test_session_and_all_reading_operations(self):
         self.initialize()
         self.assertEqual(len(self.rpc('tools/list', {})['result']['tools']), 11)
@@ -128,6 +176,7 @@ class LiteratureServer(unittest.TestCase):
         self.assertEqual(self.payload('get_paper', paper_ref='PMID:123')['data']['paper']['provider_id'], 'MED:123')
         response = self.payload('acquire_fulltext', paper_ref='PMC456', preferred_format='xml')
         self.assertEqual(response['status'], 'ok', response)
+        self.assertEqual(response['coverage']['verified_paper_identifiers'], [])
         self.assertRegex(response['invocation_id'], r'^[a-f0-9]{32}$')
         doc = response['data']['document_id']
         digest = hashlib.sha256(ARTICLE).hexdigest()

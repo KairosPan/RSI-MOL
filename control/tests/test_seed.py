@@ -9,9 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from rsi import init as init_module
-from rsi import literature_logs
 from rsi.codexrun import RECORD_FILES
-from rsi.compose import meta_config
 from rsi.init import init
 from rsi.labrun import run_task
 from rsi.limits import Limits, load_limits
@@ -82,8 +80,6 @@ Rules:
 - State possible regressions and what you are unsure of. Do not claim a benefit.
 - You cannot read or change a task's check script, the budget limits, or the control program. Records are
   read-only.
-- `literature.jsonl` in a run record is the literature server's own call log. The Lab's commands can write to it,
-  so it is not proof that a call happened; compare it with the originals in `../library/` when it matters.
 - To give the Lab a new connector or plugin, to let it read or write files outside its workspace, or to raise a
   budget limit, write an application; the owner decides. Tool servers and command networking you may change
   directly in the settings.
@@ -202,12 +198,7 @@ class Seed(unittest.TestCase):
         self.assertIn(f'`{runs}`', observe_step(text)); self.assertIn(f'`{candidate}`', text)
         named = set(re.findall(r'`([\w.-]+\.(?:json|jsonl|txt|patch))`', text))
         self.assertIn(CALL_FILE, named)
-        self.assertLessEqual(named, {CALL_FILE, *RECORD_FILES, 'diff.patch', literature_logs.LOG})
-        # The log's rule names the library as Meta reaches it from its working folder, which it may read.
-        library = os.path.relpath(Layout(Path('/RSI')).library, Layout(Path('/RSI')).meta) + '/'
-        self.assertIn(f'compare it with the originals in `{library}`', text)
-        self.assertEqual(meta_config(Layout(Path('/RSI')), {'features': {}}, {})['permissions']['meta']['filesystem']
-                         ['/RSI/library'], 'read')
+        self.assertLessEqual(named, {CALL_FILE, *RECORD_FILES, 'diff.patch'})
 
     @needs_codex
     def test_what_meta_is_told_a_record_holds_is_in_a_lab_run_record(self):

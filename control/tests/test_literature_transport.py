@@ -264,6 +264,67 @@ class Replies(unittest.TestCase):
         self.assertEqual((row['contacted_source'], row['contacted_hosts'], row['status']),
                          ('openalex', ['api.openalex.org'], 'failed'))
 
+    def test_mirrors_share_a_download_deadline(self):
+        native = mock.Mock()
+        candidates = [{'url': f'https://mirror{i}.example.org/paper', 'format': 'pdf'} for i in range(3)]
+        native.fulltext_candidates.return_value = {'status': 'ok', 'data': {'candidates': candidates},
+                                                   'provenance': {'provider': 'openalex', 'attempt_count': 1}}
+        with mock.patch('dispatch.time') as clock:
+            clock.monotonic.return_value = 0
+            def refuse(method, url, headers, body, timeout, limit):
+                clock.monotonic.return_value += min(12, timeout)
+                return {'status': 403, 'headers': {}, 'body': b''}
+            http = mock.Mock(side_effect=refuse)
+            service = Literature(self.runtime, native=native, http=http, resolve=lambda url: urlsplit(url).hostname)
+            response, _ = service.call('acquire_fulltext', {'provider': 'openalex', 'paper_ref': 'W1'}, 'a' * 32)
+        self.assertEqual([call.args[4] for call in http.call_args_list], [20, 8])
+        self.assertEqual(response['errors'][0]['code'], 'timeout')
+        self.assertEqual(response['provenance']['download_hosts'], ['mirror0.example.org', 'mirror1.example.org'])
+
+    def test_a_well_formed_but_unreadable_xml_is_only_a_fallback(self):
+        native = mock.Mock()
+        candidates = [{'format': 'xml', 'url': f'https://mirror{i}.example.org/paper'} for i in range(2)]
+        native.fulltext_candidates.return_value = {'status': 'ok', 'data': {'candidates': candidates},
+                                                   'provenance': {'provider': 'europe_pmc', 'attempt_count': 1}}
+        empty = b'<article/>'
+        readable = b'<article><body><p>The paper text.</p></body></article>'
+        for status, text, expected in [(200, readable, readable), (403, b'', empty)]:
+            with self.subTest(last_status=status):
+                http = mock.Mock(side_effect=[
+                    {'status': 200, 'headers': {'content-type': 'application/xml'}, 'body': empty},
+                    {'status': status, 'headers': {'content-type': 'application/xml'}, 'body': text}])
+                service = Literature(self.runtime, native=native, http=http, resolve=lambda url: urlsplit(url).hostname)
+                reply, _ = service.call('acquire_fulltext', {'paper_ref': 'MED:1', 'preferred_format': 'xml'}, 'a' * 32)
+                self.assertEqual(reply['data']['source_sha256'], hashlib.sha256(expected).hexdigest())
+                self.assertEqual(reply['status'], 'ok' if status == 200 else 'unavailable')
+                attempts = reply['provenance']['download_attempts']
+                self.assertEqual(attempts[0]['outcome'], 'no_readable_text')
+                self.assertEqual(attempts[1]['http_status'], status)
+
+    def test_trial_cache_miss_survives_a_failed_mirror_and_a_cached_mirror_is_usable(self):
+        trial_path = self.work.parent / 'trial'
+        trial_path.mkdir()
+        trial = Runtime(trial_path)
+        native = mock.Mock()
+        candidates = [{'format': 'xml', 'url': f'https://mirror{i}.example.org/paper'} for i in range(2)]
+        native.fulltext_candidates.return_value = {'status': 'ok', 'data': {'candidates': candidates},
+                                                   'provenance': {'provider': 'europe_pmc', 'attempt_count': 1}}
+        def acquire(runtime, statuses):
+            http = mock.Mock(side_effect=[{'status': s, 'headers': {'content-type': 'application/xml'},
+                                           'body': b'<article><body><p>Text.</p></body></article>'} for s in statuses])
+            service = Literature(runtime, native=native, http=http, resolve=lambda url: urlsplit(url).hostname)
+            return service.call('acquire_fulltext', {'paper_ref': 'MED:1', 'preferred_format': 'xml'}, 'a' * 32)[0]
+
+        miss = acquire(trial, [200, 403])
+        self.assertEqual(miss['errors'][0]['code'], 'trial_cache_miss')
+        self.assertFalse(trial.library.exists())
+        archived = acquire(self.runtime, [403, 200])
+        found = acquire(trial, [200, 200])
+        self.assertEqual(found['status'], 'ok')
+        self.assertEqual(found['data']['document_id'], archived['data']['document_id'])
+        self.assertEqual([a['outcome'] for a in found['provenance']['download_attempts']],
+                         ['trial_cache_miss', 'acquired'])
+
 
 DRIVER = '''
 import sys
@@ -352,6 +413,13 @@ class Server(unittest.TestCase):
         if number == '5':                   # an open-access PMC article: its XML full text, at .../PMC5/fullTextXML
             paper = {'source': 'MED', 'id': number, 'title': 'A paper', 'pmcid': 'PMC5', 'isOpenAccess': 'Y'}
             return complete(json.dumps({'hitCount': 1, 'resultList': {'result': [paper]}}).encode())
+        if number == '7':
+            # The first PDF mirror is unavailable, and a third mirror should be unnecessary.
+            locations = [{'availability': 'Free', 'documentStyle': 'pdf', 'url': self.host.base + path}
+                         for path in ('forbidden.pdf', 'fine.pdf', 'unused.pdf')]
+            paper = {'source': 'MED', 'id': number, 'title': 'A paper', 'pmcid': 'PMC7', 'isOpenAccess': 'Y',
+                     'fullTextUrlList': {'fullTextUrl': locations}}
+            return complete(json.dumps({'hitCount': 1, 'resultList': {'result': [paper]}}).encode())
         paper = {'source': 'MED', 'id': number, 'title': 'A paper', 'fullTextUrlList': {'fullTextUrl': [
             {'availability': 'Free', 'documentStyle': 'pdf', 'url': self.host.base + FILES[number]}]}}
         return complete(json.dumps({'hitCount': 1, 'resultList': {'result': [paper]}}).encode())
@@ -381,6 +449,31 @@ class Server(unittest.TestCase):
                 row = json.loads(line)
                 found[row['invocation_id']] = row
         return found
+
+    def test_a_truncated_xml_with_a_valid_start_never_enters_the_library(self):
+        self.rpc('initialize', {'protocolVersion': '2025-06-18'})
+        raw = b'<article><body><p>' + b'words ' * 1000
+        self.host.replies['fullTextXML'] = head('200 OK', 'Content-Type: application/xml', 'Connection: close') + raw
+        failed, shown = self.call('acquire_fulltext', paper_ref='MED:5', preferred_format='xml')
+        self.assertTrue(failed)
+        self.assertNotIn('document_id', shown['data'])
+        self.assertEqual(list(self.library.rglob('*')), [])
+        self.assertEqual(self.rows()[shown['invocation_id']]['contacted_hosts'], ['127.0.0.1'])
+
+    def test_a_second_pdf_mirror_succeeds_and_both_attempts_are_recorded(self):
+        self.rpc('initialize', {'protocolVersion': '2025-06-18'})
+        self.host.replies['forbidden.pdf'] = head('403 Forbidden', 'Content-Length: 0')
+        _, shown = self.call('acquire_fulltext', paper_ref='MED:7', preferred_format='pdf')
+        self.assertEqual(shown['data']['source_sha256'], hashlib.sha256(PDF).hexdigest())
+        self.assertEqual(shown['coverage']['verified_paper_identifiers'], [])
+        self.assertEqual(self.host.seen[1:], ['/forbidden.pdf', '/fine.pdf'])
+        provenance = shown['provenance']
+        self.assertEqual(provenance['attempt_count'], 3)   # one paper lookup and two downloads
+        self.assertEqual(provenance['download_hosts'], ['127.0.0.1', '127.0.0.1'])
+        attempts = provenance['download_attempts']
+        self.assertEqual([(a['http_status'], a['outcome']) for a in attempts],
+                         [(403, 'fulltext_unavailable'), (200, 'acquired')])
+        self.assertEqual(self.rows()[shown['invocation_id']]['download_attempts'], attempts)
 
     def test_the_server_answers_after_every_fault_and_logs_the_faulted_call(self):
         self.assertEqual(self.rpc('initialize', {'protocolVersion': '2025-06-18'})['result']['serverInfo']['name'],

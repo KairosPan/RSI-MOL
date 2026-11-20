@@ -6,11 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from rsi import install_literature as install_module
+from rsi.compose import meta_config
 from rsi.install_literature import NOTE, install_literature
-from rsi.meta import rollback
+from rsi.meta import rollback, run_round
+from rsi.mockmodel import say
 from rsi.paths import Refused
 from rsi.versions import VersionStore
-from tests.support import Root, needs_codex
+from tests.support import Root, decision, needs_codex
 from tests.test_cli import run
 
 SEED = Path(__file__).resolve().parents[1] / 'seed' / 'work'
@@ -105,6 +107,70 @@ class InstallLiterature(unittest.TestCase):
             self.assertEqual(root.store.head(), 'V0002')
             note = notes(root, NOTE)[-1]
             self.assertEqual((note['outcome'], note['version']), ('installed_but_not_in_work', 'V0002'))
+
+    def test_the_source_list_never_displaces_a_versioned_workspace_file(self):
+        for has_sources in (False, True):
+            with self.subTest(has_sources=has_sources), Root() as root:
+                work = root.layout.work
+                unrelated = work / '.rsi-kept-sources.json'
+                unrelated.write_bytes(b'my versioned file')
+                (work / 'tools/literature').mkdir(parents=True)
+                registry = work / 'tools/literature/sources.json'
+                if has_sources:
+                    registry.write_bytes(b'{"my local catalog": {}}')
+                with patch('rsi.install_literature.write_home_config'):
+                    before, after = install_literature(root.layout, SEED)
+                    self.assertEqual(install_literature(root.layout, SEED), (after, after))
+                self.assertNotEqual(before, after)
+                self.assertEqual(unrelated.read_bytes(), b'my versioned file')
+                self.assertEqual(registry.exists(), has_sources)
+                if has_sources:
+                    self.assertEqual(registry.read_bytes(), b'{"my local catalog": {}}')
+
+    @needs_codex
+    def test_install_records_a_failed_config_refresh_and_retries_without_a_new_version(self):
+        with Root() as root:
+            config = root.layout.lab_home / 'config.toml'
+            config.mkdir()
+            for outcome in ('installed_but_config_not_updated', 'unchanged_but_config_not_updated'):
+                code, out, err = run('install-literature')
+                self.assertEqual((code, out), (1, ''), err)
+                self.assertIn('work/ holds V0002', err)
+                self.assertIn('run rsi install-literature again', err)
+                self.assertIn('codex-home/config.toml', err)
+                note = notes(root, NOTE)[-1]
+                self.assertEqual((note['outcome'], note['version']), (outcome, 'V0002'))
+                self.assertTrue(any('config.toml' in line for line in note['lines']))
+                self.assertTrue((root.layout.work / 'tools/literature/server.py').is_file())
+                self.assertEqual(root.store.head(), 'V0002')
+            config.rmdir()
+            code, out, err = run('install-literature')
+            self.assertEqual((code, err), (0, ''), out)
+            self.assertEqual(notes(root, NOTE)[-1]['outcome'], 'unchanged')
+            self.assertIn('literature', tomllib.loads(config.read_text())['mcp_servers'])
+            self.assertEqual(root.store.head(), 'V0002')
+
+    @needs_codex
+    def test_upgraded_meta_verifies_literature_evidence_with_custom_owner_instructions(self):
+        with Root() as root:
+            owner = root.layout.owner / 'meta/AGENTS.md'
+            owner.parent.mkdir(exist_ok=True)
+            custom = 'Record uncertainty in every decision.\n'
+            owner.write_text(custom)
+            code, out, err = run('install-literature')
+            self.assertEqual((code, err), (0, ''), out)
+            root.model.push(say(decision('no_change')))
+            self.assertEqual(run_round(root.layout, [])['outcome'], 'no_change')
+            prompt = (root.records.call_dir('R0001') / 'prompt.txt').read_text()
+            self.assertTrue(prompt.startswith(custom))
+            self.assertIn('literature.jsonl attachment comes from a log the Lab can write', prompt)
+            self.assertIn('receipt in the recorded sessions/', prompt)
+            library = root.layout.library
+            self.assertIn(f'archived original in ../{library.name}/', prompt)
+            self.assertEqual((root.layout.meta / '..' / library.name).resolve(), library)
+            self.assertEqual(meta_config(root.layout, {'features': {}}, {})['permissions']['meta']['filesystem']
+                             [str(library)], 'read')
+            self.assertEqual(owner.read_text(), custom)
 
     def test_a_failure_to_read_the_newest_version_still_puts_work_back(self):
         with Root() as root:

@@ -32,6 +32,7 @@ XML_QUOTE_IN_ABSTRACT = (f'<article><front><article-meta><article-id pub-id-type
 
 class Fixture(unittest.TestCase):
     xml = XML
+    task = "lit-service"
 
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -87,8 +88,11 @@ class Fixture(unittest.TestCase):
                                       "result": {"content": [{"type": "text", "text": json.dumps(result)}],
                                                  "isError": False}}))
 
+    def outputs(self):
+        return {"out/answer.json": json.dumps(self.answer).encode()}
+
     def save(self):
-        files = {"out/answer.json": json.dumps(self.answer).encode(), "literature.jsonl": self.runtime.logfile.read_bytes()}
+        files = {**self.outputs(), "literature.jsonl": self.runtime.logfile.read_bytes()}
         for name, ev in ((self.lead, self.parent_events), (self.child, [self.child_meta, *self.events])):
             files[f"sessions/rollout-dummy-{name}.jsonl"] = b"".join(json.dumps(row).encode() + b"\n" for row in ev)
         hashes = {}
@@ -96,7 +100,7 @@ class Fixture(unittest.TestCase):
             (self.record / name).write_bytes(raw)
             hashes[name] = hashlib.sha256(raw).hexdigest()
         call = {"id": self.record.name, "version_before": "V0001", "status": "finished", "purpose": "task",
-                "task": "lit-service", "check": {"passed": True}, "files": hashes,
+                "task": self.task, "check": {"passed": True}, "files": hashes,
                 "subagent_threads": [self.child], "thread_id": self.lead}
         (self.record / "call.json").write_text(json.dumps(call))
 
@@ -290,3 +294,91 @@ class QuoteOutsideBody(Fixture):
         self.assertEqual(self.block["section_path"][:1], ["Abstract"])
         with self.assertRaisesRegex(ValueError, "body locator"):
             audit.audit(self.record, self.library)
+
+
+class PairedEvidence(Fixture):
+    task = "paired-validation"
+
+    def outputs(self):
+        return {"out/evidence.json": json.dumps(self.evidence).encode(), "out/report.md": "研究备忘录".encode()}
+
+    def setUp(self):
+        self.evidence = []
+        super().setUp()
+        self.evidence.append({**self.answer, "claim": "Format of the first paper"})
+        doi, quote = "10.1234/second", "paired β measurements"
+        raw = (f'<article><front><article-meta><article-id pub-id-type="doi">{doi}</article-id>'
+               f'</article-meta></front><body><sec><title>Étude</title><p>Café: {quote}.</p>'
+               '</sec></body></article>').encode()
+        article = self.runtime.ingest(raw, "application/xml", {})
+        doc = article["document_id"]
+        self.block2 = next(b for b in article["blocks"] if quote in b["text"])
+        self.evidence.append({"doi": doi, "quote": quote, "locator": self.block2["locator"], "claim": "Paired measures",
+                              **{k: article[k] for k in ("document_id", "document_version", "source_sha256")}})
+        first = self.runtime.store.read(doc, locator=self.block2["locator"], max_bytes=12)
+        self.call("read_document", {"document_id": doc, "locator": self.block2["locator"], "max_bytes": 12}, first)
+        args = {"document_id": doc, "cursor": first["next_cursor"]}
+        self.call("read_document", args, self.runtime.store.read(doc, cursor=args["cursor"]))
+        self.save()
+
+    def replay(self):
+        return audit.audit(self.record, self.library, self.task)
+
+    def test_two_sources_and_paginated_child_receipts(self):
+        result = self.replay()
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["papers"], 2)
+        verified = result["rows"][1]
+        self.assertEqual(verified["child"], self.child)
+        self.assertEqual(len(verified["invocations"]), 2)
+        quote = self.evidence[1]["quote"]
+        position = self.block2["text"].index(quote)
+        at = self.block2["char_range"][0] + position
+        byte_at = self.block2["byte_range"][0] + len(self.block2["text"][:position].encode())
+        self.assertEqual(verified["char_range"], [at, at + len(quote)])
+        self.assertEqual(verified["byte_range"], [byte_at, byte_at + len(quote.encode())])
+
+    def test_lead_reread_and_matching_tool_log_cannot_fill_a_child_receipt_gap(self):
+        self.parent_events.append(self.events[-1])
+        self.save()
+        with self.assertRaisesRegex(ValueError, "child read receipt"):
+            self.replay()
+
+    def test_correct_child_receipt_still_needs_its_own_matching_logged_passage(self):
+        invocation = json.loads(self.events[-1]["payload"]["item"]["result"]["content"][0]["text"])["invocation_id"]
+
+        def drop_passage(row):
+            if row["invocation_id"] == invocation:
+                row["evidence"] = []
+
+        self.edit_log("read_document", drop_passage)
+        with self.assertRaisesRegex(ValueError, "child read receipt"):
+            self.replay()
+
+    def test_byte_range_must_match_source_even_when_receipt_and_log_agree(self):
+        item = self.events[-1]["payload"]["item"]
+        part = item["result"]["content"][0]
+        result = json.loads(part["text"])
+        result["data"]["passages"][0]["byte_range"] = [0, 1]
+        part["text"] = json.dumps(result)
+        invocation = result["invocation_id"]
+
+        def wrong_bytes(row):
+            if row["invocation_id"] == invocation:
+                for entry in row["evidence"]:
+                    if "byte_range" in entry:
+                        entry["byte_range"] = [0, 1]
+
+        self.edit_log("read_document", wrong_bytes)
+        with self.assertRaisesRegex(ValueError, "child read receipt"):
+            self.replay()
+
+    def test_each_evidence_row_must_match_jats_doi_and_two_distinct_papers_are_required(self):
+        self.evidence[1]["doi"] = "10.1234/wrong"
+        self.save()
+        with self.assertRaisesRegex(ValueError, "Cited DOI"):
+            self.replay()
+        self.evidence[1] = self.evidence[0]
+        self.save()
+        with self.assertRaisesRegex(ValueError, "two distinct"):
+            self.replay()

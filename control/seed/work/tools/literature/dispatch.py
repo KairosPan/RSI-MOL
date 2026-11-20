@@ -7,6 +7,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -164,7 +165,48 @@ def public_location(url):
     return host
 
 
-def media_format(raw, content_type, declared):
+def _xml_identifiers(raw, paper):
+    """Parse the complete download and compare IDs of the article itself to the provider's resolved record."""
+    root = ET.fromstring(raw)
+    tag = root.tag.rsplit('}', 1)[-1].lower()
+    if tag == 'tei':
+        bib = './{*}teiHeader/{*}fileDesc/{*}sourceDesc/{*}biblStruct/'
+        identifiers = [(node.get('type'), node) for path in ('{*}idno', '{*}analytic/{*}idno')
+                       for node in root.findall(bib + path)]
+    else:
+        if tag in {'article-set', 'pmc-articleset'}:
+            articles = root.findall('./{*}article')
+            if len(articles) != 1:
+                raise ValueError('Expected one article at the full-text location')
+            root = articles[0]
+        elif tag != 'article':
+            raise ValueError('The XML response does not contain an article')
+        identifiers = [(node.get('pub-id-type'), node)
+                       for node in root.findall('./{*}front/{*}article-meta/{*}article-id')]
+
+    verified = set()
+    for kind, node in identifiers:
+        kind = (kind or '').strip().lower()
+        value = ''.join(node.itertext()).strip()
+        if kind in {'pmc', 'pmcaid', 'pmcid'}:
+            kind = 'pmcid'
+            observed = providers._pmcid('PMC' + value if value.isdecimal() else value)
+        elif kind == 'pmid':
+            observed = providers._pmid(value)
+        elif kind == 'doi':
+            observed = providers._doi(value)
+        else:
+            continue
+        expected = paper.get(kind)   # normalized by ProviderClient when it resolves the requested paper
+        if expected and observed:
+            if expected.casefold() != observed.casefold():
+                raise remote.RemoteError('identity_mismatch', f'The article {kind.upper()} differs from the '
+                                         'provider record.', dispatched=True)
+            verified.add(kind)
+    return sorted(verified)
+
+
+def media_format(raw, content_type, declared, paper):
     media = content_type.split(';')[0].strip().lower()
     if declared == 'pdf':
         if media == 'application/pdf' and raw.lstrip().startswith(b'%PDF-'):
@@ -173,20 +215,12 @@ def media_format(raw, content_type, declared):
             if PDF_END not in raw.rstrip()[-PDF_END_WINDOW:]:
                 raise remote.RemoteError('incomplete_body', 'The PDF ends before its end-of-file marker',
                                          dispatched=True)
-            return media
+            return media, []
     elif declared in XML_FORMATS:
         if media in XML_TYPES and b'<!ENTITY' not in raw.replace(b'\0', b'').upper():
-            # The upstream reader also validates the document. Check the root here to avoid
-            # treating an HTML error page or a non-article XML response as a full-text original.
-            parser = ET.XMLPullParser(events=('start',))
-            for step in range(0, len(raw), 4096):
-                parser.feed(raw[step:step + 4096])
-                for _, root in parser.read_events():
-                    if root.tag.split('}')[-1].lower() in {'article', 'article-set', 'tei', 'pmc-articleset'}:
-                        return 'application/xml'
-                    raise ValueError('The XML response does not contain an article')
+            return 'application/xml', _xml_identifiers(raw, paper)
     elif declared == 'html' and media in {'text/html', 'application/xhtml+xml'}:
-        return 'text/html'
+        return 'text/html', []
     raise ValueError('Full-text bytes or media type do not match the selected format')
 
 
@@ -280,27 +314,61 @@ class Literature:
             response = failure(code, 'No accessible candidate matches this request.', provider=provider,
                                status='unavailable')
         else:
-            candidate = min(available, key=lambda c: (c['format'] not in XML_FORMATS, c['format'] != 'pdf'))
-            try:
-                response = self._fetch(candidate, args['paper_ref'], provider, receipt)
-            except documents.DocumentError as exc:
-                status = 'unavailable' if exc.code == 'trial_cache_miss' else 'failed'
-                response = failure(exc.code, str(exc), provider=provider, status=status)
-            except OSError:
-                response = failure('source_storage_error', 'The downloaded original could not be stored.',
-                                   provider=provider)
+            response = self._acquire_candidates(available, args['paper_ref'], found['data'].get('paper', {}),
+                                                provider, receipt)
         response['provenance'].update(receipt)
         return response
 
-    def _fetch(self, candidate, paper_ref, provider, receipt):
+    def _acquire_candidates(self, candidates, paper_ref, paper, provider, receipt):
+        """Try the preferred locations first. All downloads and redirects share the same time budget."""
+        deadline = time.monotonic() + TIMEOUT
+        receipt['download_attempts'] = []
+        fallback = None  # keep an archived original, or a trial cache miss, ahead of a later HTTP failure
+        for candidate in sorted(candidates, key=lambda c: (c['format'] not in XML_FORMATS, c['format'] != 'pdf')):
+            if time.monotonic() >= deadline:
+                return fallback or failure('timeout', 'The full-text download time limit expired.',
+                                           provider=provider, status='unavailable')
+            attempt = {'format': candidate['format']}
+            receipt['download_attempts'].append(attempt)
+            try:
+                response = self._fetch(candidate, paper_ref, paper, provider, receipt, attempt, deadline)
+            except documents.DocumentError as exc:
+                status = 'unavailable' if exc.code == 'trial_cache_miss' else 'failed'
+                response = failure(exc.code, str(exc), provider=provider, status=status)
+                if exc.code == 'trial_cache_miss' and fallback is None:
+                    fallback = response
+            except OSError:
+                response = failure('source_storage_error', 'The downloaded original could not be stored.',
+                                   provider=provider)
+            data = response['data']
+            if 'document_id' in data:
+                if response['status'] == 'ok' or data.get('next_step') == PDF_NEXT_STEP:
+                    attempt['outcome'] = 'acquired'
+                    return response
+                attempt['outcome'] = data['reason']['code']
+                if fallback is None or 'document_id' not in fallback['data']:
+                    fallback = response
+            else:
+                attempt['outcome'] = response['errors'][0]['code']
+                if response['status'] != 'unavailable':
+                    return response
+        return fallback or response
+
+    def _fetch(self, candidate, paper_ref, paper, provider, receipt, attempt, deadline):
         url = candidate['url']
         try:
             for _ in range(3):
                 host = self.resolve(url)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise remote.RemoteError('timeout', 'The full-text download time limit expired.')
+                attempt['host'] = host
+                attempt.pop('http_status', None)  # a redirect's status does not describe the new hop
                 receipt['download_hosts'].append(host)
                 receipt['attempt_count'] += 1
                 reply = self.http('GET', url, {'Accept': 'application/xml, application/pdf, text/html',
-                                  'User-Agent': 'RSI-MOL-Literature/1.0'}, None, TIMEOUT, DOWNLOAD_BYTES)
+                                  'User-Agent': 'RSI-MOL-Literature/1.0'}, None, remaining, DOWNLOAD_BYTES)
+                attempt['http_status'] = reply['status']
                 headers = {k.lower(): v for k, v in reply['headers'].items()}
                 if reply['status'] in {301, 302, 303, 307, 308} and headers.get('location'):
                     url = urllib.parse.urljoin(url, headers['location'])
@@ -312,7 +380,7 @@ class Literature:
                 if not isinstance(raw, bytes) or not 0 < len(raw) <= DOWNLOAD_BYTES:
                     raise ValueError('Full-text response is empty or exceeds its byte limit')
                 content_type = headers.get('content-type', '')
-                media = media_format(raw, content_type, candidate['format'])
+                media, identifiers = media_format(raw, content_type, candidate['format'], paper)
                 break
             else:
                 raise ValueError('Full-text redirect limit reached')
@@ -324,7 +392,10 @@ class Literature:
         manifest = self.runtime.ingest(raw, media, {'provider': provider, 'paper_ref': paper_ref,
             'source_url': url, 'acquired_media_type': content_type, 'content_scope': 'unknown',
             'provider_reported_scope': candidate.get('content_scope', 'unknown')})
-        return _pdf_next_step(local(self.runtime.store.reading_package(manifest['document_id']), provider))
+        response = _pdf_next_step(local(self.runtime.store.reading_package(manifest['document_id']), provider))
+        # This describes the download check. Keep the archived manifest and document identity compatible with V0006.
+        response['coverage'] = {**response['coverage'], 'verified_paper_identifiers': identifiers}
+        return response
 
     def _asta(self, name, args):
         spec = catalog.PROVIDERS['asta']
@@ -342,7 +413,7 @@ class Literature:
             response['coverage'] = {'scope': 'provider_tool_response', 'original_paper_read': False}
             response['continuation'] = {'next_cursor': data.get('next_cursor'),
                                         'complete_for_query': not data.get('next_cursor') and not data.get('isError')}
-        response['provenance']['attempt_count'] = client.attempt_count
+        response['provenance'].update(self.contacted(), attempt_count=client.attempt_count)
         return response
 
     def _document(self, name, args, invocation_id):
