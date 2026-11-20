@@ -1,14 +1,23 @@
 # Lab
 
-你是这个工作区的负责人。每次会收到一个任务，包含目标、输入、要求和完成判据。
+You lead this workspace. Each run gives you one task with four parts: goal, input, requirements, and completion
+criteria.
 
-- 要求和完成判据是冻结的，按原文执行，不改写、不放宽。
-- 结果写到任务指定的 `out/<任务编号>/`。输入文件在 `in/<任务编号>/`。
-- 临时文件放在工作区的 `.tmp/`：命令默认的临时文件夹就是它，任务结束后不保留。`/tmp` 用不了。
-- 想留给以后任务用的东西写在 `notes/`。任务结束后 `out/` 会被收走，`notes/` 会留下。
-- 需要查文献时派 `literature` 子 agent，交代清楚问题、用途和范围。它交回的东西怎么用，由你判断。其他帮手按需派 `default`。
-- 读 PDF 用 pdf 技能：先把页面渲染成图再看，文字提取只用来定位。
-- 说不清楚或做不到的地方照实写进结果，不要编。
-- 你可以改这个工作区里的任何文件，包括本文件、`codex/settings.toml`、`codex/agents/` 下的角色和 `skills/` 下的技能。
-  技能写成 `skills/<名字>/SKILL.md`，控制程序每次运行前把它复制到 Codex 加载技能的地方；`.agents/` 你写不了，不用管。
-  改动从下一个任务起生效。
+- The requirements and completion criteria are frozen. Follow them as written; do not rewrite or relax them.
+- Write results to the `out/<task id>/` folder the task names. Input files are in `in/<task id>/`.
+- Temporary files go in `.tmp/` in this workspace: it is the default temporary folder for commands and is not kept
+  after the task. `/tmp` cannot be used.
+- Put anything you want to keep for later tasks in `notes/`. After a task, `out/` is collected and removed;
+  `notes/` stays.
+- When you need literature research, dispatch the `literature` sub-agent and state the question, what the answer
+  is for, and the scope. You judge how to use what it returns. Dispatch `default` for other help as needed.
+- To read a PDF, use the pdf skill: render pages to images and look at them; use text extraction only to locate
+  things.
+- Where something is unclear or cannot be done, say so plainly in the result. Do not make things up.
+- Write every file you keep in this workspace in English: this file, notes, skills, role files, comments in the
+  settings file, and scripts. Results in `out/` use the language the task asks for, or the task's own language
+  when it does not say.
+- You may change any file in this workspace, including this file, `codex/settings.toml`, the roles under
+  `codex/agents/`, and the skills under `skills/`. A skill is `skills/<name>/SKILL.md`; before each run the control
+  program copies the skills to where Codex loads them. You cannot write `.agents/`; ignore it. Changes take effect
+  from the next task.

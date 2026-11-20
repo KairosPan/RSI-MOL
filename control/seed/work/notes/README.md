@@ -1,1 +1,1 @@
-Lab 的笔记放在这里。
+The Lab's notes go here.

@@ -1,40 +1,50 @@
-# Lab Codex 的设置。控制程序每次启动 Lab 前，把这里写的键合成进 Codex 的配置。
-# 只认下面这些键；写了别的键不生效，会记在那次运行的记录里。不写的键用默认值。
-# 下面的例子都注释掉了，要用哪个，就去掉那几行开头的 "# "，再改成你要的值。
+# Settings of the Lab's Codex. Each time before it starts the Lab, the control program merges the keys written here
+# into Codex's configuration.
+# Only the keys below are accepted; any other key has no effect and is noted in the record of that run. A key that is
+# not written keeps its default value.
+# The examples below are all commented out. To use one, remove the "# " at the start of its lines, then change the
+# values to the ones you want.
 
-# 模型名。不写就用 Codex 的默认模型。
-# model = "<模型名>"
+# The model name. If it is not written, Codex's default model is used.
+# model = "<model name>"
 
-# 推理强度：none、minimal、low、medium、high、xhigh 之一。不写就用 Codex 的默认值。
+# Reasoning effort: one of none, minimal, low, medium, high, xhigh. If it is not written, Codex's default is used.
 # model_reasoning_effort = "high"
 
-# 网页搜索：live（实时搜）、cached（用缓存的结果）、disabled（关掉）之一。不写就用 Codex 的默认值。
+# Web search: one of live (search live), cached (use cached results), disabled (turned off). If it is not written,
+# Codex's default is used.
 # web_search = "live"
 
-# 命令联网：true 打开，false 关闭（默认关闭）。打开后命令经网络代理连外网，这台 Mac 上的本地服务仍然连不上。
+# Network for commands: true turns it on, false turns it off (off by default). When it is on, commands reach outside
+# networks through a network proxy; local services on this Mac still cannot be reached.
 # network = true
 
-# 子 agent：max_depth 是最多套几层（1 到 3，默认 1，即子 agent 不再派子 agent），
-# max_threads 是同时最多开几个（1 到 8，默认 3）。
+# Sub-agents: max_depth is how many levels deep they may nest (1 to 3, default 1, that is, a sub-agent dispatches no
+# further sub-agents), and max_threads is how many may run at once (1 to 8, default 3).
 # [agents]
 # max_depth = 2
 # max_threads = 4
 
-# 在已允许的连接器和插件里关掉某几个，写它们的编号。这些编号 Lab 自己看不到；Meta 能在运行记录里读到。
+# To turn off some of the allowed connectors and plugins, write their ids. The Lab cannot see these ids itself; Meta
+# can read them in the run records.
 # [disable]
-# connectors = ["<连接器编号>"]
-# plugins = ["<插件编号>"]
+# connectors = ["<connector id>"]
+# plugins = ["<plugin id>"]
 
-# 本地工具服务，名字写在 tool_servers. 后面（字母、数字、_ 和 -，不能含 codex）。代码放在 tools/<名字>/。
-# command 是要运行的程序，args 是参数（工作区里的文件写相对路径），network 是它要不要联网（默认 false）。
-# 它和 Lab 的命令在同一个沙箱里启动。
+# A local tool server: write its name after "tool_servers." (letters, digits, _ and -; it may not contain codex). Its
+# code goes in tools/<name>/.
+# command is the program to run, args are its arguments (give files in the workspace as relative paths), and network
+# is whether it uses the network (default false).
+# It is started in the same sandbox as the Lab's commands.
 # [tool_servers.local_tool]
 # command = "python3"
 # args = ["tools/local_tool/server.py"]
 # network = true
 
-# 按网址连接的工具服务：url 只能是 https 加域名，不能指向这台 Mac 或局域网。
-# 要密钥的话，bearer_token_env_var 写环境变量的名字（以 RSI_TOOL_ 开头）；这个密钥能发给哪个域名由主人定。
+# A tool server reached at a URL: url must be https with a domain name, and may not point to this Mac or the local
+# network.
+# If it needs a key, write in bearer_token_env_var the name of the environment variable that holds it (starting with
+# RSI_TOOL_); the owner decides which domain the key may be sent to.
 # [tool_servers.web_tool]
 # url = "https://example.com/mcp"
 # bearer_token_env_var = "RSI_TOOL_WEB"

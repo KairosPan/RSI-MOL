@@ -27,7 +27,17 @@ TASKS = SEED.parents[1] / 'tasks'
 META_TEXT = SEED / 'owner' / 'meta' / 'AGENTS.md'
 WORK_FILES = ['AGENTS.md', 'codex/agents/literature.toml', 'codex/settings.toml', 'notes/README.md']
 OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
-LAB_LEAD_FILES = ['control/seed/work/AGENTS.md', 'control/seed/work/codex/agents/literature.toml']
+# CJK punctuation, CJK ideographs, full-width forms: none may be in the Lab's seed workspace, which is all English.
+CJK = re.compile('[　-〿一-鿿＀-￯]')
+# What the English Lab seed calls the human owner and the Lab lead, and the files that name each (the role file
+# speaks of the lead; only the settings file speaks of the owner).
+NAMES = re.compile(r'\bthe (owner|lead)\b', re.IGNORECASE)
+NAMED = {'AGENTS.md': [], 'codex/agents/literature.toml': ['lead'], 'codex/settings.toml': ['owner'],
+         'notes/README.md': []}
+# The rule of Meta's standing instructions that keeps the Lab workspace in English, and the bullet it follows.
+ENGLISH_RULE = ('- Lab 工作区里留下的文件一律用英文写：指示、技能、角色、设置里的注释、脚本。'
+                '你在 `../candidate/` 里的改动用英文，你自己的笔记也用英文。')
+DISABLE_RULE = '- 要关掉已允许的某个连接器或插件'
 # A commented-out example line of the seed's settings.toml: a table header or `key = value`, after '# '.
 EXAMPLE = re.compile(r'# (\[[a-z_.]+\]|[a-z_]+ = .+)')
 IDS = '\n[apps.conn_a]\nenabled = true\n\n[plugins."pdf@x"]\nenabled = true\n'     # allowed connector and plugin
@@ -143,15 +153,32 @@ class Seed(unittest.TestCase):
                          [('apps', True), ('plugins', True)])
 
     def test_the_lab_leads_word_is_never_used_for_the_owner(self):
-        """负责人 is only the Lab lead, in the Lab's own seed files; the owner is 主人 wherever Meta reads it."""
+        """负责人 (the Lab lead) appears nowhere in the program, the tasks or the seed: the owner is 主人 wherever Meta
+        reads it. In the English Lab seed the owner is "the owner", and "the lead" is only ever the Lab lead."""
         repo = SEED.parents[1]
         paths = [repo / 'rsi', *(path for top in ('control/rsi', 'control/seed', 'tasks')
                                  for path in (repo / top).rglob('*'))]
         found = sorted(path.relative_to(repo).as_posix() for path in paths
                        if path.is_file() and '__pycache__' not in path.parts and '负责人'.encode() in path.read_bytes())
-        self.assertEqual(found, LAB_LEAD_FILES)
+        self.assertEqual(found, [])
         for text in (DECISION_GUIDE, DEFAULT_INSTRUCTIONS, META_TEXT.read_text(encoding='utf-8')):
             self.assertIn('由主人决定', text)
+        texts = {name: (SEED / 'work' / name).read_text(encoding='utf-8') for name in WORK_FILES}
+        named = {name: sorted({word.lower() for word in NAMES.findall(text)}) for name, text in texts.items()}
+        self.assertEqual(named, NAMED)
+        self.assertIn('the owner decides', (SEED / 'work' / SETTINGS).read_text(encoding='utf-8'))
+
+    def test_the_lab_seed_is_all_english(self):
+        for name in files(SEED / 'work'):
+            with self.subTest(name=name):
+                self.assertIsNone(CJK.search((SEED / 'work' / name).read_text(encoding='utf-8')))
+
+    def test_meta_is_told_to_keep_the_lab_workspace_in_english(self):
+        """The rule is the bullet right after the one on turning off a connector or plugin."""
+        lines = META_TEXT.read_text(encoding='utf-8').splitlines()
+        disable = next(index for index, line in enumerate(lines) if line.startswith(DISABLE_RULE))
+        self.assertEqual(next(line for line in lines[disable + 1:] if line.startswith('- ')), ENGLISH_RULE)
+        self.assertEqual(lines.count(ENGLISH_RULE), 1)
 
     def test_a_root_initialised_from_the_seed_has_it_as_v0001(self):
         tmp = Path(tempfile.mkdtemp()).resolve()
