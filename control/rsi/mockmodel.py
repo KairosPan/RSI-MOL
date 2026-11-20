@@ -33,6 +33,13 @@ def run_js(source: str) -> list[dict]:
              'input': source}]
 
 
+def run_command(command: str) -> list[dict]:
+    """One call of the `exec` tool that runs a shell command through Codex's shell tool, `exec_command` (the path
+    the model's commands take), without a login shell; the tool's result (exit code, output) is the exec output."""
+    return run_js('text(JSON.stringify(await tools.exec_command(' + json.dumps({'cmd': command, 'login': False})
+                  + ')));\n')
+
+
 def _apply_patch(body: str) -> list[dict]:
     patch = '*** Begin Patch\n' + body + '*** End Patch\n'
     return run_js('await tools.apply_patch(' + json.dumps(patch) + ');\n')

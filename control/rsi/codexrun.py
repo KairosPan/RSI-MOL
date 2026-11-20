@@ -152,8 +152,10 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
     if resume is not None:
         safe_id(resume, 'thread id')
     last_message = record_dir / 'last-message.txt'
+    # --ignore-user-config skips only $CODEX_HOME/config.toml; --ignore-rules also skips the saved command rules
+    # ($CODEX_HOME/rules/*.rules), where an `allow` rule the owner approved by hand could run a command unsandboxed.
     command = [codex_program(), '--no-daemon', 'exec', *(['resume'] if resume is not None else []),
-               '--skip-git-repo-check', '--json', '--ignore-user-config', *render_flags(config),
+               '--skip-git-repo-check', '--json', '--ignore-user-config', '--ignore-rules', *render_flags(config),
                *(['--output-schema', str(schema)] if schema is not None else []),
                '-o', str(last_message), *([resume] if resume is not None else []), '-']
 

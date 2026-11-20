@@ -27,7 +27,12 @@ WANTED = (('lab', 'read_records'), ('lab_net', 'local_tcp'), ('lab_net', 'local_
           ('lab', 'delete_existing_record'), ('meta', 'edit_dot_codex'), ('lab', 'edit_dot_codex'),
           ('lab', 'edit_dot_agents'), ('meta', 'edit_dot_agents'), ('lab', 'update_inside'), ('meta', 'delete_inside'),
           ('lab', 'read_control'), ('meta', 'read_control'), ('lab', 'read_meta'), ('trial_net', 'read_meta'),
-          ('lab_net', 'read_trial'), ('meta', 'read_trial'), ('trial', 'write_tools'), ('meta', 'write_tools'))
+          ('lab_net', 'read_trial'), ('meta', 'read_trial'), ('trial', 'write_tools'), ('meta', 'write_tools'),
+          # shell commands through `codex exec`, the path the agents' commands take
+          ('lab', 'shell_write_inside'), ('lab', 'shell_write_records'), ('lab', 'shell_read_task_check'),
+          ('lab', 'shell_read_owner'), ('lab', 'shell_allow_rule_outside'), ('lab', 'shell_rules_not_loaded'),
+          ('meta', 'shell_write_inside'), ('meta', 'shell_write_work'), ('meta', 'shell_write_records'),
+          ('meta', 'shell_read_owner'), ('meta', 'shell_allow_rule_outside'), ('meta', 'shell_rules_not_loaded'))
 # Every create case tries mkdir, rename-to and a link, for three letter cases, in every writable root of its profile:
 # lab work/, library/, env/; trial trial/; meta meta/, candidate/.
 CREATE_ATTEMPTS = {'lab': 27, 'lab_net': 27, 'trial': 9, 'trial_net': 9, 'meta': 18}
@@ -106,8 +111,9 @@ class Check(unittest.TestCase):
         with Root(passed_check=False) as root, mock.patch('rsi.compose.root_rule', return_value='read'):
             report = run_check(root.layout)
             self.assertFalse(report['passed'])
-            self.assertIn(('lab', 'read_records', 'allowed'), [(r['profile'], r['name'], r['observed'])
-                                                              for r in report['results']])
+            observed = [(r['profile'], r['name'], r['observed']) for r in report['results']]
+            self.assertIn(('lab', 'read_records', 'allowed'), observed)
+            self.assertIn(('lab', 'shell_read_owner', 'allowed'), observed)          # seen through `codex exec` too
             self.assertIsNotNone(gate(root.layout))
             self.assertEqual(scratch_left(root), [])
 

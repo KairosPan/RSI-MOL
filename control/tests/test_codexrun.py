@@ -13,8 +13,13 @@ from unittest import mock
 from urllib.parse import urlsplit
 
 from rsi.codexrun import _stop, codex_version, run_codex
-from rsi.mockmodel import ScriptedModel, add_file, delete_file, hang_up, provider_config, run_js, say, slow, with_usage
+from rsi.mockmodel import (ScriptedModel, add_file, delete_file, hang_up, provider_config, run_command, run_js, say,
+                           slow, with_usage)
 from tests.support import needs_codex, scratch_config
+
+# Saved command rules, as Codex writes them when the owner answers "don't ask again" in a manual session.
+RULES = ('prefix_rule(pattern = ["touch"], decision = "allow")\n'
+         'prefix_rule(pattern = ["mkdir"], decision = "forbidden")\n')
 
 
 def post(base_url: str, body: dict, timeout: float = 10) -> tuple[str, list[tuple[str, dict]]]:
@@ -255,6 +260,33 @@ class CodexRun(unittest.TestCase):
         self.assertTrue((self.work / 'inside.txt').is_file())
         self.assertFalse((self.tmp / 'records' / 'outside.txt').exists())
 
+    def test_saved_command_rules_of_the_home_are_not_loaded(self):
+        # Besides config.toml, Codex reads <CODEX_HOME>/rules/*.rules, and an `allow` rule there may run a command
+        # outside the sandbox. A `forbidden` rule shows whether the rules were loaded at all.
+        records = self.tmp / 'records'; records.mkdir()
+        rules = self.tmp / 'home' / 'rules'; rules.mkdir(parents=True)
+        (rules / 'default.rules').write_text(RULES)
+
+        def script(tag: str) -> list:
+            return [run_command(f'mkdir {self.work / ("made-" + tag)}'),
+                    run_command(f'touch {self.work / ("inside-" + tag)} {records / ("outside-" + tag)}'), say('done')]
+        self.model.push(*script('rsi'))
+        result = self.call('r9')
+        self.assertEqual(result.status, 'finished'); self.assertIn('--ignore-rules', result.command)
+        self.assertTrue((self.work / 'made-rsi').is_dir(), self.model.requests[-1]['input'][-1])   # not loaded
+        self.assertTrue((self.work / 'inside-rsi').exists()); self.assertFalse((records / 'outside-rsi').exists())
+        # The control: started without the flag, this Codex does load the rules (the forbidden mkdir is refused), so
+        # the run above measured something.
+        real = subprocess.Popen
+
+        def without_the_flag(command, **options):
+            return real([arg for arg in command if arg != '--ignore-rules'], **options)
+        self.model.push(*script('control'))
+        with mock.patch('rsi.codexrun.subprocess.Popen', without_the_flag):
+            self.call('r10')
+        self.assertFalse((self.work / 'made-control').exists())
+        self.assertFalse((records / 'outside-control').exists())
+
     def test_timeout(self):
         self.model.push(slow(30, say('late')))
         started = time.time(); result = self.call('r3', timeout=3)
@@ -285,6 +317,8 @@ class CodexRun(unittest.TestCase):
         self.assertEqual(self.model.requests[0]['text']['format']['type'], 'json_schema')
         second = self.call('r6', resume=first.thread_id)
         self.assertEqual(second.thread_id, first.thread_id); self.assertEqual(second.last_message, 'second')
+        self.assertEqual(second.command[second.command.index('resume'):][:5],
+                         ['resume', '--skip-git-repo-check', '--json', '--ignore-user-config', '--ignore-rules'])
         self.assertGreaterEqual(sum(1 for i in self.model.requests[-1]['input'] if i.get('role') == 'user'), 2)
 
 
