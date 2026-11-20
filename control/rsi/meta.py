@@ -35,7 +35,7 @@ from rsi.compose import load_envelope, meta_config, tool_server_problems, write_
 from rsi.decision import SCHEMA, Decision, parse_decision
 from rsi.labrun import (WORKSPACE_ERRORS, admit, discard, dispose, end_interrupted, move_in, noting_refusals, now,
                         open_store, problem, process_recorder, refusing, rename_in, restore_work, root_descriptor,
-                        run_trial, stage, stamp, take_work, usable_codex_version)
+                        run_trial, stage, stamp, take_work, unrecovered, usable_codex_version)
 from rsi.limits import Limits
 from rsi.paths import Layout, Refused
 from rsi.records import CALL_ID, Records
@@ -721,6 +721,7 @@ def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo)
         records.call_dir(call_id)                       # ValueError for anything but a call id
     context = {'purpose': 'meta'}
     with noting_refusals(records, context), root_descriptor(layout) as root_fd:
+        unrecovered(layout, records)
         limits, calls = admit(layout, records)
         store = open_store(layout)
         envelope = load_envelope(layout.owner)
@@ -759,6 +760,7 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
     records = Records(layout.records)
     context = {'command': 'rollback', 'version': version}
     with noting_refusals(records, context), root_descriptor(layout) as root_fd:
+        unrecovered(layout, records)
         store = open_store(layout)
         store.resolve(version)
         envelope = load_envelope(layout.owner)

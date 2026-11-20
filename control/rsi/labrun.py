@@ -9,12 +9,12 @@ and does everything else on the sealed, static tree: collecting out/<id>/, the c
 commit. A sealed tree is then removed; when something could not be versioned (or it cannot be removed) it is kept
 under sealed/<label>/ with a `sealed` note and a problem line of the call.
 
-run_task: the task, the gate, the owner's daily limits, a version store that can take a new version, the envelope
-and Codex itself are checked first. Then what sat in work/ is sealed and committed as `manual or leftover` (when it
-differs from head), main's head is staged with the task's inputs in in/<id>/ and renamed into work/, the
-configuration is composed from the owner's envelope and that version's settings, and one Codex call runs in work/.
-Afterwards the sealed tree is committed by the Lab, and main's head is staged and renamed into work/ again, so the
-owner can keep opening the Lab Codex there by hand.
+run_task: the task, that no earlier interrupted rsi is left to recover from (unrecovered), the gate, the owner's
+daily limits, a version store that can take a new version, the envelope and Codex itself are checked first. Then
+what sat in work/ is sealed and committed as `manual or leftover` (when it differs from head), main's head is staged
+with the task's inputs in in/<id>/ and renamed into work/, the configuration is composed from the owner's envelope
+and that version's settings, and one Codex call runs in work/. Afterwards the sealed tree is committed by the Lab,
+and main's head is staged and renamed into work/ again, so the owner can keep opening the Lab Codex there by hand.
 
 run_trial does the same in trial/, staged from a given commit, with a task or with a probe text instead, and never
 commits: it is Meta's evidence, cost class `meta`. trial/ is sealed and removed afterwards.
@@ -38,13 +38,13 @@ from rsi.codexrun import codex_version, run_codex
 from rsi.compose import lab_config, load_envelope, tool_server_problems, write_home_config, write_role_files
 from rsi.limits import Limits, load_limits, refusal
 from rsi.paths import Layout, Refused, safe_id
-from rsi.records import Records
+from rsi.records import STARTED, Records
 from rsi.sessions import collect_sessions
 from rsi.settings import Settings, load_settings
 from rsi.skills import materialise
 from rsi.tasks import Task, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
 from rsi.versions import VersionStore
-from rsi.workspace import has_entry, keep, open_folder, prepare_for_commit, remove, seal
+from rsi.workspace import SEALED, has_entry, keep, open_folder, prepare_for_commit, remove, seal
 
 MANUAL = 'manual or leftover'   # author of what is found in work/ before a run: the owner's or a leftover process's
 RESTAGED = '运行后放回 work/ 的最新版本里：'   # before a skill line of the work/ re-staged after a run
@@ -149,6 +149,20 @@ def _root(layout: Layout):
         yield fd
     finally:
         os.close(fd)
+
+
+def unrecovered(layout: Layout, records: Records) -> None:
+    """Refused while an earlier rsi was ended before it could finish and `rsi recover` has not run since: a call
+    still `started` (its Codex may still be running, writing by path into what a next run would use), or a sealed
+    entry still in the root (`.sealed-*`: a tree that was being handled, whose content is in no version). rsi recover
+    stops the first and keeps the second under sealed/. rsi task, rsi meta and rsi rollback check this first."""
+    started = [str(call.get('id')) for call in records.calls() if call.get('status') == STARTED]
+    sealed = sorted(name for name in os.listdir(layout.root) if name.startswith(SEALED))
+    what = [f'调用 {call_id} 还没有结束' for call_id in started[:3]] + [f'{name} 还在 RSI 文件夹里' for name in sealed[:3]]
+    if len(started) + len(sealed) > len(what):
+        what.append(f'另有 {len(started) + len(sealed) - len(what)} 处')
+    if what:
+        raise Refused(f'上一次 rsi 被打断以后还没有收拾：{"；".join(what)}。请先运行 rsi recover，再重试。')
 
 
 def _admit(layout: Layout, records: Records) -> tuple[Limits, list[dict]]:
@@ -373,6 +387,7 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
     records = Records(layout.records)
     context = {'purpose': 'task', 'task': task.id}
     with _noting_refusals(records, context), _root(layout) as root_fd:
+        unrecovered(layout, records)
         limits, calls = _admit(layout, records)
         store = _store(layout)
         envelope = load_envelope(layout.owner)

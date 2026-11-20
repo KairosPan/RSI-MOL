@@ -10,6 +10,7 @@ from unittest import mock
 
 from rsi import labrun, workspace
 from rsi.codexrun import codex_version
+from rsi.init import recover
 from rsi.labrun import run_task, run_trial
 from rsi.mockmodel import add_file, say, slow, with_usage
 from rsi.paths import Refused
@@ -240,7 +241,12 @@ class MoreLabRuns(unittest.TestCase):
             # Codex had ended: the call keeps its status and usage, and says what was not done.
             self.assertEqual((second['status'], second['usage']['input_tokens']), ('finished', 0))
             self.assertTrue(any('KeyboardInterrupt' in line for line in second['problems']))
-            root.model.push(say('ok'))                                       # work/ is missing now: staged again
+            # The collection left its sealed tree in the root and no work/: nothing runs until rsi recover has kept
+            # the tree under sealed/ and put main's head back.
+            with self.assertRaisesRegex(Refused, 'rsi recover'):
+                run_task(root.layout, 'T1')
+            recover(root.layout)
+            root.model.push(say('ok'))
             self.assertEqual(run_task(root.layout, 'T1')['status'], 'finished')
             self.assertEqual((root.layout.work / 'left.txt').read_text(), 'what the interrupted run left')
 

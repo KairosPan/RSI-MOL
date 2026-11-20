@@ -110,17 +110,20 @@ def _merge(base: dict, extra: dict) -> dict:
 
 
 def _stop(process: subprocess.Popen) -> None:
-    """SIGTERM the call's process group, SIGKILL it after KILL_GRACE seconds, and reap the leader."""
+    """SIGTERM the call's process group, SIGKILL it after KILL_GRACE seconds, and reap the leader. The SIGKILL is sent
+    in any case: a second interruption (Ctrl-C, SIGTERM, SIGHUP) during the grace period cannot skip it."""
     try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):  # macOS: PermissionError for a group of one exited leader
-        pass
-    try:
-        process.wait(timeout=KILL_GRACE)
-    except subprocess.TimeoutExpired:
-        pass
-    _kill_group(process)
-    process.wait()
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):  # macOS: PermissionError for a group of one exited leader
+            pass
+        try:
+            process.wait(timeout=KILL_GRACE)
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        _kill_group(process)
+        process.wait()
 
 
 def _kill_group(process: subprocess.Popen) -> None:

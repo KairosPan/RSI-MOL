@@ -15,9 +15,11 @@ work/, meta/, library/ and env/ are agent-writable: init never reads, walks or r
 rsi.labrun). It only looks at the entry itself in the root (lstat), creates a missing one, and seals work/ before
 handling what was in it. trial/ and candidate/ are made by the runs that use them.
 
-recover marks every call still `started` as `interrupted` (a call is never started again), stops the process group
-recorded in the call's process.json when it is provably that call's, and moves what only an interrupted run leaves
-(entries of staging/ and sealed entries in the root) under sealed/, never deleting or reading them.
+recover marks every call still `started` as `interrupted` (a call is never started again), first stopping the process
+group recorded in the call's process.json when it is provably that call's (SIGTERM, then SIGKILL after STOP_GRACE
+seconds); it moves what only an interrupted run leaves (entries of staging/ and sealed entries in the root) under
+sealed/, never deleting or reading them, and puts main's head back into a missing work/. Until it has run, rsi task,
+meta and rollback refuse to start (rsi.labrun.unrecovered).
 """
 import fcntl
 import json
@@ -26,6 +28,7 @@ import signal
 import shutil
 import subprocess
 import tempfile
+import time
 import tomllib
 from contextlib import contextmanager
 from datetime import datetime
@@ -54,6 +57,7 @@ VENV_SECONDS = 600
 # A call's process group is signalled only when the process with the recorded pid started within this many seconds
 # of the recorded start time (process.json): the pid may since have been reused by an unrelated process.
 SAME_PROCESS_SECONDS = 2
+STOP_GRACE = 5                  # seconds recover waits for a call's process group after SIGTERM, before SIGKILL
 ENVELOPE_HEADER = ('# Lab 的对外范围。负责人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
                    '# 取自负责人原来的 codex-home/config.toml 的备份（config.toml.before-rsi…），[rsi] 是控制程序的设置。\n')
 
@@ -385,30 +389,45 @@ def _moment(text) -> datetime | None:
         return None
 
 
-def _stop_group(records: Records, call_id: str) -> bool:
-    """SIGTERM the process group of the call's Codex process, as runs/<call>/process.json records it (the pid leads
-    its own group), when that group is alive and the process with that pid started when the record says (to within
-    SAME_PROCESS_SECONDS); whether it was signalled. A pid that may have been reused is left alone."""
-    try:
-        data = json.loads((records.call_dir(call_id) / PROCESS_FILE).read_bytes())
-    except (OSError, ValueError, RecursionError):
-        return False
-    pid = data.get('pid') if isinstance(data, dict) else None
-    started = _moment(data.get('started')) if isinstance(data, dict) else None
-    if type(pid) is not int or pid <= 1 or pid in (os.getpid(), os.getpgrp()) or started is None:
-        return False
+def _group_gone(pid: int) -> bool:
+    """Whether no process of the group is left to signal (ESRCH; on macOS EPERM when only an exited leader is)."""
     try:
         os.killpg(pid, 0)
     except OSError:
-        return False
+        return True
+    return False
+
+
+def _stop_group(records: Records, call_id: str) -> tuple[bool, bool]:
+    """Stop the process group of the call's Codex process, as runs/<call>/process.json records it (the pid leads its
+    own group), when that group is alive and the process with that pid started when the record says (to within
+    SAME_PROCESS_SECONDS): SIGTERM, up to STOP_GRACE seconds for it to go, then SIGKILL. (whether it was signalled,
+    whether it needed the SIGKILL). A pid that may have been reused is left alone."""
+    try:
+        data = json.loads((records.call_dir(call_id) / PROCESS_FILE).read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return False, False
+    pid = data.get('pid') if isinstance(data, dict) else None
+    started = _moment(data.get('started')) if isinstance(data, dict) else None
+    if type(pid) is not int or pid <= 1 or pid in (os.getpid(), os.getpgrp()) or started is None or _group_gone(pid):
+        return False, False
     began = _moment(process_start(pid))
     if began is None or abs((began - started).total_seconds()) > SAME_PROCESS_SECONDS:
-        return False
+        return False, False
     try:
         os.killpg(pid, signal.SIGTERM)
     except OSError:
-        return False
-    return True
+        return False, False
+    deadline = time.monotonic() + STOP_GRACE
+    while time.monotonic() < deadline:
+        if _group_gone(pid):
+            return True, False
+        time.sleep(0.1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    return True, True
 
 
 def _move_aside(layout: Layout, records: Records, dir_fd: int, name: str, path: Path, relative: Path, workspace: str,
@@ -466,12 +485,12 @@ def recover(layout: Layout, moved: list[str] | None = None) -> list[str]:
     for call in records.calls():
         if call.get('status') != STARTED:
             continue
-        signalled = _stop_group(records, call['id'])
+        signalled, killed = _stop_group(records, call['id'])
         try:
             records.finish_call(call['id'], {'status': 'interrupted', 'ended': now(), 'usage': None})
         except (KeyError, ValueError):
             continue
-        records.note('recovered', {'call': call['id'], 'signalled': signalled})
+        records.note('recovered', {'call': call['id'], 'signalled': signalled, 'killed': killed})
         changed.append(call['id'])
     lines = _leftovers(layout, records)
     if moved is not None:

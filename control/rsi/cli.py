@@ -8,13 +8,14 @@ and short, with everything from records shown through safe(); `status --json` is
 import json
 import os
 import re
+import signal
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 
 from rsi.check import CHECK_FILE, WORDS, check_state, run_check
 from rsi.init import init, locked, recover
-from rsi.labrun import run_task
+from rsi.labrun import noting_refusals, run_task, unrecovered
 from rsi.limits import usage_by_class
 from rsi.meta import RELEASE_FILE, rollback, run_round
 from rsi.paths import Layout, Refused, find_layout
@@ -40,6 +41,8 @@ SHOWN_PROBLEMS = 5
 SHOWN_CHARS = 300                               # characters of one value from records or an agent
 ID_CHARS = 80                                   # characters of an id, a version or a status
 ERROR_CHARS = 2000                              # characters of a refusal or error message
+INTERRUPTED = ('被打断了。请先运行 rsi recover：它会停下还没结束的调用，把中断留下的东西移到 sealed/，并把最新版本放回 work/；'
+               '在那之前 rsi task、meta 和 rollback 都不会运行。')
 # Shown escaped in text mode: C0 and C1 controls (ESC, CR, LF), DEL, bidirectional controls, line and paragraph
 # separators, lone surrogates.
 UNSAFE = re.compile('[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069\ud800-\udfff]')
@@ -52,7 +55,8 @@ USAGE = """用法：rsi <子命令>
   meta                 跑一轮 Meta，看还没有被任何一轮看过的任务运行（没有就不跑）
   status [--json]      当前版本、最近的运行和发布、待处理的申请、各类成本合计
   rollback <版本>      退回到某个版本
-  recover              控制程序被打断后，把没有结束的调用标成“中断”，把中断留下的东西移到 sealed/"""
+  recover              控制程序被打断后：停下没有结束的调用并标成“中断”，把中断留下的东西移到 sealed/，
+                       把最新版本放回 work/；在那之前 task、meta、rollback 都不会运行"""
 
 
 class Usage(Exception):
@@ -92,6 +96,28 @@ def _parse(args: list[str]) -> tuple[str, dict]:
     raise Usage(f'看不懂这条命令：rsi {" ".join(args)}')
 
 
+def _interrupt(signum, frame) -> None:
+    raise KeyboardInterrupt
+
+
+@contextmanager
+def _interruptible():
+    """While inside, SIGHUP (the terminal closed) and SIGTERM end rsi the way Ctrl-C does: a KeyboardInterrupt in the
+    main thread, so a running Codex is stopped (SIGTERM, then SIGKILL) and its call finished as interrupted. The
+    handlers from before are put back afterwards. Outside the main thread nothing is changed."""
+    previous = {}
+    try:
+        for number in (signal.SIGHUP, signal.SIGTERM):
+            previous[number] = signal.signal(number, _interrupt)
+    except ValueError:
+        pass
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
 def main(argv: list[str] | None = None) -> int:
     raise_open_files_limit()        # macOS starts programs with 256 open files
     args = sys.argv[1:] if argv is None else list(argv)
@@ -108,21 +134,25 @@ def main(argv: list[str] | None = None) -> int:
     layout = find_layout()
     if 'PATH' in os.environ:                        # what every program rsi starts inherits: nothing agents write
         os.environ['PATH'] = clean_path(layout.root)
-    try:
-        _own_python(layout)
-        if command == 'status':
-            return _status(layout, options['json'])
-        with locked(layout):
-            return COMMANDS[command](layout, **options)
-    except (Refused, Invalid) as error:
-        _error(error)
-        return 3
-    except KeyboardInterrupt:
-        _error('被打断了。如果 rsi status 里还有“未结束”的调用，请运行 rsi recover。')
-        return 1
-    except Exception as error:
-        _error(f'出错了：{type(error).__name__}: {error}')
-        return 1
+    with _interruptible():
+        try:
+            _own_python(layout)
+            if command == 'status':
+                return _status(layout, options['json'])
+            with locked(layout):
+                return COMMANDS[command](layout, **options)
+        except (Refused, Invalid) as error:
+            _error(error)
+            return 3
+        except KeyboardInterrupt:
+            try:
+                _error(INTERRUPTED)
+            except (OSError, KeyboardInterrupt):        # the terminal may be gone (SIGHUP)
+                pass
+            return 1
+        except Exception as error:
+            _error(f'出错了：{type(error).__name__}: {error}')
+            return 1
 
 
 def _own_python(layout: Layout) -> None:
@@ -427,7 +457,10 @@ def untriggered(records: Records) -> list[str]:
 
 
 def _meta(layout: Layout) -> int:
-    trigger = untriggered(Records(layout.records))
+    records = Records(layout.records)
+    with noting_refusals(records, {'purpose': 'meta'}):
+        unrecovered(layout, records)                    # before deciding whether there is anything to look at
+    trigger = untriggered(records)
     if not trigger:
         _print(['没有新的任务运行，没有启动 Meta。'])
         return 0

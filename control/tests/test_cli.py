@@ -18,12 +18,13 @@ from rsi import init as init_module
 from rsi.cli import main, safe
 from rsi.init import init, locked, recover
 from rsi.labrun import process_recorder
-from rsi.mockmodel import add_file, say
+from rsi.mockmodel import add_file, say, slow
 from rsi.paths import Layout, Refused
 from rsi.versions import VersionStore
 from tests.support import ENVELOPE, Root, decision, force_remove, needs_codex
 
 SEED = Path(__file__).resolve().parents[1] / 'seed'
+LAUNCHER = Path(__file__).resolve().parents[2] / 'rsi'
 CONFIG = ('approval_policy = "on-request"\n[features]\napps = true\n'
           '[apps._default]\nenabled = false\n[apps.conn_a]\nenabled = true\n[plugins."pdf@x"]\nenabled = true\n'
           '[tui]\nx = 1\n[projects."/somewhere"]\ntrust_level = "trusted"\n')
@@ -47,6 +48,18 @@ def run(*args: str) -> tuple[int, str, str]:
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         code = main(list(args))
     return code, out.getvalue(), err.getvalue()
+
+
+def group_alive(pgid: int, seconds: float = 5) -> bool:
+    """Whether the process group still has a live member after waiting up to `seconds` for it to go."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except OSError:                 # ESRCH; on macOS EPERM when only an exited leader is left
+            return False
+        time.sleep(0.1)
+    return True
 
 
 def notes(layout: Layout, kind: str) -> list[dict]:
@@ -267,8 +280,85 @@ class Recover(unittest.TestCase):
             self.assertEqual((kept[0] / 'staging' / 'S1' / 'x.txt').read_text(), 'x')
             self.assertEqual((kept[0] / 'sealed-work-R0009' / 'AGENTS.md').read_text(), 'hello\n')
             self.assertEqual(sorted(note['workspace'] for note in notes(layout, 'sealed')), ['staging', 'work'])
+            self.assertTrue(all(note['command'] == 'recover' and 'rsi recover' in note['reasons'][0]
+                                for note in notes(layout, 'sealed')))
             self.assertEqual(len(moved), 3)                                          # two moves and work/ restored
             self.assertEqual((layout.work / 'AGENTS.md').read_text(), 'hello\n')
+            self.assertEqual(root.store.tree_of_dir(layout.work), root.store.tree_of(root.store.head()))
+
+    def test_recover_kills_a_process_group_that_ignores_sigterm(self):
+        with Root() as root:
+            stubborn = subprocess.Popen(['/bin/sh', '-c', 'trap "" TERM; echo ready; exec /bin/sleep 60'],
+                                        start_new_session=True, stdout=subprocess.PIPE)
+            self.addCleanup(stubborn.stdout.close)
+            stubborn.stdout.readline()                                  # SIGTERM is ignored from here on
+            self.addCleanup(stubborn.wait); self.addCleanup(stubborn.kill)
+            root.records.start_call(root.records.new_id('R'), {'role': 'lab', 'purpose': 'task'})
+            process_recorder(root.records, 'R0001')(stubborn.pid)
+            with mock.patch.object(init_module, 'STOP_GRACE', 1):
+                self.assertEqual(recover(root.layout), ['R0001'])
+            self.assertEqual(stubborn.wait(timeout=10), -signal.SIGKILL)
+            self.assertEqual(root.records.load_call('R0001')['status'], 'interrupted')
+            [note] = notes(root.layout, 'recovered')
+            self.assertEqual((note['signalled'], note['killed']), (True, True))
+
+    def test_task_meta_and_rollback_wait_until_recover_has_run(self):
+        with Root() as root:
+            root.add_task('T1')
+            call = root.records.new_id('R')
+            root.records.start_call(call, {'role': 'lab', 'purpose': 'task', 'task': 'T1'})
+            for leftover in ('started', 'sealed'):
+                if leftover == 'sealed':
+                    recover(root.layout)
+                    (root.layout.root / '.sealed-work-x').mkdir()
+                for args in (('task', 'T1'), ('task', 'T1', '--no-meta'), ('meta',), ('rollback', 'V0001')):
+                    code, out, err = run(*args)
+                    self.assertEqual((code, out), (3, ''), (leftover, args, err))
+                    self.assertIn('rsi recover', err); self.assertEqual(len(err.splitlines()), 1, err)
+                    self.assertIn(call if leftover == 'started' else '.sealed-work-x', err)
+            self.assertEqual(len(root.records.calls()), 1); self.assertEqual(root.model.requests, [])
+            self.assertEqual(len(notes(root.layout, 'refusal')), 8)
+            recover(root.layout)
+            self.assertFalse(os.path.lexists(root.layout.root / '.sealed-work-x'))
+            root.model.push(say('ok'))
+            self.assertEqual(run('task', 'T1', '--no-meta')[0], 0)
+
+    @needs_codex
+    def test_a_terminated_rsi_stops_its_codex_and_tells_the_owner_to_recover(self):
+        with Root() as root:
+            root.add_task('T1')
+            root.model.push(slow(120, say('late')))
+            process = subprocess.Popen([str(LAUNCHER), 'task', 'T1', '--no-meta'], stdin=subprocess.DEVNULL,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.addCleanup(process.kill)
+            deadline = time.monotonic() + 60
+            while not root.model.requests:                              # Codex has started and asked the model
+                self.assertIsNone(process.poll(), process.stderr.read() if process.poll() is not None else '')
+                self.assertLess(time.monotonic(), deadline); time.sleep(0.1)
+            pid = json.loads((root.records.call_dir('R0001') / 'process.json').read_text())['pid']
+            process.send_signal(signal.SIGTERM)
+            out, err = process.communicate(timeout=60)
+            self.assertEqual(process.returncode, 1, err); self.assertIn('rsi recover', err)
+            self.assertFalse(group_alive(pid))
+            self.assertEqual(root.records.load_call('R0001')['status'], 'interrupted')
+
+    def test_sighup_ends_a_command_the_way_ctrl_c_does(self):
+        def hang_up(*args, **kwargs):
+            os.kill(os.getpid(), signal.SIGHUP)
+            time.sleep(10)
+        hit = []
+
+        def guard(*args):                       # the test runner's own: SIGHUP must never end the test run
+            hit.append(args)
+        previous = signal.signal(signal.SIGHUP, guard); self.addCleanup(signal.signal, signal.SIGHUP, previous)
+        term = signal.getsignal(signal.SIGTERM)
+        with Root() as root:
+            root.add_task('T1')
+            with mock.patch.object(cli, 'run_task', hang_up):
+                started = time.monotonic(); code, _, err = run('task', 'T1')
+            self.assertEqual(code, 1); self.assertIn('rsi recover', err); self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(hit, [])                                       # rsi's own handler took it
+        self.assertEqual((signal.getsignal(signal.SIGHUP), signal.getsignal(signal.SIGTERM)), (guard, term))
 
     def test_recover_stops_only_the_process_group_the_call_started(self):
         with Root() as root:

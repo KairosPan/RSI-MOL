@@ -2,6 +2,7 @@ import http.client
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -209,6 +210,23 @@ class FakeCodex(unittest.TestCase):
         env = self.seen()['env']
         self.assertEqual((env['NO_PROXY'], env['no_proxy']), ('example.org,localhost,127.0.0.1', '127.0.0.1,localhost'))
         self.assertEqual(env['HTTPS_PROXY'], 'http://proxy.example:3128')
+
+    def test_a_second_interrupt_during_the_grace_period_cannot_skip_the_kill(self):
+        stubborn = subprocess.Popen(['/bin/sh', '-c', 'trap "" TERM; echo ready; exec /bin/sleep 60'],
+                                    start_new_session=True, stdout=subprocess.PIPE)
+        self.addCleanup(stubborn.stdout.close)
+        stubborn.stdout.readline()                                  # SIGTERM is ignored from here on
+        self.addCleanup(stubborn.wait); self.addCleanup(stubborn.kill)
+        real_wait, waits = stubborn.wait, []
+
+        def wait(timeout=None):
+            waits.append(timeout)
+            if len(waits) == 1:
+                raise KeyboardInterrupt                 # the second Ctrl-C (or SIGTERM), while _stop waits
+            return real_wait(timeout)
+        with mock.patch.object(stubborn, 'wait', wait), self.assertRaises(KeyboardInterrupt):
+            _stop(stubborn)
+        self.assertEqual(real_wait(timeout=10), -signal.SIGKILL)
 
     def test_stop_survives_a_group_it_may_not_signal(self):
         process = subprocess.Popen(['/bin/sleep', '0'], start_new_session=True); process.wait()
