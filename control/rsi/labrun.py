@@ -47,7 +47,7 @@ from rsi.versions import VersionStore
 from rsi.workspace import SEALED, has_entry, keep, open_folder, prepare_for_commit, remove, seal
 
 MANUAL = 'manual or leftover'   # author of what is found in work/ before a run: the owner's or a leftover process's
-RESTAGED = '运行后放回 work/ 的最新版本里：'   # before a skill line of the work/ re-staged after a run
+RESTAGED = 'In the newest version put back into work/ after the run: '    # before a skill line of that work/
 PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
 PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
@@ -131,7 +131,7 @@ def _refusing(what: str):
     try:
         yield
     except WORKSPACE_ERRORS as error:
-        raise Refused(f'{what}：{type(error).__name__}: {error}') from None
+        raise Refused(f'{what}: {type(error).__name__}: {error}') from None
 
 
 @contextmanager
@@ -140,7 +140,7 @@ def _problem(problems: list[str], what: str):
     try:
         yield
     except Exception as error:
-        problems.append(f'{what}：{type(error).__name__}: {error}')
+        problems.append(f'{what}: {type(error).__name__}: {error}')
 
 
 @contextmanager
@@ -160,11 +160,13 @@ def unrecovered(layout: Layout, records: Records) -> None:
     stops the first and keeps the second under sealed/. rsi task, rsi meta and rsi rollback check this first."""
     started = [str(call.get('id')) for call in records.calls() if call.get('status') == STARTED]
     sealed = sorted(name for name in os.listdir(layout.root) if name.startswith(SEALED))
-    what = [f'调用 {call_id} 还没有结束' for call_id in started[:3]] + [f'{name} 还在 RSI 文件夹里' for name in sealed[:3]]
+    what = ([f'the call {call_id} has not ended' for call_id in started[:3]]
+            + [f'{name} is still in the RSI folder' for name in sealed[:3]])
     if len(started) + len(sealed) > len(what):
-        what.append(f'另有 {len(started) + len(sealed) - len(what)} 处')
+        what.append(f'and {len(started) + len(sealed) - len(what)} more')
     if what:
-        raise Refused(f'上一次 rsi 被打断以后还没有收拾：{"；".join(what)}。请先运行 rsi recover，再重试。')
+        raise Refused(f'An earlier rsi was interrupted and nothing has cleaned up after it: {"; ".join(what)}. '
+                      'Run rsi recover first, then try again.')
 
 
 def _admit(layout: Layout, records: Records) -> tuple[Limits, list[dict]]:
@@ -185,8 +187,8 @@ def _store(layout: Layout) -> VersionStore:
     not be stored."""
     store = VersionStore(layout.versions)
     if not (store.git_dir / 'HEAD').is_file():
-        raise Refused(f'还没有版本库（{layout.versions}），请先运行 rsi init。')
-    with _refusing(f'版本库（{layout.versions}）现在存不了新版本，请先修好它'):
+        raise Refused(f'There is no version store yet ({layout.versions}). Run rsi init first.')
+    with _refusing(f'The version store ({layout.versions}) cannot take a new version now; repair it first'):
         store.check_writable()
     return store
 
@@ -202,15 +204,16 @@ def _own_interpreter(layout: Layout, task: Task | None) -> None:
     forms = {os.path.abspath(sys.executable), os.path.realpath(sys.executable)}
     roots = {os.path.abspath(layout.root), os.path.realpath(layout.root)}
     if not sys.executable or any(_within(form, root) for form in forms for root in roots):
-        raise Refused(f'控制程序用的 Python（{sys.executable!r}）在 RSI 文件夹里，agent 改得到，不能用它运行检查脚本。'
-                      '请用 RSI 文件夹以外的 python3 运行 rsi。')
+        raise Refused(f'The Python of the control program ({sys.executable!r}) is inside the RSI folder, where '
+                      'agents can change it, so it cannot run a check script. Run rsi with a python3 outside the RSI '
+                      'folder.')
 
 
 def _codex_version(layout: Layout) -> str:
     try:
         return codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        raise Refused(f'Codex 程序用不了：{error}') from None
+        raise Refused(f'The Codex program cannot be used: {error}') from None
 
 
 def _compose(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, resolve) -> tuple[dict, list[str]]:
@@ -249,7 +252,8 @@ def _stage(layout: Layout, store: VersionStore, version: str, task: Task | None 
     try:
         store.checkout(version, folder)
         if has_entry(folder, '.codex'):
-            raise Refused(f'版本 {version} 里有 .codex，不能用它启动 Lab Codex：请先在版本里去掉它。')
+            raise Refused(f'The version {version} holds .codex, so the Lab Codex cannot be started on it. Remove '
+                          '.codex from the version first.')
         (folder / '.tmp').mkdir()
         (folder / 'out').mkdir()
         if task is not None:
@@ -285,7 +289,8 @@ def _move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name:
         label = _stamp()
         entry = seal(root_fd, name, label)
         if entry is not None:
-            reasons = [] if name == 'trial' else ['它在准备运行时才出现，没有存成版本']
+            reasons = [] if name == 'trial' else ['it appeared while the run was being prepared; it was not saved '
+                                                  'as a version']
             _dispose(layout, records, root_fd, entry, name, label, reasons, context, problems)
         _rename_in(staged, root_fd, name)
     except BaseException:
@@ -306,7 +311,7 @@ def _dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: s
             remove(entry, root_fd, path)
             return
         except OSError as error:
-            reasons = [f'删不掉（{error.strerror or error}）']
+            reasons = [f'it cannot be removed ({error.strerror or error})']
     where = entry
     try:
         keep(root_fd, entry, path, layout.sealed / label / name)
@@ -314,7 +319,7 @@ def _dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: s
     except OSError:
         pass
     records.note('sealed', {'workspace': name, 'path': where, 'reasons': reasons, **context})
-    problems.append(f'封存的 {name}/：{"；".join(reasons)}；已整个留在 {where}')
+    problems.append(f'The sealed {name}/: {"; ".join(reasons)}; it was kept whole at {where}')
 
 
 def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, save, context: dict,
@@ -329,15 +334,17 @@ def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: st
                                                    f'{layout.sealed.name}/{label}/left-out')
         problems += lines
         if moved:
-            reasons.append(f'有 {moved} 处内容没有存进版本，已移到 {layout.sealed.name}/{label}/left-out/')
+            reasons.append(f'{moved} entries were not saved in the version; they were moved to '
+                           f'{layout.sealed.name}/{label}/left-out/')
         if blocked:
-            reasons.append(f'有 {blocked} 处应排除在版本之外的内容没能移出去，版本没有保存')
+            reasons.append(f'{blocked} entries that must be left out of the version could not be moved out; the '
+                           'version was not saved')
         if has_entry(tree, '.codex'):
-            reasons.append('里面有 .codex，版本没有保存')
+            reasons.append('it holds .codex; the version was not saved')
         elif not blocked:
             save(tree)
     except WORKSPACE_ERRORS as error:
-        reasons.append(f'版本没有保存（{type(error).__name__}: {error}）')
+        reasons.append(f'the version was not saved ({type(error).__name__}: {error})')
     _dispose(layout, records, root_fd, entry, name, label, reasons, context, problems)
 
 
@@ -356,14 +363,14 @@ def _take_work(layout: Layout, records: Records, store: VersionStore, root_fd: i
     (the program cannot tell the owner's edits from what a leftover process wrote). Refused if work/ cannot be
     sealed; anything else becomes a problem line (and a `sealed` note when the tree is kept)."""
     label = _stamp()
-    with _refusing('work/ 封存不了，这次不能运行（请检查 work/ 本身的标志和 ACL）'):
+    with _refusing('work/ cannot be sealed, so this run cannot start (check the flags and the ACL of work/ itself)'):
         entry = seal(root_fd, 'work', label)
     if entry is None:
         return
     previous = _uncommitted(calls)
-    message = '运行前在 work/ 里发现的改动（人工改动，或以前的进程留下的）'
+    message = 'Changes found in work/ before a run (made by hand, or left by an earlier process)'
     if previous is not None:
-        message += f'；上一次任务运行 {previous} 没能存成版本'
+        message += f'; the last task run {previous} could not be saved as a version'
     _settle(layout, records, root_fd, entry, 'work', label, lambda tree: store.commit(tree, MANUAL, message), context,
             notes)
 
@@ -376,7 +383,8 @@ def _restore_work(layout: Layout, records: Records, store: VersionStore, root_fd
         _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, [])
         return ''
     except Exception as error:
-        return f'；work/ 也没能换回 main 的最新版本（{type(error).__name__}: {error}），现在没有可用的 work/'
+        return (f'; work/ could not be put back to the newest version of main either ({type(error).__name__}: '
+                f'{error}), so there is no usable work/ now')
 
 
 # The two runs.
@@ -398,12 +406,12 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
         notes, skill_lines = [], []
         _take_work(layout, records, store, root_fd, calls, context, notes)
         try:
-            with _refusing('版本库用不了'):
+            with _refusing('The version store cannot be used'):
                 version_before = store.head()
                 fields = {'version_before': version_before, 'commit': store.resolve(version_before),
                           'tree': store.tree_of(version_before)}
                 staged, settings = _stage(layout, store, version_before, task)
-            with _refusing('准备好的工作区放不进 work/'):
+            with _refusing('The staged workspace could not be moved into work/'):
                 _move_in(layout, records, root_fd, staged, 'work', context, notes, skill_lines=skill_lines)
         except Refused as refused:              # work/ is sealed by now: put main's head back for the owner
             raise Refused(f'{refused}{_restore_work(layout, records, store, root_fd, context)}') from None
@@ -424,11 +432,11 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
     trial/ is staged from that commit, never from main; main and work/ are left alone. Refused or ValueError before
     any call."""
     if (task_id is None) == (probe is None):
-        raise ValueError('试跑要么给一个任务编号，要么给一段测试文字，只能给其中一个。')
-    safe_id(round_id, '轮次编号')
+        raise ValueError('A trial needs exactly one of a task id and a test text.')
+    safe_id(round_id, 'round id')
     task = load_task(layout.tasks, task_id) if task_id is not None else None
     if probe is not None and (not isinstance(probe, str) or not probe.strip() or len(probe) > PROBE_LIMIT):
-        raise ValueError(f'测试文字必须是非空文本，最多 {PROBE_LIMIT} 个字符。')
+        raise ValueError(f'A test text must be non-empty text of at most {PROBE_LIMIT} characters.')
     records = Records(layout.records)
     context = {'purpose': 'trial', 'round': round_id, 'task': task_id}
     with _noting_refusals(records, context), _root(layout) as root_fd:
@@ -436,18 +444,18 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
         try:
             commit_id = store.resolve(commit)               # ValueError: a bad request, whatever the limits
         except (OSError, subprocess.SubprocessError) as error:
-            raise Refused(f'版本库用不了：{type(error).__name__}: {error}') from None
+            raise Refused(f'The version store cannot be used: {type(error).__name__}: {error}') from None
         limits, _ = _admit(layout, records)
         envelope = load_envelope(layout.owner)
         _own_interpreter(layout, task)
         codex = _codex_version(layout)
-        with _refusing('版本库用不了'):
+        with _refusing('The version store cannot be used'):
             tree = store.tree_of(commit_id)
             head, work_settings = _stage(layout, store, store.head())      # for the owner's own Lab config:
             _discard(head)                                                  # read from main's head, not work/
             staged, settings = _stage(layout, store, commit_id, task)
         notes, skill_lines = [], []
-        with _refusing('准备好的工作区放不进 trial/'):
+        with _refusing('The staged workspace could not be moved into trial/'):
             _move_in(layout, records, root_fd, staged, 'trial', context, notes, skill_lines=skill_lines)
         write_home_config(layout, envelope, work_settings, resolve=resolve)
         config, settings_problems = _compose(layout, envelope, settings, trial=True, resolve=resolve)
@@ -501,7 +509,8 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     try:
         _collect(layout, records, store, run, call_id, call_dir, result, end, problems)
     except BaseException as error:                  # only an interruption gets here: each step catches Exception
-        problems.append(f'收取结果时被打断（{type(error).__name__}），其余步骤没有做')
+        problems.append(f'Interrupted while collecting the results ({type(error).__name__}); the remaining steps were '
+                        'not done')
         try:
             records.finish_call(call_id, {**end, 'problems': problems})
         except Exception:
@@ -514,46 +523,46 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
              end: dict, problems: list[str]) -> None:
     """Everything after the Codex call, into end and problems; each failing step becomes a problem line."""
     if result.thread_id is not None:
-        with _problem(problems, '没能取出会话记录'):
+        with _problem(problems, 'Could not copy the session records'):
             end['subagent_threads'] = collect_sessions(layout.lab_home, result.thread_id, call_dir / 'sessions')
     context = {**run.context, 'call': call_id}
     with _root(layout) as root_fd:
         entry = None
-        with _problem(problems, f'{run.name}/ 封存不了，这次运行的结果没有收取'):
+        with _problem(problems, f'{run.name}/ cannot be sealed; the results of this run were not collected'):
             entry = seal(root_fd, run.name, call_id)
             if entry is None:
-                problems.append(f'运行结束时 {run.name}/ 已经不在了')
+                problems.append(f'{run.name}/ was gone when the run ended')
         out = call_dir / 'out'
-        with _problem(problems, f'out/{run.out_name} 没能收进记录'):
+        with _problem(problems, f'out/{run.out_name} could not be collected into the record'):
             if entry is None:
                 out.mkdir()
             else:
                 problems += collect_out(layout.root / entry, run.out_name, out)
         if run.task is not None:
-            end['check'] = {'passed': False, 'message': '检查脚本没能运行', 'exit_code': None}
-            with _problem(problems, '检查脚本没能运行'):
+            end['check'] = {'passed': False, 'message': 'the check script could not run', 'exit_code': None}
+            with _problem(problems, 'The check script could not run'):
                 end['check'] = run_check(run.task, out)
         if entry is not None:
-            with _problem(problems, f'封存的 {run.name}/ 没能处理完'):
+            with _problem(problems, f'The sealed {run.name}/ could not be handled completely'):
                 _settle(layout, records, root_fd, entry, run.name, call_id, _saver(store, run, call_id, end),
                         context, problems)
         if run.name == 'trial':
             return
         diff = ''
         if end['version_after'] is not None:
-            with _problem(problems, f'没能算出 {run.version_before} 到 {end["version_after"]} 的差异'):
+            with _problem(problems, f'Could not compute the diff from {run.version_before} to {end["version_after"]}'):
                 diff = store.diff(run.version_before, end['version_after'])
-        with _problem(problems, '没能写 diff.patch'):
+        with _problem(problems, 'Could not write diff.patch'):
             with open(call_dir / 'diff.patch', 'x', encoding='utf-8') as stream:
                 stream.write(diff)
         restaged, settings = [], None       # what of the new head's skills/ the owner's work/ lacks: told at once
-        with _problem(problems, 'work/ 没能换成最新版本'):
+        with _problem(problems, 'work/ could not be replaced by the newest version'):
             staged, head_settings = _stage(layout, store, store.head())
             _move_in(layout, records, root_fd, staged, 'work', context, problems, skill_lines=restaged)
             settings = head_settings
         problems += [RESTAGED + line for line in restaged]
         if settings is not None:            # the owner's manual Lab Codex uses the version now in work/
-            with _problem(problems, 'Lab 的 Codex 配置（codex-home/config.toml）没能更新'):
+            with _problem(problems, "The Lab's Codex configuration (codex-home/config.toml) could not be updated"):
                 write_home_config(layout, run.envelope, settings, resolve=run.resolve)
 
 
@@ -563,7 +572,7 @@ def _saver(store: VersionStore, run: _Run, call_id: str, end: dict):
         if run.name == 'trial':
             end['tree_after'] = store.tree_of_dir(tree)
         else:
-            end['version_after'] = store.commit(tree, f'lab {call_id}', f'Lab 运行 {call_id}（任务 {run.task.id}）')
+            end['version_after'] = store.commit(tree, f'lab {call_id}', f'Lab run {call_id} (task {run.task.id})')
             end['commit_failed'] = False
     return save
 

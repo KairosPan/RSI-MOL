@@ -41,7 +41,7 @@ ATTRIBUTES = '* -text -ident -filter -working-tree-encoding !diff !merge\n'
 
 def _check_author(author) -> None:
     if not isinstance(author, str) or not AUTHOR.fullmatch(author):
-        raise ValueError(f'作者名不合规：{author!r}')
+        raise ValueError(f'The author name is not valid: {author!r}')
 
 
 def _any_case(name: str) -> str:
@@ -108,10 +108,11 @@ class VersionStore:
         elif isinstance(name, str) and COMMIT_ID.fullmatch(name):
             ref = name
         else:
-            raise ValueError(f'不是版本名或提交号：{name!r}。版本名形如 V0001，提交号是 40 位十六进制。')
+            raise ValueError(f'{name!r} is not a version name or a commit id. A version name looks like V0001; a '
+                             'commit id is 40 hexadecimal digits.')
         done = self._git('rev-parse', '--verify', '--quiet', '--end-of-options', f'{ref}^{{commit}}', check=False)
         if done.returncode != 0:
-            raise ValueError(f'版本库里没有这个版本或提交：{name}')
+            raise ValueError(f'The version store has no such version or commit: {name}')
         return done.stdout.decode().strip()
 
     def tree_of(self, name: str) -> str:
@@ -166,14 +167,14 @@ class VersionStore:
         `main.lock` fails it), and the object and index folders are writable."""
         main = self._main()
         if main is None:
-            raise RuntimeError('版本库里还没有任何版本')
+            raise RuntimeError('The version store has no version yet')
         names = self._versions()
         tag = f'V{int(names[-1][1:]) + 1:04d}' if names else 'V0001'
         self._git('update-ref', '--stdin',
                   stdin=f'start\nverify {MAIN} {main}\ncreate refs/tags/{tag} {main}\nprepare\nabort\n'.encode())
         for folder in ('objects', 'indexes'):
             if not os.access(self.git_dir / folder, os.W_OK):
-                raise RuntimeError(f'{self.git_dir / folder} 不可写')
+                raise RuntimeError(f'{self.git_dir / folder} is not writable')
 
     def diff(self, old: str, new: str, limit: int = 1_000_000) -> str:
         """`git diff` from one version or commit to another, cut after `limit` bytes of output (with a note)."""
@@ -189,7 +190,7 @@ class VersionStore:
         if not cut and process.returncode != 0:
             raise RuntimeError(f'git diff failed ({process.returncode}): {error.decode(errors="replace").strip()}')
         text = data[:limit].decode('utf-8', errors='replace')
-        return text + f'\n…（差异超过 {limit} 字节，其余部分已截去）\n' if cut else text
+        return text + f'\n... (the diff is longer than {limit} bytes; the rest was cut off)\n' if cut else text
 
     def log(self) -> list[dict]:
         """All versions, newest first: version, commit, tree, author, message, time (ISO 8601)."""
@@ -274,12 +275,12 @@ class VersionStore:
         """
         folder = Path(folder)
         if folder.is_symlink() or not folder.is_dir():
-            raise ValueError(f'不是文件夹（或是链接）：{folder}')
+            raise ValueError(f'Not a folder (or a link): {folder}')
         real = folder.resolve()
         here, store = os.stat(real), os.stat(self.git_dir)
         if any(os.path.samestat(here, os.stat(path)) for path in (self.git_dir, *self.git_dir.parents)) or \
                 any(os.path.samestat(os.stat(path), store) for path in real.parents):
-            raise ValueError(f'文件夹和版本库互相包含：{folder}')
+            raise ValueError(f'The folder and the version store contain each other: {folder}')
         return real
 
     def _refuse_git_entries(self, folder: Path, aliases: set[str]) -> None:
@@ -291,7 +292,7 @@ class VersionStore:
                 dirs[:] = [name for name in dirs if name.lower() not in self._excluded and name not in aliases]
             for name in dirs + files:
                 if name.lower() == '.git':
-                    raise ValueError(f'文件夹里有 .git，不能存为版本：{Path(top, name)}')
+                    raise ValueError(f'The folder holds .git, so it cannot be saved as a version: {Path(top, name)}')
 
     def _index(self, folder: Path) -> Path:
         return self.git_dir / 'indexes' / hashlib.sha256(str(folder).encode()).hexdigest()[:32]

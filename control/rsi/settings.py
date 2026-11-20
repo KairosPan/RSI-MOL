@@ -1,7 +1,7 @@
 """The Lab's own settings: `codex/settings.toml` and the role files `codex/agents/<name>.toml` of a workspace.
 
 Both agents write these files, so everything in them is untrusted. load_settings keeps only the free keys of the
-plan (design §5.3) and turns everything else into a problem: one Chinese line naming the key or file. A bad part
+plan (design §5.3) and turns everything else into a problem: one English line naming the key or file. A bad part
 falls back to its default and is listed; nothing in a file's content makes it raise. Files are read without
 following symbolic links, and only when they are small regular files.
 """
@@ -78,12 +78,13 @@ def _read_table(path: Path, label: str, problems: list[str]) -> dict | None:
     except FileNotFoundError:
         return None
     except OSError as error:
-        problems.append(f'{label}：读不了（{error.strerror}），可能是符号链接或特殊文件，按不存在处理')
+        problems.append(f'{label}: cannot be read ({error.strerror}); it may be a symbolic link or a special file, and '
+                        'is taken as missing')
         return None
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
-            problems.append(f'{label}：不是普通文件，按不存在处理')
+            problems.append(f'{label}: not a regular file; taken as missing')
             return None
         chunks, size = [], 0
         while size <= MAX_BYTES:
@@ -94,26 +95,27 @@ def _read_table(path: Path, label: str, problems: list[str]) -> dict | None:
     finally:
         os.close(fd)
     if size > MAX_BYTES:
-        problems.append(f'{label}：超过 {MAX_BYTES} 字节，按不存在处理')
+        problems.append(f'{label}: more than {MAX_BYTES} bytes; taken as missing')
         return None
     try:
         text = b''.join(chunks).decode('utf-8')
     except UnicodeDecodeError:
-        problems.append(f'{label}：不是 UTF-8 文本，按不存在处理')
+        problems.append(f'{label}: not UTF-8 text; taken as missing')
         return None
     try:
         return tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
-        problems.append(f'{label}：不是合法的 TOML（{" ".join(str(error).split())}），按不存在处理')
+        problems.append(f'{label}: not valid TOML ({" ".join(str(error).split())}); taken as missing')
     except Exception as error:  # e.g. RecursionError on deeply nested arrays or tables: still only a problem
-        problems.append(f'{label}：解析失败（{type(error).__name__}，可能嵌套太深），按不存在处理')
+        problems.append(f'{label}: could not be parsed ({type(error).__name__}; it may be nested too deeply); taken as '
+                        'missing')
     return None
 
 
 def _linked(workspace: Path, folder: str, problems: list[str]) -> bool:
     """Whether a workspace folder is a symbolic link; then nothing below it is read."""
     if (workspace / folder).is_symlink():
-        problems.append(f'{folder}：是符号链接，里面的内容不生效')
+        problems.append(f'{folder}: a symbolic link; nothing in it takes effect')
         return True
     return False
 
@@ -140,73 +142,75 @@ def _url_problem(url) -> str | None:
     """Why a tool server's url is refused, or None. Codex itself connects to it, outside every sandbox, so only
     https to a named host is allowed: no credentials in the url, no IP literal, no local name."""
     if not isinstance(url, str):
-        return '必须是文本'
+        return 'must be text'
     if any(char <= ' ' or char in '\x7f\\' for char in url):
-        return '不能含空白、控制字符或反斜杠'
+        return 'must not contain white space, control characters or backslashes'
     try:
         parts = urlsplit(url)
         host = parts.hostname
         parts.port  # raises ValueError for a port that is not a number
     except ValueError:
-        return '不是合法的网址'
+        return 'is not a valid URL'
     if parts.scheme != 'https' or not host:
-        return '必须是 https:// 开头、带主机名的网址'
+        return 'must be a URL that starts with https:// and names a host'
     if '@' in parts.netloc:
-        return '不能带用户名或密码'
+        return 'must not carry a user name or a password'
     labels = host.removesuffix('.').split('.')
     if not all(HOST_LABEL.fullmatch(label) for label in labels):
-        return '主机名只能是域名，不能是 IP 地址'
+        return 'must name its host by a domain name, not by an IP address'
     last = labels[-1]
     if last.isdigit() or re.fullmatch(r'0x[0-9a-f]*', last):
-        return '主机名只能是域名，不能是 IP 地址'
+        return 'must name its host by a domain name, not by an IP address'
     if last in LOCAL_SUFFIXES:
-        return '不能指向本机或局域网'
+        return 'must not point to this machine or the local network'
     return None
 
 
 def _tool_server(name: str, server, workspace: Path, problems: list[str]) -> dict | None:
     """The checked tool server, or None after listing why it is left out."""
-    where = f'{SETTINGS}：工具服务 {show(name)}'
+    where = f'{SETTINGS}: tool server {show(name)}'
     before = len(problems)
     if not isinstance(server, dict):
-        problems.append(f'{where} 必须是一个表')
+        problems.append(f'{where} must be a table')
         return None
     for key in sorted(set(server) - LOCAL_KEYS - REMOTE_KEYS):
-        problems.append(f'{where} 里不允许的键 {show(key)}')
+        problems.append(f'{where}: the key {show(key)} is not allowed')
     local, remote = set(server) & LOCAL_KEYS, set(server) & REMOTE_KEYS
     if local and remote:
-        problems.append(f'{where} 不能同时写本地的键（{", ".join(sorted(local))}）和网址的键（{", ".join(sorted(remote))}）')
+        problems.append(f'{where} cannot have both local keys ({", ".join(sorted(local))}) and URL keys '
+                        f'({", ".join(sorted(remote))})')
     elif 'command' not in server and 'url' not in server:
-        problems.append(f'{where} 要么写 command（本地），要么写 url（按网址连接）')
+        problems.append(f'{where} needs either command (a local server) or url (a server reached by URL)')
     if len(problems) > before:
         return None
     if 'url' in server:
         reason = _url_problem(server['url'])
         if reason:
-            problems.append(f'{where} 的 url {show(server["url"])} {reason}')
+            problems.append(f'{where}: the url {show(server["url"])} {reason}')
         result = {'url': server['url']}
         if 'bearer_token_env_var' in server:
             variable = server['bearer_token_env_var']
             if not (isinstance(variable, str) and BEARER.fullmatch(variable)):
-                problems.append(f'{where} 的 bearer_token_env_var {show(variable)} 必须以 RSI_TOOL_ 开头，'
-                                '只含大写字母、数字和 _')
+                problems.append(f'{where}: bearer_token_env_var {show(variable)} must start with RSI_TOOL_ and hold '
+                                'only capital letters, digits and _')
             result['bearer_token_env_var'] = variable
         return None if len(problems) > before else result
     command, args, network = server['command'], server.get('args', []), server.get('network', False)
     if not _clean(command) or not command or command.startswith('-'):
-        problems.append(f'{where} 的 command 必须是不以 - 开头的非空文本')
+        problems.append(f'{where}: command must be non-empty text that does not start with -')
     elif '/' in command and not os.path.isabs(command) and not inside(command, workspace):
-        problems.append(f'{where} 的 command {show(command)} 指向工作区以外')
+        problems.append(f'{where}: the command {show(command)} points outside the workspace')
     if not isinstance(args, list) or not all(_clean(arg) for arg in args):
-        problems.append(f'{where} 的 args 必须是文本的列表')
+        problems.append(f'{where}: args must be a list of texts')
     else:
         for arg in args:
             if os.path.isabs(arg):
-                problems.append(f'{where} 的参数 {show(arg)} 是绝对路径；工作区里的文件请写相对路径')
+                problems.append(f'{where}: the argument {show(arg)} is an absolute path; name a file in the '
+                                'workspace by a relative path')
             elif is_workspace_path(arg, workspace) and not inside(arg, workspace):
-                problems.append(f'{where} 的参数 {show(arg)} 指向工作区以外')
+                problems.append(f'{where}: the argument {show(arg)} points outside the workspace')
     if not isinstance(network, bool):
-        problems.append(f'{where} 的 network 必须是 true 或 false')
+        problems.append(f'{where}: network must be true or false')
     if len(problems) > before:
         return None
     return {'command': command, 'args': list(args), 'network': network}
@@ -220,71 +224,75 @@ def _apply(settings: Settings, table: dict, workspace: Path) -> None:
             if isinstance(value, str) and MODEL.fullmatch(value):
                 settings.model = value
             else:
-                problems.append(f'{SETTINGS}：model 必须是模型名（字母、数字和 ._:/@+-）')
+                problems.append(f'{SETTINGS}: model must be a model name (letters, digits and ._:/@+-)')
         elif key == 'model_reasoning_effort':
             if value in EFFORTS:
                 settings.effort = value
             else:
-                problems.append(f'{SETTINGS}：model_reasoning_effort 只能是 {"、".join(EFFORTS)} 之一')
+                problems.append(f'{SETTINGS}: model_reasoning_effort must be one of {", ".join(EFFORTS)}')
         elif key == 'web_search':
             if value in WEB_SEARCH:
                 settings.web_search = value
             else:
-                problems.append(f'{SETTINGS}：web_search 只能是 {"、".join(WEB_SEARCH)} 之一')
+                problems.append(f'{SETTINGS}: web_search must be one of {", ".join(WEB_SEARCH)}')
         elif key == 'network':
             if isinstance(value, bool):
                 settings.network = value
             else:
-                problems.append(f'{SETTINGS}：network 必须是 true 或 false')
+                problems.append(f'{SETTINGS}: network must be true or false')
         elif key == 'agents':
             _agents(settings, value)
         elif key == 'disable':
             _disable(settings, value)
         elif key == 'tool_servers':
             if not isinstance(value, dict):
-                problems.append(f'{SETTINGS}：tool_servers 必须是一个表')
+                problems.append(f'{SETTINGS}: tool_servers must be a table')
                 continue
             for name in sorted(value, key=str):
                 if not (isinstance(name, str) and SAFE_ID.fullmatch(name)):
-                    problems.append(f'{SETTINGS}：工具服务的名字 {show(name)} 不合规，只能用字母、数字、_ 和 -，'
-                                    '以字母或数字开头，最长 64 个字符')
+                    problems.append(f'{SETTINGS}: the tool server name {show(name)} is not valid: use only letters, '
+                                    'digits, _ and -, start with a letter or a digit, and use at most 64 characters')
                 elif 'codex' in name.lower():
-                    problems.append(f'{SETTINGS}：工具服务的名字 {show(name)} 含 codex，留给 Codex 自己用')
+                    problems.append(f'{SETTINGS}: the tool server name {show(name)} contains codex, which is kept '
+                                    'for Codex itself')
                 else:
                     server = _tool_server(name, value[name], workspace, problems)
                     if server is not None:
                         settings.tool_servers[name] = server
         else:
-            problems.append(f'{SETTINGS}：不允许的键 {show(key)}（只能改 model、model_reasoning_effort、web_search、'
-                            'network、agents、disable、tool_servers）')
+            problems.append(f'{SETTINGS}: the key {show(key)} is not allowed (only model, model_reasoning_effort, '
+                            'web_search, network, agents, disable and tool_servers may be set)')
 
 
 def _agents(settings: Settings, value) -> None:
     if not isinstance(value, dict):
-        settings.problems.append(f'{SETTINGS}：agents 必须是一个表')
+        settings.problems.append(f'{SETTINGS}: agents must be a table')
         return
     for key in sorted(value, key=str):
         number = value[key]
         allowed = {'max_depth': DEPTHS, 'max_threads': THREADS}.get(key)
         if allowed is None:
-            settings.problems.append(f'{SETTINGS}：agents 里不允许的键 {show(key)}（只能是 max_depth、max_threads）')
+            settings.problems.append(f'{SETTINGS}: the key {show(key)} is not allowed in agents (only max_depth and '
+                                     'max_threads)')
         elif isinstance(number, bool) or not isinstance(number, int) or number not in allowed:
-            settings.problems.append(f'{SETTINGS}：agents.{key} 必须是 {allowed.start} 到 {allowed.stop - 1} 的整数')
+            settings.problems.append(f'{SETTINGS}: agents.{key} must be an integer from {allowed.start} to '
+                                     f'{allowed.stop - 1}')
         else:
             setattr(settings, key, number)
 
 
 def _disable(settings: Settings, value) -> None:
     if not isinstance(value, dict):
-        settings.problems.append(f'{SETTINGS}：disable 必须是一个表')
+        settings.problems.append(f'{SETTINGS}: disable must be a table')
         return
     for key in sorted(value, key=str):
         ids = value[key]
         target = {'connectors': settings.disabled_connectors, 'plugins': settings.disabled_plugins}.get(key)
         if target is None:
-            settings.problems.append(f'{SETTINGS}：disable 里不允许的键 {show(key)}（只能是 connectors、plugins）')
+            settings.problems.append(f'{SETTINGS}: the key {show(key)} is not allowed in disable (only connectors and '
+                                     'plugins)')
         elif not isinstance(ids, list) or not all(_clean(item) and item for item in ids):
-            settings.problems.append(f'{SETTINGS}：disable.{key} 必须是编号（文本）的列表')
+            settings.problems.append(f'{SETTINGS}: disable.{key} must be a list of ids (texts)')
         else:
             target.extend(ids)
 
@@ -297,7 +305,7 @@ def _roles(settings: Settings, workspace: Path) -> None:
     except FileNotFoundError:
         return
     except OSError as error:
-        problems.append(f'{AGENTS}：读不了（{error.strerror}），角色不生效')
+        problems.append(f'{AGENTS}: cannot be read ({error.strerror}); no role takes effect')
         return
     for file_name in names:
         if not file_name.endswith('.toml'):
@@ -305,26 +313,26 @@ def _roles(settings: Settings, workspace: Path) -> None:
         label = f'{AGENTS}/{show(file_name)}'
         name = file_name.removesuffix('.toml')
         if not ROLE.fullmatch(name) or name in RESERVED_ROLES:
-            problems.append(f'{label}：角色名必须是小写字母开头的 [a-z0-9_-]，最长 32 个字符，'
-                            '且不能是 default、explorer、worker 或 Codex 的 agents 设置名')
+            problems.append(f'{label}: a role name must be [a-z0-9_-] starting with a small letter, at most 32 '
+                            "characters, and not default, explorer, worker or a setting name of Codex's agents table")
             continue
         before = len(problems)
         table = _read_table(folder / file_name, label, problems)
         if table is None:
             if len(problems) == before:
-                problems.append(f'{label}：读不了，角色不生效')
+                problems.append(f'{label}: cannot be read; the role does not take effect')
             continue
         for key in sorted(set(table) - ROLE_KEYS, key=str):
-            problems.append(f'{label}：不允许的键 {show(key)}（只能有 {"、".join(sorted(ROLE_KEYS))}）')
+            problems.append(f'{label}: the key {show(key)} is not allowed (only {", ".join(sorted(ROLE_KEYS))})')
         for key in ROLE_REQUIRED:
             if not (_clean(table.get(key)) and table[key].strip()):
-                problems.append(f'{label}：缺少 {key}，或它不是非空文本')
+                problems.append(f'{label}: {key} is missing, or it is not non-empty text')
         if table.get('name') not in (None, name) and _clean(table.get('name')):
-            problems.append(f'{label}：name 必须和文件名一致，是 {name}')
+            problems.append(f'{label}: name must match the file name, that is {name}')
         if 'model' in table and not (isinstance(table['model'], str) and MODEL.fullmatch(table['model'])):
-            problems.append(f'{label}：model 必须是模型名（字母、数字和 ._:/@+-）')
+            problems.append(f'{label}: model must be a model name (letters, digits and ._:/@+-)')
         if 'model_reasoning_effort' in table and table['model_reasoning_effort'] not in EFFORTS:
-            problems.append(f'{label}：model_reasoning_effort 只能是 {"、".join(EFFORTS)} 之一')
+            problems.append(f'{label}: model_reasoning_effort must be one of {", ".join(EFFORTS)}')
         if len(problems) == before:
             settings.roles[name] = {'description': table['description'], 'file': folder / file_name,
                                     'model': table.get('model'), 'effort': table.get('model_reasoning_effort'),
@@ -352,5 +360,5 @@ def workspace_problems(workspace: Path) -> list[str]:
     from rsi.workspace import has_entry
     problems = load_settings(workspace).problems + scan(workspace)
     if has_entry(workspace, '.codex'):
-        problems.append('工作区里有 .codex')
+        problems.append('The workspace holds .codex')
     return problems

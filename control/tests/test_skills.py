@@ -58,7 +58,7 @@ def needs_folding(test: unittest.TestCase, alias: str = ALIAS, name: str = '.age
 class Materialise(unittest.TestCase):
     def test_regular_skills_are_copied_and_the_rest_named(self):
         staged = tree(self)
-        skill(staged, 'a', '---\nname: a\ndescription: 技能 a\n---\n正文\n')
+        skill(staged, 'a', '---\nname: a\ndescription: skill a\n---\nBody.\n')
         write(staged / 'skills' / 'a' / 'ref.md', b'\x00ref\xff')
         write(staged / 'skills' / 'a' / 'run.sh', '#!/bin/sh\n').chmod(0o755)
         write(staged / 'skills' / 'b' / 'README.md', 'no SKILL.md here')
@@ -72,12 +72,13 @@ class Materialise(unittest.TestCase):
         self.assertTrue(os.access(target / 'a' / 'run.sh', os.X_OK))
         self.assertEqual(len(lines), 3, lines)
         for name in ('skills/b', 'skills/c', 'skills/a/link'):
-            self.assertEqual(sum(name in line.split('：')[0] for line in lines), 1, (name, lines))
+            self.assertEqual(sum(name in line.split(': ')[0] for line in lines), 1, (name, lines))
         self.assertEqual(lines, scan(staged))                           # the same walk names the same entries
 
     def test_files_beside_the_skills_are_ignored_without_a_line(self):
         staged = tree(self)
-        skill(staged, 'a'); write(staged / 'skills' / 'README.md', '索引'); write(staged / 'skills' / '.DS_Store', b'\0')
+        skill(staged, 'a'); write(staged / 'skills' / 'README.md', 'index')
+        write(staged / 'skills' / '.DS_Store', b'\0')
         self.assertEqual((materialise(staged), files(staged / '.agents' / 'skills')), ([], ['a', 'a/SKILL.md']))
         self.assertEqual(workspace_problems(staged), [])               # nothing blocks a candidate's snapshot
 
@@ -88,7 +89,7 @@ class Materialise(unittest.TestCase):
             lines = materialise(staged)
         self.assertEqual(files(staged / '.agents' / 'skills'), ['a', 'a/SKILL.md'])
         [line] = lines                                                  # one line, then the walk stops
-        self.assertTrue(line.startswith('skills/b：') and '1' in line, lines)
+        self.assertTrue(line.startswith('skills/b: the skills have reached the limit of 1 skills;'), lines)
         # (constant, value), files of skill a besides SKILL.md, what is copied besides a/SKILL.md, what is named.
         # Once the files are full the walk stops: one line names where, and skill b is not looked at.
         for patch, extra, kept, named in (
@@ -104,7 +105,7 @@ class Materialise(unittest.TestCase):
             with mock.patch.object(skills, *patch):
                 lines = materialise(staged)
             self.assertEqual(files(staged / '.agents' / 'skills'), sorted(['a', 'a/SKILL.md'] + kept), patch)
-            self.assertEqual([line.split('：')[0] for line in lines], named, (patch, lines))
+            self.assertEqual([line.split(': ')[0] for line in lines], named, (patch, lines))
         visited = []
         original = os.stat
 
@@ -117,7 +118,7 @@ class Materialise(unittest.TestCase):
         for number in range(50):
             write(staged / 'skills' / 'a' / f'f{number:02d}')
         with mock.patch.object(skills, 'MAX_FILES', 2), mock.patch.object(skills.os, 'stat', counting):
-            self.assertEqual([line.split('：')[0] for line in materialise(staged)], ['skills/a/f01'])
+            self.assertEqual([line.split(': ')[0] for line in materialise(staged)], ['skills/a/f01'])
         self.assertLess(len(visited), 10, visited)                      # it stopped looking
 
     def test_copy_failures_are_lines_within_the_cap(self):
@@ -131,8 +132,8 @@ class Materialise(unittest.TestCase):
         with mock.patch.object(workspace, 'MAX_LINES', 2), mock.patch.object(skills._Target, 'open', refuse):
             lines = materialise(staged)
         self.assertEqual(len(lines), 3, lines)
-        self.assertTrue(all('没能放进' in line for line in lines[:2]), lines)
-        self.assertIn('另有 3 条', lines[2])
+        self.assertTrue(all('could not be put into .agents/skills/ (No space' in line for line in lines[:2]), lines)
+        self.assertEqual(lines[2], 'and 3 more of the same kind, not listed one by one')
         self.assertFalse(os.path.lexists(staged / '.agents'))
 
     def test_an_agents_entry_from_a_checkout_is_removed_first(self):
@@ -178,7 +179,7 @@ class Materialise(unittest.TestCase):
                     os.unlink(staged / 'skills'); os.symlink(outside / 'skills', staged / 'ſkills')
             lines = materialise(staged)
             self.assertEqual((len(lines), os.path.lexists(staged / '.agents')), (1, False), odd)
-            self.assertTrue(lines[0].startswith('skills：'), lines)
+            self.assertTrue(lines[0].startswith('skills: '), lines)
             self.assertEqual(lines, workspace_problems(staged))
         self.assertEqual(files(outside), ['skills', 'skills/a', 'skills/a/SKILL.md'])
 
@@ -187,7 +188,7 @@ class Materialise(unittest.TestCase):
         skill(candidate, 'a'); write(candidate / 'skills' / 'b' / 'README.md')
         os.symlink('/etc/hosts', candidate / 'skills' / 'a' / 'link')
         problems = workspace_problems(candidate)
-        self.assertEqual([line.split('：')[0] for line in problems], ['skills/a/link', 'skills/b'])
+        self.assertEqual([line.split(': ')[0] for line in problems], ['skills/a/link', 'skills/b'])
         self.assertFalse(os.path.lexists(candidate / '.agents'))
 
 
@@ -250,7 +251,7 @@ class Aliases(unittest.TestCase):
         needs_folding(self, '.CODEX', '.codex')
         candidate = tree(self)
         (candidate / '.CODEX').mkdir()
-        self.assertIn('工作区里有 .codex', workspace_problems(candidate))
+        self.assertIn('The workspace holds .codex', workspace_problems(candidate))
         self.assertTrue(workspace.has_entry(candidate, '.codex'))
         self.assertFalse(workspace.has_entry(candidate, '.missing'))
 

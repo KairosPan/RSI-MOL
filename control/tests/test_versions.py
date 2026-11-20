@@ -242,6 +242,7 @@ class Versions(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ['a', 'b', 'home', 'versions'])
 
     def test_log_and_a_cut_diff(self):
+        # A message in Chinese, as the versions of a root made before the program spoke English have: read back as is.
         (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', '第一版')
         (self.a / 'f.txt').write_text('2' * 5000); self.store.commit(self.a, 'lab R0002', 'second\nline')
         log = self.store.log()
@@ -255,6 +256,7 @@ class Versions(unittest.TestCase):
         self.assertIn('+' + '2' * 5000, full)
         cut = self.store.diff('V0001', 'V0002', limit=100)
         self.assertTrue(cut.startswith(full[:100])); self.assertLess(len(cut), 200)
+        self.assertTrue(cut.endswith('\n... (the diff is longer than 100 bytes; the rest was cut off)\n'), cut)
 
     def test_no_index_is_left_behind(self):
         (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
@@ -262,7 +264,7 @@ class Versions(unittest.TestCase):
         self.assertEqual(os.listdir(self.store.git_dir / 'indexes'), [])
 
     def test_check_writable_locks_nothing_and_changes_nothing(self):
-        with self.assertRaisesRegex(RuntimeError, '还没有任何版本'): self.store.check_writable()
+        with self.assertRaisesRegex(RuntimeError, 'has no version yet'): self.store.check_writable()
         (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
         refs = self.store._out('for-each-ref')
         self.store.check_writable(); self.store.check_writable()

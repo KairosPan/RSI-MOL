@@ -16,7 +16,7 @@ skills/ opened without following a link.
 
 What is copied is decided by one walk (_walk), which Meta's checks of candidate/ share (scan, used by
 rsi.settings.workspace_problems): regular files and folders only, within the caps below. Everything it leaves out is
-named in a Chinese line, except regular files directly in skills/ (a README, a .DS_Store): they are no skills and are
+named in an English line, except regular files directly in skills/ (a README, a .DS_Store): they are no skills and are
 ignored. Once nothing more can be taken the walk stops, with one line saying where.
 """
 import errno
@@ -71,9 +71,9 @@ class _Walk:
     def take(self, size: int) -> str | None:
         """Count one more regular file of that size, or say why it does not fit (then nothing is counted)."""
         if self.files >= MAX_FILES:
-            return f'技能里的文件已到 {MAX_FILES} 个的上限'
+            return f'the skills have reached the limit of {MAX_FILES} files'
         if self.size + size > MAX_BYTES:
-            return f'技能里的文件加起来会超过 {MAX_BYTES} 字节的上限'
+            return f'the files of the skills would together exceed the limit of {MAX_BYTES} bytes'
         self.files += 1
         self.size += size
         return None
@@ -85,27 +85,27 @@ class _Walk:
         if self.stopped:
             return True
         if self.files >= MAX_FILES:
-            reason = f'技能里的文件已到 {MAX_FILES} 个的上限'
+            reason = f'the skills have reached the limit of {MAX_FILES} files'
         elif self.size >= MAX_BYTES:
-            reason = f'技能里的文件已到 {MAX_BYTES} 字节的上限'
+            reason = f'the files of the skills have reached the limit of {MAX_BYTES} bytes'
         elif top and self.skills >= MAX_SKILLS:
-            reason = f'技能已到 {MAX_SKILLS} 个的上限'
+            reason = f'the skills have reached the limit of {MAX_SKILLS} skills'
         else:
             return False
         self.stopped = True
-        self.line(path, f'{reason}，从这里起其余的内容都不再看，不会放进 {WHERE}')
+        self.line(path, f'{reason}; nothing from here on is looked at, and none of it goes into {WHERE}')
         return True
 
     def line(self, path: str, what: str) -> None:
         """A line about skills/<path>, within the cap of rsi.workspace.Lines."""
-        self.lines.add(f'{show(f"{SKILLS}/{path}")}：{what}')
+        self.lines.add(f'{show(f"{SKILLS}/{path}")}: {what}')
 
 
 def _kind(info: os.stat_result) -> str:
     """What an entry that is not a folder is, for a line."""
     if stat.S_ISLNK(info.st_mode):
-        return '是符号链接'
-    return '是文件' if stat.S_ISREG(info.st_mode) else '是特殊文件'
+        return 'a symbolic link'
+    return 'a file' if stat.S_ISREG(info.st_mode) else 'a special file'
 
 
 def _listed(name: str, parent: int, path: str, walk: _Walk) -> tuple[int, list[str]] | None:
@@ -114,13 +114,13 @@ def _listed(name: str, parent: int, path: str, walk: _Walk) -> tuple[int, list[s
     try:
         fd = open_folder(name, parent)
     except OSError as error:
-        walk.line(path, f'读不了（{error.strerror or error}），不会放进 {WHERE}')
+        walk.line(path, f'cannot be read ({error.strerror or error}); it does not go into {WHERE}')
         return None
     try:
         return fd, sorted(os.listdir(fd))
     except OSError as error:
         os.close(fd)
-        walk.line(path, f'读不了（{error.strerror or error}），不会放进 {WHERE}')
+        walk.line(path, f'cannot be read ({error.strerror or error}); it does not go into {WHERE}')
         return None
 
 
@@ -133,7 +133,7 @@ def _copy(source: int, name: str, info: os.stat_result, target: _Target, path: s
         try:
             found = os.fstat(fd)
             if not stat.S_ISREG(found.st_mode) or (found.st_dev, found.st_ino) != (info.st_dev, info.st_ino):
-                raise OSError(errno.ESTALE, '不是刚才看到的那个普通文件')
+                raise OSError(errno.ESTALE, 'not the regular file seen a moment ago')
             folder = target.open()
             out = os.open(name, _CREATE, 0o755 if found.st_mode & 0o111 else 0o644, dir_fd=folder)
             created = folder
@@ -157,7 +157,7 @@ def _copy(source: int, name: str, info: os.stat_result, target: _Target, path: s
                 os.unlink(name, dir_fd=created)
             except OSError:
                 pass
-        walk.line(path, f'没能放进 {WHERE}（{error.strerror or error}）')
+        walk.line(path, f'could not be put into {WHERE} ({error.strerror or error})')
 
 
 def _folder(source: int, relative: str, level: int, names: list[str], target: _Target | None, walk: _Walk) -> None:
@@ -170,11 +170,11 @@ def _folder(source: int, relative: str, level: int, names: list[str], target: _T
         try:
             info = os.stat(name, dir_fd=source, follow_symlinks=False)
         except OSError as error:
-            walk.line(path, f'读不了（{error.strerror or error}），不会放进 {WHERE}')
+            walk.line(path, f'cannot be read ({error.strerror or error}); it does not go into {WHERE}')
             continue
         if stat.S_ISDIR(info.st_mode):
             if level + 1 > MAX_DEPTH:
-                walk.line(path, f'文件夹嵌套超过 {MAX_DEPTH} 层，不会放进 {WHERE}')
+                walk.line(path, f'folders nested more than {MAX_DEPTH} levels deep; it does not go into {WHERE}')
                 continue
             opened = _listed(name, source, path, walk)
             if opened is None:
@@ -189,11 +189,11 @@ def _folder(source: int, relative: str, level: int, names: list[str], target: _T
         elif stat.S_ISREG(info.st_mode):
             reason = walk.take(info.st_size)
             if reason is not None:
-                walk.line(path, f'{reason}，不会放进 {WHERE}')
+                walk.line(path, f'{reason}; it does not go into {WHERE}')
             elif target is not None:
                 _copy(source, name, info, target, path, walk)
         else:
-            walk.line(path, f'{_kind(info)}，不会放进 {WHERE}（只放普通文件和文件夹）')
+            walk.line(path, f'{_kind(info)}; it does not go into {WHERE} (only regular files and folders do)')
 
 
 def _skill(top: int, name: str, target: _Target | None, walk: _Walk) -> None:
@@ -208,11 +208,11 @@ def _skill(top: int, name: str, target: _Target | None, walk: _Walk) -> None:
         except OSError:
             found = None
         if found is None or not stat.S_ISREG(found.st_mode):
-            walk.line(name, f'里面没有普通文件 {SKILL_FILE}，不是技能，不会放进 {WHERE}')
+            walk.line(name, f'no regular file {SKILL_FILE} in it, so it is not a skill; it does not go into {WHERE}')
             return
         reason = walk.take(found.st_size)
         if reason is not None:
-            walk.line(name, f'{reason}，整个技能不会放进 {WHERE}')
+            walk.line(name, f'{reason}; the whole skill does not go into {WHERE}')
             return
         walk.skills += 1
         here = None if target is None else _Target(name, target)
@@ -234,24 +234,24 @@ def _walk(workspace: int, target: _Target | None) -> list[str]:
     except FileNotFoundError:
         return []
     except OSError as error:
-        return [f'{SKILLS}：读不了（{error.strerror or error}），里面的技能都不会生效']
+        return [f'{SKILLS}: cannot be read ({error.strerror or error}); none of the skills in it take effect']
     if not stat.S_ISDIR(info.st_mode):
-        return [f'{SKILLS}：{_kind(info)}，不是文件夹，里面的技能都不会生效']
+        return [f'{SKILLS}: {_kind(info)}, not a folder; none of the skills in it take effect']
     try:
         top = open_folder(SKILLS, workspace)
     except OSError as error:
-        return [f'{SKILLS}：读不了（{error.strerror or error}），里面的技能都不会生效']
+        return [f'{SKILLS}: cannot be read ({error.strerror or error}); none of the skills in it take effect']
     walk = _Walk()
     try:
         try:
             names = sorted(os.listdir(top))
         except OSError as error:
-            return [f'{SKILLS}：读不了（{error.strerror or error}），里面的技能都不会生效']
+            return [f'{SKILLS}: cannot be read ({error.strerror or error}); none of the skills in it take effect']
         for name in names:
             try:
                 info = os.stat(name, dir_fd=top, follow_symlinks=False)
             except OSError as error:
-                walk.line(name, f'读不了（{error.strerror or error}），不会放进 {WHERE}')
+                walk.line(name, f'cannot be read ({error.strerror or error}); it does not go into {WHERE}')
                 continue
             if stat.S_ISREG(info.st_mode):
                 continue                            # a file beside the skills (a README, a .DS_Store): no skill
@@ -260,14 +260,15 @@ def _walk(workspace: int, target: _Target | None) -> list[str]:
             if stat.S_ISDIR(info.st_mode):
                 _skill(top, name, target, walk)
             else:
-                walk.line(name, f'{_kind(info)}，不是技能（技能是带 {SKILL_FILE} 的文件夹），不会放进 {WHERE}')
+                walk.line(name, f'{_kind(info)}, not a skill (a skill is a folder with {SKILL_FILE}); it does not '
+                                f'go into {WHERE}')
     finally:
         os.close(top)
     return walk.lines.done()
 
 
 def scan(workspace: Path) -> list[str]:
-    """The Chinese lines of materialise's walk of the workspace's skills/ (what would not reach .agents/skills/),
+    """The English lines of materialise's walk of the workspace's skills/ (what would not reach .agents/skills/),
     copying nothing: for Meta's checks of candidate/. A missing workspace has no skills; one that cannot be opened is
     one line."""
     try:
@@ -275,7 +276,7 @@ def scan(workspace: Path) -> list[str]:
     except FileNotFoundError:
         return []
     except OSError as error:
-        return [f'{SKILLS}：读不了（{error.strerror or error}），里面的技能都不会生效']
+        return [f'{SKILLS}: cannot be read ({error.strerror or error}); none of the skills in it take effect']
     try:
         return _walk(fd, None)
     finally:
@@ -292,12 +293,12 @@ def _clear(workspace: int, path: str) -> None:
         except FileNotFoundError:
             return
         remove(AGENTS, workspace, f'{path}/{AGENTS}')
-    raise OSError(errno.EBUSY, f'{AGENTS} 删了 {CLEAR_TRIES} 次还在', path)
+    raise OSError(errno.EBUSY, f'{AGENTS} is still there after {CLEAR_TRIES} removals', path)
 
 
 def materialise(workspace: Path) -> list[str]:
     """Copy the skills of a staged workspace to its .agents/skills/, after removing whatever the file system returns
-    for .agents there; the Chinese lines of what was left out or could not be copied. Only folders that get a copied
+    for .agents there; the English lines of what was left out or could not be copied. Only folders that get a copied
     file are made, so nothing to copy leaves no .agents at all. OSError when the tree cannot be opened, or a .agents
     found there cannot be removed (_clear)."""
     fd = open_folder(workspace)

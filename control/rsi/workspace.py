@@ -13,7 +13,7 @@ Even so, everything here
   link and never on a file with more than one hard link (that inode is shared with a file elsewhere);
 - holds at most about MAX_DEPTH folders open at a time (macOS starts a program with 256 open files);
 - puts a hard cap on every search and every repeated pass: reaching it is an OSError, never a hang;
-- reports in Chinese lines, at most MAX_LINES of them plus one line counting the rest.
+- reports in English lines, at most MAX_LINES of them plus one line counting the rest.
 """
 import ctypes
 import errno
@@ -48,7 +48,7 @@ _GITMODULES_SHORT = re.compile(r'(?:gi7eba|gi7eb|gi7e|gi7|gi|g|)~[1-9][0-9]*')
 
 
 class Lines:
-    """Chinese problem lines, at most MAX_LINES of them plus one line counting the rest."""
+    """English problem lines, at most MAX_LINES of them plus one line counting the rest."""
 
     def __init__(self) -> None:
         self.lines, self.more, self.limit = [], 0, MAX_LINES
@@ -60,7 +60,7 @@ class Lines:
             self.more += 1
 
     def done(self) -> list[str]:
-        return self.lines + ([f'另有 {self.more} 条同类情况，不再逐条列出'] if self.more else [])
+        return self.lines + ([f'and {self.more} more of the same kind, not listed one by one'] if self.more else [])
 
 
 def raise_open_files_limit() -> None:
@@ -213,7 +213,7 @@ def open_unlocked(name: str, dir_fd: int | None, path: str) -> int:
     a link or not a folder; OSError if it still cannot be opened."""
     info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
     if not stat.S_ISDIR(info.st_mode):
-        raise NotADirectoryError(errno.ENOTDIR, '不是文件夹（可能是符号链接或文件）', path)
+        raise NotADirectoryError(errno.ENOTDIR, 'not a folder (it may be a symbolic link or a file)', path)
     _unlock(name, dir_fd, path, info, stat.S_IRWXU)
     return _opened(name, dir_fd, path)
 
@@ -244,7 +244,7 @@ def free_name(dir_fd: int, base: str, counters: dict | None = None) -> str:
         name = f'{base}-{secrets.token_hex(8)}'
         if not _taken(name, dir_fd):
             return name
-    raise FileExistsError(errno.EEXIST, f'找不到空闲的名字（试了 {LINEAR_TRIES + RANDOM_TRIES} 个）', base)
+    raise FileExistsError(errno.EEXIST, f'no free name found (after {LINEAR_TRIES + RANDOM_TRIES} tries)', base)
 
 
 # The seal, and what becomes of a sealed entry.
@@ -335,7 +335,7 @@ def empty(top: int, path: str) -> None:
         finally:
             for frame in stack[1:]:
                 os.close(frame[0])
-    raise OSError(errno.EBUSY, f'删了 {MAX_PASSES} 遍还没删完', path)
+    raise OSError(errno.EBUSY, f'not removed after {MAX_PASSES} passes', path)
 
 
 # Names git refuses to store.
@@ -394,11 +394,12 @@ class _Aside:
             _retrying(lambda: os.rename(name, target, src_dir_fd=dir_fd, dst_dir_fd=self.fd), path, info)
         except OSError as error:
             self.blocked += 1
-            lines.add(f'{show(relative)} {why}，应排除在版本之外，但移不出去（{error.strerror or error}），'
-                      '所以这次不存版本')
+            lines.add(f'{show(relative)} {why}; it must be left out of the version but cannot be moved out '
+                      f'({error.strerror or error}), so no version is saved this time')
             return
         self.moved += 1
-        lines.add(f'{show(relative)} {why}，没有存进版本，已移到 {show(self.shown + "/" + target)}')
+        lines.add(f'{show(relative)} {why}; it was not saved in the version and was moved to '
+                  f'{show(self.shown + "/" + target)}')
 
 
 def _readable(name: str, dir_fd: int, path: str, info: os.stat_result) -> bool:
@@ -424,29 +425,31 @@ def _visit(name: str, fd: int, prefix: str, depth: int, counters: dict, tree: st
     if is_dotgit(name) or (stat.S_ISLNK(info.st_mode) and is_dotgitmodules(name)):
         new = free_name(fd, ('.git' if is_dotgit(name) else '.gitmodules') + KEPT, counters)
         os.rename(name, new, src_dir_fd=fd, dst_dir_fd=fd)
-        lines.add(f'{show(prefix + name)} 是 git 不收的名字（嵌套的 .git 之类），已改名为 {show(prefix + new)}，'
-                  '以便存成版本')
+        lines.add(f'{show(prefix + name)} is a name git does not store (a nested .git or the like); it was renamed '
+                  f'to {show(prefix + new)} so that it can be saved in a version')
         name, path = new, f'{tree}/{prefix}{new}'
     relative = prefix + name
     if folder:
         if depth + 1 > MAX_DEPTH or len(os.fsencode(relative)) > MAX_PATH_BYTES:
-            aside.take(name, fd, path, info, relative, f'嵌套超过 {MAX_DEPTH} 层或路径超过 {MAX_PATH_BYTES} 字节', lines)
+            aside.take(name, fd, path, info, relative,
+                       f'is nested more than {MAX_DEPTH} levels deep or has a path longer than {MAX_PATH_BYTES} bytes',
+                       lines)
             return
         try:
             child, names = _listed(name, fd, path)
         except PermissionError:
-            aside.take(name, fd, path, info, relative, '打不开', lines)
+            aside.take(name, fd, path, info, relative, 'cannot be opened', lines)
             return
         stack.append([child, iter(names), relative + '/', depth + 1, {}])
     elif regular:
         if info.st_size > BIG_FILE:
-            aside.take(name, fd, path, info, relative, f'有 {info.st_size} 字节，超过 {BIG_FILE} 字节', lines)
+            aside.take(name, fd, path, info, relative, f'has {info.st_size} bytes, more than {BIG_FILE}', lines)
         elif not _readable(name, fd, path, info):
-            aside.take(name, fd, path, info, relative, '读不了', lines)
+            aside.take(name, fd, path, info, relative, 'cannot be read', lines)
 
 
 def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str], int, int]:
-    """Make a sealed tree storable as a version. Returns the Chinese lines (capped), how many entries were moved
+    """Make a sealed tree storable as a version. Returns the English lines (capped), how many entries were moved
     out of the tree (left out of the version), and how many are blocking: entries that had to be left out but could
     not be moved out, or that could not be handled at all. When any entry is blocking, the tree must not be saved as
     a version: it may hold what the rules leave out. OSError if the tree itself is not a folder that can be opened.
@@ -482,7 +485,8 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
                 _visit(name, fd, prefix, depth, counters, tree, aside, lines, stack)
             except OSError as error:
                 failed += 1
-                lines.add(f'{show(prefix + name)} 处理不了（{error.strerror or error}），所以这次不存版本')
+                lines.add(f'{show(prefix + name)} cannot be handled ({error.strerror or error}), so no version is '
+                          'saved this time')
     finally:
         close(*(frame[0] for frame in stack), aside.fd)
     return lines.done(), aside.moved, aside.blocked + failed

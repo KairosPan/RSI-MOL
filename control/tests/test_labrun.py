@@ -111,7 +111,7 @@ class LabRuns(unittest.TestCase):
             self.assertEqual(root.store.commit(root.layout.work, 'owner', 'with .codex'), 'V0002')
             with self.assertRaisesRegex(Refused, '.codex'): run_task(root.layout, 'T1')     # head holds .codex
             self.assertFalse(os.path.lexists(root.layout.work))          # head cannot be staged back either ...
-            self.assertIn('现在没有可用的 work/', index(root, 'refusal')[0]['reason'])     # ... and it says so
+            self.assertIn('there is no usable work/ now', index(root, 'refusal')[0]['reason'])     # ... and says so
             (root.layout.owner / 'limits.toml').write_text('[day]\ncalls = 0\n')
             with self.assertRaises(Refused): run_task(root.layout, 'T1')
             self.assertEqual(root.records.calls(), []); self.assertEqual(root.model.requests, [])
@@ -154,7 +154,7 @@ class LabRuns(unittest.TestCase):
             self.assertNotEqual(call['tree_after'], root.store.tree_of('V0001'))
             self.assertTrue(call['check']['passed']); self.assertFalse(os.path.lexists(root.layout.trial))
             root.model.push(say('hi'))
-            probe = run_trial(root.layout, commit=commit, round_id='M0001', probe='说一声你好')
+            probe = run_trial(root.layout, commit=commit, round_id='M0001', probe='say hello')
             self.assertEqual((probe['task'], probe['check']), (None, None))
             self.assertEqual(([entry['version'] for entry in root.store.log()], leftovers(root)), (['V0001'], []))
 
@@ -187,7 +187,7 @@ class MoreLabRuns(unittest.TestCase):
 
             def commit(store, folder, author, message):
                 if author.startswith('lab '):
-                    raise ValueError('文件夹里有 .git，不能存为版本：repo/.git')
+                    raise ValueError('The folder holds .git, so it cannot be saved as a version: repo/.git')
                 return original(store, folder, author, message)
 
             with mock.patch.object(VersionStore, 'commit', commit):
@@ -315,9 +315,9 @@ class MoreLabRuns(unittest.TestCase):
     def test_probe_results_are_collected(self):
         with Root() as root:
             commit = root.store.resolve('V0001')
-            root.model.push(add_file('out/probe/hello.txt', '你好'), say('done'))
-            call = run_trial(root.layout, commit=commit, round_id='M0001', probe='写一个文件')
-            self.assertEqual((call['status'], call['probe'], call['task']), ('finished', '写一个文件', None))
+            root.model.push(add_file('out/probe/hello.txt', 'hello'), say('done'))
+            call = run_trial(root.layout, commit=commit, round_id='M0001', probe='write a file')
+            self.assertEqual((call['status'], call['probe'], call['task']), ('finished', 'write a file', None))
             self.assertTrue((root.records.call_dir(call['id']) / 'out' / 'hello.txt').is_file())
             self.assertIn('out/probe/', (root.records.call_dir(call['id']) / 'prompt.txt').read_text())
             self.assertFalse(os.path.lexists(root.layout.trial))
@@ -376,7 +376,7 @@ class SealFirst(unittest.TestCase):
                 with self.assertRaises(Refused): run_task(root.layout, 'T1')
             self.assertEqual((os.listdir(outside), (outside / 'x').read_text()), (['x'], 'x'))
             self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
-            [refusal] = index(root, 'refusal'); self.assertIn('现在没有可用的 work/', refusal['reason'])
+            [refusal] = index(root, 'refusal'); self.assertIn('there is no usable work/ now', refusal['reason'])
             self.assertTrue(root.layout.work.is_symlink())
             [note] = index(root, 'sealed'); self.assertTrue((root.layout.root / note['path']).is_symlink())
             root.model.push(say('ok'))                                 # the next run seals the link and keeps it
@@ -470,7 +470,7 @@ class SealFirst(unittest.TestCase):
                 root.model.push(add_file(f'notes/{number}.md', 'x'), say('ok'))
                 self.assertIsNotNone(run_task(root.layout, 'T1')['version_after'])
                 root.model.push(say('hi'))
-                self.assertEqual(run_trial(root.layout, commit=commit, round_id='M0001', probe='你好')['status'],
+                self.assertEqual(run_trial(root.layout, commit=commit, round_id='M0001', probe='hello')['status'],
                                  'finished')
             self.assertEqual((os.listdir(root.layout.staging), leftovers(root)), ([], []))
             self.assertFalse(root.layout.sealed.exists()); self.assertEqual(root.store.head(), 'V0006')
@@ -524,10 +524,10 @@ class SealFirst(unittest.TestCase):
             self.assertEqual((call['status'], call['usage']['input_tokens'], call['usage']['output_tokens']),
                              ('finished', 5, 2))
             self.assertEqual((call['version_after'], call['commit_failed'], root.store.head()), (None, True, 'V0001'))
-            self.assertTrue(any('版本没有保存' in line for line in call['problems']))
+            self.assertTrue(any('the version was not saved' in line for line in call['problems']))
             [note] = index(root, 'sealed')
             self.assertEqual((note['call'], note['path']), (call['id'], f'sealed/{call["id"]}/work'))
-            self.assertTrue(any('版本没有保存' in reason for reason in note['reasons']))
+            self.assertTrue(any('the version was not saved' in reason for reason in note['reasons']))
             self.assertTrue((root.layout.root / note['path'] / 'data' / 'huge.bin').is_file())
             self.assertFalse(os.path.lexists(root.layout.work / 'data'))     # work/ is main's head again
 
@@ -535,7 +535,7 @@ class SealFirst(unittest.TestCase):
         with Root() as root:
             outside = root.layout.root / 'outside'; outside.mkdir(); (outside / 'x').write_text('x')
             root.layout.trial.rmdir(); os.symlink(outside, root.layout.trial); root.model.push(say('hi'))
-            call = run_trial(root.layout, commit=root.store.resolve('V0001'), round_id='M0001', probe='说一声你好')
+            call = run_trial(root.layout, commit=root.store.resolve('V0001'), round_id='M0001', probe='say hello')
             self.assertEqual((call['status'], os.listdir(outside)), ('finished', ['x']))
             self.assertFalse(os.path.lexists(root.layout.trial)); self.assertEqual(leftovers(root), [])
 
@@ -543,7 +543,7 @@ class SealFirst(unittest.TestCase):
 def write_skill(workspace: Path, folder: str, name: str) -> None:
     path = workspace / 'skills' / folder / 'SKILL.md'
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(f'---\nname: {name}\ndescription: 演示用的技能 {name}\n---\n\n演示。\n', encoding='utf-8')
+    path.write_text(f'---\nname: {name}\ndescription: a skill for the demo {name}\n---\n\nA demo.\n', encoding='utf-8')
 
 
 def body(request: dict) -> str:
@@ -558,7 +558,7 @@ class Skills(unittest.TestCase):
         with Root() as root:
             root.add_task('T1'); write_skill(root.layout.work, 'demo', 'demo-skill-marker')
             self.assertEqual(root.store.commit(root.layout.work, 'owner', 'a skill'), 'V0002')
-            new = '---\nname: new-skill-marker\ndescription: Lab 自己加的技能\n---\n\n新技能。\n'
+            new = '---\nname: new-skill-marker\ndescription: a skill the Lab added itself\n---\n\nA new skill.\n'
             root.model.push(add_file('skills/new/SKILL.md', new), add_file('skills/loose/x.md', 'no SKILL.md'),
                             say('ok'))
             call = run_task(root.layout, 'T1')
@@ -571,7 +571,7 @@ class Skills(unittest.TestCase):
             # The re-staged work/ holds V0003: the skill it drops is told at once, in this call's problems.
             [line] = call['problems']
             self.assertEqual((call['settings_problems'], line.startswith(labrun.RESTAGED)), ([], True))
-            self.assertTrue(line.removeprefix(labrun.RESTAGED).startswith('skills/loose：'), line)
+            self.assertTrue(line.removeprefix(labrun.RESTAGED).startswith('skills/loose: '), line)
             for folder in ('demo', 'new'):
                 self.assertTrue((root.layout.work / '.agents' / 'skills' / folder / 'SKILL.md').is_file(), folder)
             first = len(root.model.requests); root.model.push(say('ok'))
@@ -580,7 +580,7 @@ class Skills(unittest.TestCase):
             self.assertIn('demo-skill-marker', body(root.model.requests[first]))
             self.assertEqual((call['version_before'], call['version_after'], root.store.head()),
                              ('V0003', None, 'V0003'))                      # .agents never makes a version
-            self.assertEqual([line.split('：')[0] for line in call['settings_problems']], ['skills/loose'])
+            self.assertEqual([line.split(': ')[0] for line in call['settings_problems']], ['skills/loose'])
             self.assertEqual(leftovers(root), [])
 
     def test_an_agents_folder_that_cannot_be_cleared_is_a_noted_refusal(self):
@@ -591,7 +591,7 @@ class Skills(unittest.TestCase):
             self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
             [refusal] = index(root, 'refusal')
             self.assertIn('Operation not permitted', refusal['reason'])
-            self.assertIn('现在没有可用的 work/', refusal['reason'])          # the restore met the same failure
+            self.assertIn('there is no usable work/ now', refusal['reason'])      # the restore met the same failure
 
     def test_a_trial_loads_the_candidates_skills_not_heads(self):
         with Root() as root:
@@ -603,11 +603,11 @@ class Skills(unittest.TestCase):
             loose.mkdir(); (loose / 'x.md').write_text('x')
             commit = root.store.snapshot(root.layout.candidate, 'M0001', 't')
             root.model.push(say('hi'))
-            call = run_trial(root.layout, commit=commit, round_id='M0001', probe='说一声你好')
+            call = run_trial(root.layout, commit=commit, round_id='M0001', probe='say hello')
             self.assertEqual(call['status'], 'finished')
             self.assertIn('candidate-skill-marker', body(root.model.requests[0]))
             self.assertNotIn('head-skill-marker', body(root.model.requests[0]))
-            self.assertEqual([line.split('：')[0] for line in call['settings_problems']], ['skills/loose'])
+            self.assertEqual([line.split(': ')[0] for line in call['settings_problems']], ['skills/loose'])
             self.assertEqual((call['tree_after'], call['problems']), (root.store.tree_of(commit), []))
             self.assertFalse(os.path.lexists(root.layout.trial)); self.assertEqual(leftovers(root), [])
 

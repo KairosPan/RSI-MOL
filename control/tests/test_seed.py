@@ -168,7 +168,7 @@ class Seed(unittest.TestCase):
             (Path(folder) / SETTINGS).write_text('\n'.join(examples) + '\n', encoding='utf-8')
             settings = load_settings(Path(folder))
         # Uncommented, every example is taken except the model's, which stands for a model name and is refused.
-        self.assertEqual(len(settings.problems), 1, settings.problems); self.assertIn('：model ', settings.problems[0])
+        self.assertEqual(len(settings.problems), 1, settings.problems); self.assertIn(': model ', settings.problems[0])
         default = Settings()
         for name in ('effort', 'web_search', 'network', 'max_depth', 'max_threads', 'disabled_connectors',
                      'disabled_plugins'):

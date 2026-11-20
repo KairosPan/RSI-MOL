@@ -256,7 +256,8 @@ class BeforeCommit(unittest.TestCase):
 
             with mock.patch.object(workspace, 'BIG_FILE', 10), mock.patch.object(os, 'rename', refuse):
                 lines, moved, blocked = prepare(root, tree)
-            self.assertEqual((len(lines), moved, blocked), (1, 0, 1)); self.assertIn('所以这次不存版本', lines[0])
+            self.assertEqual((len(lines), moved, blocked), (1, 0, 1))
+            self.assertIn('so no version is saved this time', lines[0])
             self.assertTrue((tree / 'big.bin').is_file())
 
     @macos
