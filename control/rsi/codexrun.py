@@ -19,6 +19,9 @@ from rsi.tomlout import render_flags
 KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL of a call's process group
 RECORD_FILES = ('prompt.txt', 'events.jsonl', 'stderr.txt', 'last-message.txt')
 LOCAL_HOSTS = '127.0.0.1,localhost'
+# The only variables of the control program's own environment that Codex gets, besides LC_* and the owner's tool
+# secrets RSI_TOOL_* (bearer tokens of URL tool servers, see settings.BEARER).
+KEPT_VARIABLES = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR')
 
 
 @dataclass
@@ -36,15 +39,39 @@ def codex_program() -> str:
     return os.environ.get('RSI_CODEX', 'codex')
 
 
-def codex_version() -> str:
-    """The version Codex reports, e.g. '0.170.0'.
+def codex_environment(home: Path, *, secrets: bool = True) -> dict:
+    """The environment a Codex process starts with: the few basics of KEPT_VARIABLES and LC_*, the owner's
+    RSI_TOOL_* secrets (unless secrets is false) and CODEX_HOME. Nothing else of os.environ reaches Codex."""
+    env = {key: value for key, value in os.environ.items()
+           if key in KEPT_VARIABLES or key.startswith('LC_') or (secrets and key.startswith('RSI_TOOL_'))}
+    env['CODEX_HOME'] = str(home)
+    return env
 
-    Codex writes helper files into its home even for --version, so this runs with a throwaway home.
+
+def codex_version() -> str:
+    """The version Codex reports, e.g. '0.170.0'; RuntimeError (in Chinese) when it reports none.
+
+    Codex writes helper files into its home even for --version, so this runs with a throwaway home, in its own
+    process group, which is killed afterwards.
     """
+    program = codex_program()
     with tempfile.TemporaryDirectory() as home:
-        done = subprocess.run([codex_program(), '--version'], capture_output=True, text=True, timeout=60,
-                              check=True, env=dict(os.environ, CODEX_HOME=home))
-    return done.stdout.split()[-1]
+        process = subprocess.Popen([program, '--version'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True,
+                                   env=codex_environment(Path(home), secrets=False))
+        try:
+            out, err = process.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            process.wait()
+            raise RuntimeError(f'`{program} --version` 60 秒内没有结束') from None
+        finally:
+            _kill_group(process)
+    words = out.split()
+    if process.returncode != 0 or not words:
+        detail = ' '.join(err.split())[:300]
+        raise RuntimeError(f'`{program} --version` 没有报出版本号（退出码 {process.returncode}）：{detail}')
+    return words[-1]
 
 
 def _merge(base: dict, extra: dict) -> dict:
@@ -61,7 +88,7 @@ def _stop(process: subprocess.Popen) -> None:
     """SIGTERM the call's process group, SIGKILL it after KILL_GRACE seconds, and reap the leader."""
     try:
         os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):  # macOS: PermissionError for a group of one exited leader
         pass
     try:
         process.wait(timeout=KILL_GRACE)
@@ -101,9 +128,12 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
 
     When $RSI_TEST_MODEL_ENDPOINT is set the call goes to that scripted endpoint instead of a model.
     on_start(pid) is called once the process exists. Status is `finished` (exit code 0 and a turn.completed
-    event), `timed_out` (the process group got SIGTERM, then SIGKILL) or `failed`.
+    event), `timed_out` (the process group got SIGTERM, then SIGKILL) or `failed`. The paths are made absolute
+    first. Codex gets codex_environment(home), not the control program's whole environment.
     """
-    env = dict(os.environ, CODEX_HOME=str(home))
+    home, cwd, record_dir = Path(home).resolve(), Path(cwd).resolve(), Path(record_dir).resolve()
+    schema = Path(schema).resolve() if schema is not None else None
+    env = codex_environment(home)
     endpoint = os.environ.get('RSI_TEST_MODEL_ENDPOINT')
     if endpoint:
         config = _merge(config, provider_config(endpoint))
@@ -145,8 +175,9 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
             except BaseException:
                 _stop(process)
                 raise
-            # After every call, finished or not, SIGKILL the whole process group on purpose: nothing the call
-            # started (a tool's background process, a stray child) may outlive it.
+            # After every call, finished or not, SIGKILL the whole process group on purpose, so that what the call
+            # left in it (a tool's background process, a stray child) does not outlive it. A process that started
+            # its own session or group is out of this reach.
             _kill_group(process)
     if not os.path.lexists(last_message):
         last_message.touch()

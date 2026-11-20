@@ -3,6 +3,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
 
-from rsi.codexrun import codex_version, run_codex
+from rsi.codexrun import _stop, codex_version, run_codex
 from rsi.mockmodel import ScriptedModel, add_file, delete_file, hang_up, provider_config, run_js, say, slow, with_usage
 from tests.support import needs_codex, scratch_config
 
@@ -124,20 +125,66 @@ class ScriptedEndpoint(unittest.TestCase):
                 'request_max_retries': 0, 'stream_max_retries': 0}}})
 
 
-class CodexHome(unittest.TestCase):
-    def test_version_runs_with_a_throwaway_home(self):
-        seen = {}
+class FakeCodex(unittest.TestCase):
+    """A stand-in program as $RSI_CODEX: a Python script that notes what it was started with in seen.json."""
 
-        def fake_run(command, **options):
-            home = Path(options['env']['CODEX_HOME'])
-            seen.update(command=command, home=home, existed=home.is_dir())
-            return subprocess.CompletedProcess(command, 0, 'codex-cli 9.8.7\n', '')
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.dict(os.environ); patcher.start(); self.addCleanup(patcher.stop)
 
-        with mock.patch('rsi.codexrun.subprocess.run', fake_run):
-            self.assertEqual(codex_version(), '9.8.7')
-        self.assertEqual(seen['command'][1:], ['--version'])
-        self.assertTrue(seen['existed']); self.assertFalse(seen['home'].exists())
-        self.assertNotEqual(seen['home'], Path.home() / '.codex')
+    def fake(self, output: str) -> Path:
+        program = self.tmp / 'fake-codex'
+        program.write_text(
+            f'#!{sys.executable}\nimport json, os, sys\nif sys.argv[1:] != ["--version"]: sys.stdin.read()\n'
+            'seen = {"env": dict(os.environ), "cwd": os.getcwd(), "argv": sys.argv, "pid": os.getpid(),\n'
+            '        "pgid": os.getpgid(0), "home_existed": os.path.isdir(os.environ.get("CODEX_HOME", ""))}\n'
+            f'json.dump(seen, open({str(self.tmp / "seen.json")!r}, "w"))\nprint({output!r})\n')
+        program.chmod(0o755)
+        os.environ['RSI_CODEX'] = str(program)
+        return program
+
+    def seen(self) -> dict:
+        return json.loads((self.tmp / 'seen.json').read_text())
+
+    def test_version_runs_with_a_throwaway_home_in_its_own_group(self):
+        self.fake('codex-cli 9.8.7')
+        self.assertEqual(codex_version(), '9.8.7')
+        seen = self.seen(); home = Path(seen['env']['CODEX_HOME'])
+        self.assertEqual(seen['argv'][1:], ['--version'])
+        self.assertTrue(seen['home_existed']); self.assertFalse(home.exists())
+        self.assertNotEqual(home, Path.home() / '.codex')
+        self.assertEqual(seen['pid'], seen['pgid'])
+
+    def test_version_without_output_is_a_clear_error(self):
+        self.fake('')
+        with self.assertRaisesRegex(RuntimeError, '版本号'):
+            codex_version()
+
+    def test_codex_gets_a_minimal_environment_and_absolute_paths(self):
+        self.fake('')
+        os.environ.update(RSI_TOOL_FAR='secret', SSH_AUTH_SOCK='/x/agent.sock', OPENAI_API_KEY='k', LC_CTYPE='UTF-8',
+                          PYTHONPATH='/x', RSI_TEST_MODEL_ENDPOINT='http://127.0.0.1:9/v1')
+        (self.tmp / 'work').mkdir(); (self.tmp / 's.json').write_text('{}')
+        here = os.getcwd(); os.chdir(self.tmp); self.addCleanup(os.chdir, here)
+        result = run_codex(home=Path('home'), cwd=Path('work'), prompt='go', config={}, record_dir=Path('r'),
+                           timeout=30, schema=Path('s.json'))
+        seen = self.seen(); env = seen['env']
+        self.assertEqual((env['CODEX_HOME'], seen['cwd']), (str(self.tmp / 'home'), str(self.tmp / 'work')))
+        self.assertEqual((env['RSI_TOOL_FAR'], env['LC_CTYPE'], env['NO_PROXY']),
+                         ('secret', 'UTF-8', '127.0.0.1,localhost'))
+        for gone in ('SSH_AUTH_SOCK', 'OPENAI_API_KEY', 'PYTHONPATH', 'RSI_TEST_MODEL_ENDPOINT', 'RSI_CODEX'):
+            self.assertNotIn(gone, env)
+        allowed = {'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', 'CODEX_HOME', 'NO_PROXY',
+                   '__CF_USER_TEXT_ENCODING'}
+        self.assertEqual([key for key in env if key not in allowed and not key.startswith(('LC_', 'RSI_TOOL_'))], [])
+        self.assertEqual(result.command[result.command.index('-o') + 1], str(self.tmp / 'r' / 'last-message.txt'))
+        self.assertEqual(result.command[result.command.index('--output-schema') + 1], str(self.tmp / 's.json'))
+
+    def test_stop_survives_a_group_it_may_not_signal(self):
+        process = subprocess.Popen(['/bin/sleep', '0'], start_new_session=True); process.wait()
+        with mock.patch('rsi.codexrun.os.killpg', side_effect=PermissionError):
+            _stop(process)
 
 
 class MissingCodex(unittest.TestCase):
