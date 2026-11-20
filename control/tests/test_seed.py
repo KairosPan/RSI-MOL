@@ -27,15 +27,13 @@ TASKS = SEED.parents[1] / 'tasks'
 META_TEXT = SEED / 'owner' / 'meta' / 'AGENTS.md'
 WORK_FILES = ['AGENTS.md', 'codex/agents/literature.toml', 'codex/settings.toml', 'notes/README.md']
 OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
-# CJK punctuation, CJK ideographs, full-width forms: none may be in the Lab's seed workspace, which is all English.
-CJK = re.compile('[　-〿一-鿿＀-￯]')
-# What the English Lab seed calls the human owner and the Lab lead, and the files that name each (the role file
-# speaks of the lead; only the settings file speaks of the owner).
+# What the English Lab seed calls the human owner and the Lab lead, and the files that name each (the instructions
+# and the role file speak of the lead; only the settings file speaks of the owner).
 NAMES = re.compile(r'\bthe (owner|lead)\b', re.IGNORECASE)
-NAMED = {'AGENTS.md': [], 'codex/agents/literature.toml': ['lead'], 'codex/settings.toml': ['owner'],
+NAMED = {'AGENTS.md': ['lead'], 'codex/agents/literature.toml': ['lead'], 'codex/settings.toml': ['owner'],
          'notes/README.md': []}
 # The rule of Meta's standing instructions that keeps the Lab workspace in English, and the bullet it follows.
-ENGLISH_RULE = ('- Lab 工作区里留下的文件一律用英文写：指示、技能、角色、设置里的注释、脚本。'
+ENGLISH_RULE = ('- Lab 工作区里留下的文件一律用英文写，文件名和文件夹名也用英文：指示、技能、角色、设置里的注释、脚本。'
                 '你在 `../candidate/` 里的改动用英文，你自己的笔记也用英文。')
 DISABLE_RULE = '- 要关掉已允许的某个连接器或插件'
 # A commented-out example line of the seed's settings.toml: a table header or `key = value`, after '# '.
@@ -169,9 +167,10 @@ class Seed(unittest.TestCase):
         self.assertIn('the owner decides', (SEED / 'work' / SETTINGS).read_text(encoding='utf-8'))
 
     def test_the_lab_seed_is_all_english(self):
+        """Every file of the Lab's seed workspace is plain ASCII: no Chinese, nor any other non-ASCII character."""
         for name in files(SEED / 'work'):
             with self.subTest(name=name):
-                self.assertIsNone(CJK.search((SEED / 'work' / name).read_text(encoding='utf-8')))
+                self.assertTrue((SEED / 'work' / name).read_bytes().isascii())
 
     def test_meta_is_told_to_keep_the_lab_workspace_in_english(self):
         """The rule is the bullet right after the one on turning off a connector or plugin."""

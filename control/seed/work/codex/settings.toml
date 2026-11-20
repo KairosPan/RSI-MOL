@@ -1,5 +1,5 @@
-# Settings of the Lab's Codex. Each time before it starts the Lab, the control program merges the keys written here
-# into Codex's configuration.
+# The Lab Codex's settings. Before each Lab run, the control program merges the keys written here into the Codex
+# configuration.
 # Only the keys below are accepted; any other key has no effect and is noted in the record of that run. A key that is
 # not written keeps its default value.
 # The examples below are all commented out. To use one, remove the "# " at the start of its lines, then change the
@@ -11,8 +11,8 @@
 # Reasoning effort: one of none, minimal, low, medium, high, xhigh. If it is not written, Codex's default is used.
 # model_reasoning_effort = "high"
 
-# Web search: one of live (search live), cached (use cached results), disabled (turned off). If it is not written,
-# Codex's default is used.
+# Web search: one of live (search the web at request time), cached (use cached results), disabled (turned off). If
+# it is not written, Codex's default is used.
 # web_search = "live"
 
 # Network for commands: true turns it on, false turns it off (off by default). When it is on, commands reach outside
