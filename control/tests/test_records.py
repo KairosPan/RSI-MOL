@@ -4,9 +4,10 @@ import os
 import shutil
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from rsi.limits import Limits, refusal, usage_by_class
 from rsi.records import Records
 
 
@@ -92,6 +93,36 @@ class RecordsTests(unittest.TestCase):
         self.assertEqual(self.records.new_id('R'), 'R10001')         # reserved but not started: not a call yet
         self.assertEqual([c['id'] for c in self.records.calls()], ['R9999', 'R10000'])
         self.assertEqual({c['status'] for c in self.records.calls()}, {'started'})
+
+    def test_a_bad_record_does_not_hide_the_others(self):
+        before = (datetime.now().astimezone() - timedelta(days=2)).isoformat()
+        for _ in range(6):
+            fields = {'role': 'lab', 'cost_class': 'online', 'started': before}
+            self.records.start_call(self.records.new_id('R'), fields)
+        self.records.finish_call('R0001', {'status': 'finished', 'usage': {'input_tokens': 5, 'output_tokens': 1}})
+        bad = {call: self.records.call_dir(call) / 'call.json' for call in ('R0002', 'R0003', 'R0004', 'R0005')}
+        bad['R0002'].write_text('{"id": "R0002", "sta')                # cut short
+        bad['R0003'].write_text('null')
+        bad['R0004'].write_bytes(b'{"id": "\xff"}')                    # not UTF-8
+        bad['R0005'].unlink(); bad['R0005'].mkdir()                     # cannot be read as a file
+        calls = self.records.calls()
+        self.assertEqual([c['id'] for c in calls], ['R0001', 'R0002', 'R0003', 'R0004', 'R0005', 'R0006'])
+        self.assertEqual([c['status'] for c in calls], ['finished'] + ['unreadable'] * 4 + ['started'])
+        for call, path in bad.items():
+            stand_in = calls[int(call[1:]) - 1]
+            self.assertEqual(sorted(stand_in), ['id', 'problem', 'status'])
+            self.assertIn(str(path), stand_in['problem'])
+            with self.assertRaises(ValueError) as caught: self.records.load_call(call)
+            self.assertEqual(str(caught.exception), stand_in['problem'])
+        with self.assertRaises(ValueError): self.records.finish_call('R0003', {'status': 'interrupted'})
+        now = datetime.now().astimezone()
+        self.assertIsNone(refusal(Limits(day_calls=5), calls, now))       # only the four unreadable count today
+        self.assertIn('其中 4 份调用记录读不出来', refusal(Limits(day_calls=4), calls, now))
+        summary = usage_by_class(calls)
+        self.assertEqual(summary['unknown'], {'calls': 4, 'input_tokens': 0, 'output_tokens': 0,
+                                              'unknown_usage_calls': 4})
+        self.assertEqual(summary['online'], {'calls': 2, 'input_tokens': 5, 'output_tokens': 1,
+                                             'unknown_usage_calls': 1})
 
     def test_application_ids_are_claimed_by_their_file(self):
         applications = self.records.root / 'applications'

@@ -3,15 +3,19 @@
 Only the owner edits limits.toml; a missing file means the defaults, and anything the file holds besides the six
 keys below is an error rather than ignored. refusal() checks only the daily caps, over the call records; the caps
 per Lab run and per Meta round are for the code that starts those. Usage comes from each call's record after the
-call; a call whose usage is not known is counted as unknown, never as zero.
+call; a call whose usage is not known is counted as unknown, never as zero. A call record that cannot be read
+(status `unreadable`) counts as a call of today with unknown usage and cost class `unknown`.
 """
 import tomllib
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from rsi.records import UNREADABLE
+
 FILE = 'limits.toml'
 COST_CLASSES = ('online', 'meta', 'eval')
+UNKNOWN_CLASS = 'unknown'      # for a call whose cost class is missing, not a string, or unreadable
 # (table, key) in limits.toml -> (field of Limits, smallest allowed value)
 KEYS = {
     ('lab', 'seconds_per_run'): ('lab_seconds', 1),
@@ -82,15 +86,27 @@ def _tokens(usage) -> tuple[int, int] | None:
     return counts
 
 
+def _unreadable(call) -> bool:
+    return not isinstance(call, dict) or call.get('status') == UNREADABLE
+
+
+def _usage(call):
+    return None if _unreadable(call) else call.get('usage')
+
+
 def refusal(limits: Limits, calls: list[dict], now: datetime) -> str | None:
     """Why no new call may start today, in Chinese, or None.
 
-    Today is the local calendar day of now; a call belongs to the day it started, whatever its status. A call
-    without a readable `started` time is not counted. The token cap counts only calls whose usage is known.
+    Today is the local calendar day of now; a call belongs to the day it started, whatever its status. An
+    unreadable record counts as today's, whatever its date, since its date is not known; a readable call without a
+    readable `started` time is not counted. The token cap counts only calls whose usage is known.
     """
     today = _local_day(now)
     todays = []
     for call in calls:
+        if _unreadable(call):
+            todays.append(call)
+            continue
         try:
             started = datetime.fromisoformat(call['started'])
         except (KeyError, TypeError, ValueError):
@@ -98,10 +114,12 @@ def refusal(limits: Limits, calls: list[dict], now: datetime) -> str | None:
         if _local_day(started) == today:
             todays.append(call)
     if len(todays) >= limits.day_calls:
+        unreadable = sum(map(_unreadable, todays))
+        note = f'其中 {unreadable} 份调用记录读不出来，按今天的算。' if unreadable else ''
         return (f'今天（{today}）已经开始了 {len(todays)} 次调用，到了每天 {limits.day_calls} 次的上限'
-                f'（owner/limits.toml 的 day.calls）。')
+                f'（owner/limits.toml 的 day.calls）。{note}')
     if limits.day_tokens:
-        known = [counts for call in todays if (counts := _tokens(call.get('usage'))) is not None]
+        known = [counts for call in todays if (counts := _tokens(_usage(call))) is not None]
         used = sum(i + o for i, o in known)
         if used >= limits.day_tokens:
             unknown = len(todays) - len(known)
@@ -116,12 +134,17 @@ def _no_usage() -> dict:
 
 
 def usage_by_class(calls: list[dict]) -> dict:
-    """cost class -> {'calls', 'input_tokens', 'output_tokens', 'unknown_usage_calls'}; the three classes always."""
+    """cost class -> {'calls', 'input_tokens', 'output_tokens', 'unknown_usage_calls'}.
+
+    The three classes are always there. A call whose class is missing, empty, not a string or unreadable goes under
+    `unknown`.
+    """
     summary = {cls: _no_usage() for cls in COST_CLASSES}
     for call in calls:
-        totals = summary.setdefault(call.get('cost_class'), _no_usage())
+        cls = None if _unreadable(call) else call.get('cost_class')
+        totals = summary.setdefault(cls if isinstance(cls, str) and cls else UNKNOWN_CLASS, _no_usage())
         totals['calls'] += 1
-        counts = _tokens(call.get('usage'))
+        counts = _tokens(_usage(call))
         if counts is None:
             totals['unknown_usage_calls'] += 1
         else:

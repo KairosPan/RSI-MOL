@@ -28,6 +28,7 @@ CALL_FILE = 'call.json'
 INDEX = 'index.jsonl'
 STARTED = 'started'
 ENDED = ('finished', 'failed', 'timed_out', 'interrupted')
+UNREADABLE = 'unreadable'      # status of the stand-in calls() returns for a call.json it cannot read
 # One component of a path written by write_json: never empty, `.`, `..` or hidden.
 COMPONENT = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}')
 NOTE_KIND = re.compile(r'[a-z][a-z_]{0,31}')
@@ -142,21 +143,38 @@ class Records:
         return record
 
     def load_call(self, call_id: str) -> dict:
+        """The call's call.json. KeyError if the call was never started; ValueError, in Chinese and naming the
+        file, if it cannot be read or is not a JSON object."""
         path = self.call_dir(call_id) / CALL_FILE
         try:
-            text = path.read_text(encoding='utf-8')
+            record = json.loads(path.read_bytes().decode('utf-8'))
         except FileNotFoundError:
             raise KeyError(call_id) from None
-        return json.loads(text)
+        except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:
+            raise ValueError(f'调用记录 {path} 读不出来：{error}') from error
+        if not isinstance(record, dict):
+            raise ValueError(f'调用记录 {path} 不是 JSON 对象，而是 {json.dumps(record)[:80]}。')
+        return record
 
     def calls(self) -> list[dict]:
-        """Every started call, oldest (lowest number) first, whatever its status; reserved ids are left out."""
+        """Every started call, oldest (lowest number) first, whatever its status; reserved ids are left out.
+
+        A call.json that cannot be read stands in the list as {'id', 'status': 'unreadable', 'problem'}, the problem
+        being load_call's Chinese message, so one bad record never hides the others.
+        """
         folder = self.root / KINDS['R']
         if not folder.is_dir():
             return []
         ids = sorted((name for name in os.listdir(folder) if CALL_ID.fullmatch(name)), key=lambda name: int(name[1:]))
-        return [json.loads((folder / name / CALL_FILE).read_text(encoding='utf-8'))
-                for name in ids if (folder / name / CALL_FILE).is_file()]
+        found = []
+        for call_id in ids:
+            try:
+                found.append(self.load_call(call_id))
+            except KeyError:
+                continue                                    # reserved by new_id, not started yet
+            except ValueError as error:
+                found.append({'id': call_id, 'status': UNREADABLE, 'problem': str(error)})
+        return found
 
     def write_json(self, relative: str, data: dict) -> Path:
         """Create records/<relative> holding data; FileExistsError rather than overwrite. Indexed with its sha256."""

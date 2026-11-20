@@ -45,8 +45,24 @@ class LimitsTests(unittest.TestCase):
     def test_refusal_counts_today_only(self):
         limits = Limits(1800, 8, 4, 900, 2, 0)
         self.assertIsNone(refusal(limits, [self.call(), self.call(-1), self.call(-1)], self.NOW))
-        self.assertIn('2', refusal(limits, [self.call(), self.call()], self.NOW))
+        message = refusal(limits, [self.call(), self.call(), self.call(), self.call(-1)], self.NOW)
+        self.assertIn('已经开始了 3 次调用', message)                    # the count, not a digit of the date
+        self.assertIn('每天 2 次的上限', message)
+        self.assertNotIn('读不出来', message)
         self.assertIsNotNone(refusal(Limits(1800, 8, 4, 900, 60, 15), [self.call(tokens=20)], self.NOW))
+
+    def test_an_unreadable_record_counts_today_whatever_its_date(self):
+        unreadable = {'id': 'R0002', 'status': 'unreadable', 'problem': '调用记录 x 读不出来'}
+        limits = Limits(1800, 8, 4, 900, 2, 0)
+        self.assertIsNone(refusal(limits, [self.call(-1), unreadable], self.NOW))
+        message = refusal(limits, [self.call(), unreadable], self.NOW)
+        self.assertIn('已经开始了 2 次调用', message)
+        self.assertIn('其中 1 份调用记录读不出来', message)
+        self.assertIsNotNone(refusal(limits, [self.call(), None], self.NOW))     # not even a dict
+        summary = usage_by_class([unreadable, None, self.call(tokens=4)])
+        self.assertEqual(summary['unknown'], {'calls': 2, 'input_tokens': 0, 'output_tokens': 0,
+                                              'unknown_usage_calls': 2})
+        self.assertEqual(summary['online']['input_tokens'], 4)
 
     def test_today_is_the_local_calendar_day(self):
         limits = Limits(1800, 8, 4, 900, 1, 0)
@@ -70,6 +86,13 @@ class LimitsTests(unittest.TestCase):
         self.assertIsNotNone(refusal(limits, [self.call(tokens=7), self.call(tokens=7)], self.NOW))
         self.assertIsNone(refusal(limits, [self.call(-1, tokens=100), self.call(tokens=None)], self.NOW))
         self.assertIsNone(refusal(Limits(1800, 8, 4, 900, 60, 0), [self.call(tokens=10 ** 9)], self.NOW))
+        mixed = [self.call(tokens=10), self.call(tokens=None), self.call(tokens=6), self.call(tokens=None),
+                 self.call(-1, tokens=None)]
+        message = refusal(limits, mixed, self.NOW)
+        self.assertIn('已用 18 个 token', message)                      # (10 + 1) + (6 + 1), known usage only
+        self.assertIn('每天 15 个的上限', message)
+        self.assertIn('另有 2 次调用的用量不明，没有算进去', message)      # yesterday's unknown call is not today's
+        self.assertNotIn('用量不明', refusal(limits, [self.call(tokens=20)], self.NOW))
 
     def test_unknown_usage_is_not_zero(self):
         summary = usage_by_class([self.call(tokens=10), self.call(tokens=None), self.call(tokens=5, cls='meta')])
@@ -80,6 +103,13 @@ class LimitsTests(unittest.TestCase):
         odd = [dict(self.call(), usage={'input_tokens': 'x', 'output_tokens': 1}),
                dict(self.call(), usage={'input_tokens': True, 'output_tokens': 1}), dict(self.call(), usage={})]
         self.assertEqual(usage_by_class(odd)['online']['unknown_usage_calls'], 3)
+        classless = [dict(self.call(), cost_class=None), dict(self.call(), cost_class=3),
+                     dict(self.call(), cost_class=''),
+                     {key: value for key, value in self.call().items() if key != 'cost_class'}]
+        summary = usage_by_class(classless)
+        self.assertEqual(summary['unknown'],
+                         {'calls': 4, 'input_tokens': 40, 'output_tokens': 4, 'unknown_usage_calls': 0})
+        self.assertEqual(sorted(summary), ['eval', 'meta', 'online', 'unknown'])
 
 
 if __name__ == '__main__':
