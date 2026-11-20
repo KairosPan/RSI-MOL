@@ -1,12 +1,12 @@
 """`rsi init` and `rsi recover`, and the lock that every command but `status` holds.
 
 init builds an RSI root, or completes one: it is safe to run again and never replaces what is there. It makes the
-folders and, before anything can rewrite it, keeps the owner's own codex-home/config.toml as config.toml.before-rsi
-(once). It writes the owner's files that are missing (the envelope, imported from that kept copy, and the seed's
-limits and Meta files), creates the version store and, when the store has no version, seals what sits in work/,
-makes V0001 from the seed in staging/ (author `init`), and then adds to the sealed tree the seed files it lacks
-(nothing in it is replaced) before committing it as `manual or leftover`, as before a task run; then main's head is
-staged and renamed in as work/. It creates env/ with `<python> -m venv` when env/ is missing, writes the Lab home's
+folders and, before anything can rewrite it, keeps a verified copy of the owner's own codex-home/config.toml
+(compose.keep_owner_config: config.toml.before-rsi, -2, …). It writes the owner's files that are missing (the
+envelope, imported from the newest usable copy, and the seed's limits and Meta files), creates the version store
+and, when the store has no version, seals what sits in work/, makes V0001 from the seed in staging/ (author
+`init`), and then adds to the sealed tree the seed files it lacks (nothing in it is replaced) before committing it
+as `manual or leftover`, as before a task run; then main's head is staged and renamed in as work/. It creates env/ with `<python> -m venv` when env/ is missing, writes the Lab home's
 config.toml (naming the top-level keys of the owner's original it does not carry over), and reports whether each
 Codex home is signed in.
 
@@ -24,13 +24,15 @@ import os
 import signal
 import shutil
 import subprocess
+import tempfile
 import tomllib
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
 from rsi.codexrun import codex_environment, codex_program
-from rsi.compose import ENVELOPE, TOOL_FOLDERS, load_envelope, write_home_config
+from rsi.compose import (ENVELOPE, HOME_CONFIG, TOOL_FOLDERS, backup_names, keep_owner_config, load_envelope,
+                         read_regular, write_home_config)
 from rsi.labrun import (MANUAL, PROCESS_FILE, WORKSPACE_ERRORS, discard, move_in, now, process_start, refusing,
                         restore_work, root_descriptor, settle, stage, stamp)
 from rsi.paths import Layout, Refused
@@ -41,7 +43,6 @@ from rsi.versions import VersionStore
 from rsi.workspace import SEALED, keep, kind, open_folder, seal
 
 DEFAULT_PYTHON = '/opt/homebrew/bin/python3'
-BEFORE_RSI = 'config.toml.before-rsi'           # the Lab home's config.toml as it was before the first init
 IMPORTED = ('features', 'apps', 'plugins')      # tables of that file the envelope takes (and approval_policy)
 UNSAFE_IN_ROOT = '"[]*?\n\r'                    # Codex's own sandbox cannot confine a path with these
 OWNER_FOLDERS = ('owner', 'tasks', 'records', 'versions', 'staging', 'sealed', 'codex-home', 'codex-home-meta')
@@ -52,9 +53,8 @@ VENV_SECONDS = 600
 # A call's process group is signalled only when the process with the recorded pid started within this many seconds
 # of the recorded start time (process.json): the pid may since have been reused by an unrelated process.
 SAME_PROCESS_SECONDS = 2
-GENERATED = render_file({}).encode()          # the first line of every config.toml rsi writes
 ENVELOPE_HEADER = ('# Lab 的对外范围。负责人的文件，agent 改不了。由 rsi init 写成：approval_policy、features、apps、plugins\n'
-                   '# 取自当时的 codex-home/config.toml（原文件另存为 config.toml.before-rsi），[rsi] 是控制程序的设置。\n')
+                   '# 取自负责人原来的 codex-home/config.toml 的备份（config.toml.before-rsi…），[rsi] 是控制程序的设置。\n')
 
 
 @contextmanager
@@ -79,7 +79,7 @@ def locked(layout: Layout):
 
 def _report() -> dict:
     return {'folders': [], 'files': [], 'envelope': None, 'first_version': None, 'version': None, 'work': None,
-            'env': None, 'signed_in': {}, 'original': None, 'problems': []}
+            'env': None, 'signed_in': {}, 'original': None, 'envelope_source': None, 'problems': []}
 
 
 def _folders(layout: Layout, root_fd: int, report: dict) -> None:
@@ -103,57 +103,63 @@ def _folders(layout: Layout, root_fd: int, report: dict) -> None:
 
 
 def _create(path: Path, data: bytes, mode: int = 0o644) -> None:
-    """A new file; FileExistsError if anything (a link too) has that name."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
-    with os.fdopen(fd, 'wb') as stream:
-        stream.write(data)
-
-
-def _keep_original(layout: Layout, report: dict) -> None:
-    """codex-home/config.toml copied to config.toml.before-rsi (mode 0600, created exclusively) when that copy is
-    missing, whether or not an envelope exists: init and every run rewrite config.toml, so the owner's own file is
-    kept before anything can. A config.toml rsi itself wrote is not the owner's and is not kept; a link is never
-    followed (rsi replaces the link itself, never the file it points to)."""
-    source, kept = layout.lab_home / 'config.toml', layout.lab_home / BEFORE_RSI
-    if os.path.lexists(kept) or not os.path.lexists(source):
-        return
-    if source.is_symlink() or not source.is_file():
-        report['problems'].append('codex-home/config.toml 不是普通文件（可能是符号链接），没有备份，也没有从它导入；'
-                                  '生成的配置只会替换这个链接本身，不会改它指向的文件')
-        return
-    data = source.read_bytes()
-    if data.startswith(GENERATED):
-        return
-    _create(kept, data, 0o600)
-    report['files'].append(f'codex-home/{BEFORE_RSI}')
-
-
-def _original(layout: Layout) -> tuple[dict | None, str | None]:
-    """The owner's original config (config.toml.before-rsi) as a table, and why it cannot be read; (None, None) when
-    there is none."""
-    kept = layout.lab_home / BEFORE_RSI
-    if not os.path.lexists(kept):
-        return None, None
-    if kept.is_symlink() or not kept.is_file():
-        return None, f'{kept} 不是普通文件（可能是符号链接）'
+    """A new file holding data, all at once: written to a synced temporary file in the same folder, then linked to
+    path, so a crash or a full disk never leaves a partial file under that name. FileExistsError if anything (a link
+    too) has that name."""
+    fd, temporary = tempfile.mkstemp(prefix='.rsi-', suffix='.tmp', dir=path.parent)
     try:
-        return tomllib.loads(kept.read_bytes().decode('utf-8')), None
-    except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
-        return None, f'{kept} 不是合法的 TOML（{" ".join(str(error).split())}）'
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.link(temporary, path)
+    finally:
+        os.unlink(temporary)
 
 
-def _envelope(layout: Layout, report: dict) -> None:
+def _keep_owner_config(layout: Layout, report: dict) -> None:
+    """A verified copy of the owner's codex-home/config.toml before anything can rewrite it (Refused, and nothing
+    rewritten, when none can be made). A link there is never followed: reported, and only the link is replaced."""
+    if os.path.islink(layout.lab_home / HOME_CONFIG):
+        report['problems'].append('codex-home/config.toml 是符号链接，没有备份，也没有从它导入；'
+                                  '生成的配置只会替换这个链接本身，不会改它指向的文件')
+    kept, made = keep_owner_config(layout)
+    if made:
+        report['files'].append(f'codex-home/{kept.name}')
+
+
+def _original(layout: Layout, problems: list[str]) -> tuple[dict | None, Path | None]:
+    """The owner's original config as a table, from the newest copy (backup_names, newest first) that is a regular,
+    non-empty file holding valid TOML, and that copy's path; (None, None) when there is none. Each copy passed over
+    on the way is a problem line: an empty or broken copy is never taken as "nothing to import"."""
+    for kept in reversed(backup_names(layout)):
+        try:
+            data = read_regular(kept)
+        except OSError as error:
+            problems.append(f'codex-home/{kept.name} 读不了（{error.strerror or error}；可能是符号链接），没有从它导入')
+            continue
+        if data is None:
+            continue
+        if not data.strip():
+            problems.append(f'codex-home/{kept.name} 是空的（{len(data)} 字节），可能没写完，没有从它导入')
+            continue
+        try:
+            return tomllib.loads(data.decode('utf-8')), kept
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
+            problems.append(f'codex-home/{kept.name} 不是合法的 TOML（{" ".join(str(error).split())}），没有从它导入')
+    return None, None
+
+
+def _envelope(layout: Layout, report: dict, original: dict | None, source: Path | None) -> None:
     """owner/lab-envelope.toml when missing: approval_policy, features, apps and plugins of the owner's original
-    config (config.toml.before-rsi, never the config.toml rsi generates), and [rsi] extra_read (the tool folders
+    config (the newest usable copy, never the config.toml rsi generates), and [rsi] extra_read (the tool folders
     that exist) and python. Nothing else of that file is taken: no projects, no tui, no model."""
     path = layout.owner / ENVELOPE
     if os.path.lexists(path):
         report['envelope'] = 'kept'
         return
-    original, problem = _original(layout)
-    if problem is not None:
-        raise Refused(f'{problem}，没有导入；请改好它，或自己先写好 {path}')
-    source, table = layout.lab_home / BEFORE_RSI, original or {}
+    table = original or {}
     envelope = {'approval_policy': table.get('approval_policy', 'on-request')}
     envelope.update({key: table[key] for key in IMPORTED if key in table})
     envelope['rsi'] = {'extra_read': [folder for folder in TOOL_FOLDERS if os.path.exists(folder)],
@@ -164,6 +170,7 @@ def _envelope(layout: Layout, report: dict) -> None:
         raise Refused(f'{source} 里有写不进 {ENVELOPE} 的值（{error}）；请自己先写好 {path}') from None
     _create(path, text.encode('utf-8'))
     report['envelope'] = 'default' if original is None else 'imported'
+    report['envelope_source'] = None if source is None else f'codex-home/{source.name}'
     report['files'].append(f'owner/{ENVELOPE}')
 
 
@@ -344,8 +351,9 @@ def init(layout: Layout, seed: Path) -> dict:
     report, context = _report(), {'command': 'init'}
     with root_descriptor(layout) as root_fd:
         _folders(layout, root_fd, report)
-        _keep_original(layout, report)
-        _envelope(layout, report)
+        _keep_owner_config(layout, report)
+        original, source = _original(layout, report['problems'])
+        _envelope(layout, report, original, source)
         _owner_seed(layout, seed, report)
         envelope = load_envelope(layout.owner)
         records = Records(layout.records)
@@ -359,10 +367,9 @@ def init(layout: Layout, seed: Path) -> dict:
         _env(layout, root_fd, envelope, report)
         write_home_config(layout, envelope, settings)
         report['version'] = store.head()
-        original, problem = _original(layout)
-        report['original'] = None if original is None and problem is None else {
-            'dropped': None if original is None else sorted(set(original) - {'approval_policy', *IMPORTED}),
-            'problem': problem}
+        if original is not None:
+            report['original'] = {'path': f'codex-home/{source.name}',
+                                  'dropped': sorted(set(original) - {'approval_policy', *IMPORTED})}
     report['signed_in'] = {home.name: signed_in(home) for home in (layout.lab_home, layout.meta_home)}
     return report
 

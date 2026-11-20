@@ -9,12 +9,15 @@ here: role files are copies in the Lab home (which no agent can write), and a to
 resolve only to public addresses and may carry a secret only to the host the owner tied it to.
 """
 import copy
+import errno
 import ipaddress
 import json
 import os
 import platform
 import shutil
 import socket
+import stat
+import tempfile
 import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,6 +46,10 @@ NATIVE_TARGETS = {('Darwin', 'arm64'): ('codex-darwin-arm64', 'aarch64-apple-dar
 HOW_TO_SET_CODEX = ('请把 $RSI_CODEX 设成 Codex 原生程序的绝对路径（npm 安装的在 '
                     '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），'
                     '它不能在 RSI 文件夹或 /tmp 这类公用临时文件夹里')
+HOME_CONFIG = 'config.toml'
+OWNER_BACKUP = 'config.toml.before-rsi'      # the owner's own config.toml, kept before rsi replaces it
+BACKUP_NAMES = 100                           # config.toml.before-rsi, config.toml.before-rsi-2, ... -100
+MARKER = render_file({}).encode()            # the first line of every config.toml rsi writes
 NETWORK_OFF = {'enabled': False}
 NETWORK_ON = {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}}
 
@@ -487,15 +494,146 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
     return config
 
 
+# The owner's own codex-home/config.toml is never replaced without a verified copy.
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def read_regular(path: Path) -> bytes | None:
+    """The bytes of the regular file at path, opened without following a link; None when there is no entry by that
+    name; OSError when it is a link or anything but a regular file."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    with os.fdopen(fd, 'rb') as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            raise OSError(errno.EINVAL, '不是普通文件', str(path))
+        return stream.read()
+
+
+def _sync_folder(folder: Path) -> None:
+    """Make a link or rename in folder durable (best effort)."""
+    try:
+        fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _temporary(folder: Path, data: bytes) -> str:
+    """A new, complete and synced file holding data in folder (mode 0600); the caller links or renames it."""
+    fd, name = tempfile.mkstemp(prefix='.rsi-', suffix='.tmp', dir=folder)
+    try:
+        _write_all(fd, data)
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        os.unlink(name)
+        raise
+    os.close(fd)
+    return name
+
+
+def backup_names(layout: Layout) -> list[Path]:
+    """Every name a copy of the owner's config may have, oldest first: config.toml.before-rsi, …-2, … -100."""
+    return [layout.lab_home / (OWNER_BACKUP if number == 1 else f'{OWNER_BACKUP}-{number}')
+            for number in range(1, BACKUP_NAMES + 1)]
+
+
+def _copy_verified(source: Path, target: Path, data: bytes) -> None:
+    """target as a new file holding data: written to a temporary file in the same folder and synced, linked to
+    target (FileExistsError when the name is taken), then target and source are both read back and must equal data;
+    otherwise target is removed again and OSError raised."""
+    temporary = _temporary(target.parent, data)
+    try:
+        os.link(temporary, target)
+    finally:
+        os.unlink(temporary)
+    try:
+        if read_regular(target) != data or read_regular(source) != data:
+            raise OSError(errno.EIO, '备份读回来和原文件不一致', str(target))
+    except BaseException:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+    _sync_folder(target.parent)
+
+
+def keep_owner_config(layout: Layout) -> tuple[Path | None, bool]:
+    """When codex-home/config.toml is the owner's (a regular file, never followed if a link, that does not start
+    with rsi's MARKER line), make sure a verified copy of it exists: an existing backup with the same bytes, or a
+    new one at the first free name of backup_names() (a name taken by other bytes, or by a link, is skipped).
+    Returns (that copy, whether it was made now); (None, False) when there is nothing of the owner's to keep.
+    Refused, naming the file, when no copy could be made and verified: the caller must then not replace it."""
+    path = layout.lab_home / HOME_CONFIG
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None, False
+    if not stat.S_ISREG(info.st_mode):
+        return None, False                      # a link is replaced as a link; its target is never touched
+    try:
+        data = read_regular(path)
+    except OSError as error:
+        raise Refused(f'{path} 读不了（{error.strerror or error}），没能备份，所以没有改写它') from None
+    if data is None or data.startswith(MARKER):
+        return None, False
+    for target in backup_names(layout):
+        try:
+            kept = read_regular(target)
+        except OSError:
+            continue
+        if kept == data:
+            return target, False
+        if kept is not None:
+            continue
+        try:
+            _copy_verified(path, target, data)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise Refused(f'{path} 是负责人自己的配置，没能可靠地备份到 {target}（{error.strerror or error}），'
+                          '所以没有改写它') from None
+        return target, True
+    raise Refused(f'{path} 是负责人自己的配置，但 {OWNER_BACKUP} 到 {OWNER_BACKUP}-{BACKUP_NAMES} 都被占用了，'
+                  '没能备份，所以没有改写它')
+
+
+def _write_config(path: Path, text: str) -> None:
+    """Replace path with text through a synced temporary file in the same folder (a link at path is replaced as a
+    link, never followed)."""
+    temporary = _temporary(path.parent, text.encode('utf-8'))
+    try:
+        os.replace(temporary, path)
+    except BaseException:
+        os.unlink(temporary)
+        raise
+    _sync_folder(path.parent)
+
+
 def write_home_config(layout: Layout, envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo) -> None:
     """codex-home/config.toml for opening the Lab Codex by hand: the task-run configuration, but interactive,
     with the role copies of work/ written first.
 
     It never holds a `projects` table: a trusted project would let a `.codex/config.toml` in that folder override
-    this configuration. (Rewriting the file also drops any trust Codex itself recorded during manual use.)"""
+    this configuration. (Rewriting the file also drops any trust Codex itself recorded during manual use.) A
+    config.toml of the owner's (see keep_owner_config) is copied and verified first; Refused, and nothing replaced,
+    when that cannot be done."""
     config = lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve)
     if 'projects' in config:
         raise Refused('Lab 的 Codex 配置里不能有 projects 表')
     text = render_file(config)
     write_role_files(layout, settings, trial=False)
-    _replace(layout.lab_home / 'config.toml', text)
+    keep_owner_config(layout)
+    _write_config(layout.lab_home / HOME_CONFIG, text)

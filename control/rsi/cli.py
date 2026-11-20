@@ -359,8 +359,8 @@ def _init(layout: Layout) -> int:
         lines.append(f'新建的文件夹：{"、".join(report["folders"])}')
     if report['files']:
         lines.append(f'新写的文件：{"、".join(report["files"])}')
-    envelope = {'imported': '从原来的 codex-home/config.toml 导入（原文件存在 codex-home/config.toml.before-rsi）',
-                'default': '按默认值新写（没有原来的 codex-home/config.toml）', 'kept': '已有，没有改'}
+    envelope = {'imported': f'从负责人原来的 Codex 配置导入（备份在 {safe(report["envelope_source"])}）',
+                'default': '按默认值新写（没有可用的原 Codex 配置备份）', 'kept': '已有，没有改'}
     lines.append(f'Lab 的对外范围 owner/lab-envelope.toml：{envelope[report["envelope"]]}')
     first = f'，其中 {report["first_version"]} 是这次用种子文件建的' if report['first_version'] else ''
     lines.append(f'当前版本：{report["version"]}{first}')
@@ -369,10 +369,8 @@ def _init(layout: Layout) -> int:
                             'failed': '没建好（见问题）'}[report['env']])
     lines.append('Codex 配置 codex-home/config.toml：已重新生成')
     original = report['original']
-    if original is not None and original['problem'] is not None:
-        lines.append(f'  原来的配置没有带过来：{safe(original["problem"])}')
-    elif original is not None and original['dropped']:
-        lines.append(f'  原来的配置（codex-home/config.toml.before-rsi）里这些顶层键没有带进新的 config.toml：'
+    if original is not None and original['dropped']:
+        lines.append(f'  原来的配置（{safe(original["path"])}）里这些顶层键没有带进新的 config.toml：'
                      f'{_ids(original["dropped"])}（approval_policy、features、apps、plugins 以 owner/lab-envelope.toml 为准）')
     for home, state in report['signed_in'].items():
         lines.append(f'{home}：{"已登录" if state else "没有登录" if state is False else "查不了登录状态"}'

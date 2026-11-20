@@ -91,7 +91,9 @@ class Init(unittest.TestCase):
         self.assertEqual(os.listdir(layout.staging), [])
         self.assertEqual((first['first_version'], second['first_version'], second['version']), ('V0001', None, 'V0001'))
         self.assertEqual((first['envelope'], second['envelope'], second['work']), ('imported', 'kept', 'kept'))
-        self.assertEqual(first['original'], {'dropped': ['projects', 'tui'], 'problem': None})
+        self.assertEqual(first['original'],
+                         {'path': 'codex-home/config.toml.before-rsi', 'dropped': ['projects', 'tui']})
+        self.assertEqual(first['envelope_source'], 'codex-home/config.toml.before-rsi')
         if os.path.isfile(PYTHON):
             self.assertTrue((layout.env / 'pyvenv.cfg').is_file()); self.assertEqual(second['env'], 'kept')
         if HAS_CODEX:
@@ -121,17 +123,31 @@ class Init(unittest.TestCase):
         self.assertEqual((layout.owner / 'lab-envelope.toml').read_text(), ENVELOPE)
         self.assertEqual(tomllib.loads((layout.lab_home / 'config.toml').read_text())['approval_policy'], 'never')
 
-    def test_an_invalid_config_is_kept_and_survives_a_handwritten_envelope(self):
+    def test_an_invalid_config_is_kept_and_reported_never_imported(self):
         layout = bare(self); layout.lab_home.mkdir()
         (layout.lab_home / 'config.toml').write_text('model = [unclosed\n')
-        with self.assertRaises(Refused):
-            init(layout, SEED)
-        self.assertEqual((layout.lab_home / 'config.toml.before-rsi').read_text(), 'model = [unclosed\n')
-        (layout.owner / 'lab-envelope.toml').write_text(ENVELOPE)                  # as init's message advises
         report = init(layout, SEED)
         self.assertEqual((layout.lab_home / 'config.toml.before-rsi').read_text(), 'model = [unclosed\n')
+        self.assertEqual((report['envelope'], report['original']), ('default', None))
+        self.assertTrue(any('before-rsi 不是合法的 TOML' in line for line in report['problems']), report['problems'])
         self.assertTrue(tomllib.loads((layout.lab_home / 'config.toml').read_text())['permissions'])
-        self.assertIn('TOML', report['original']['problem'])
+        init(layout, SEED)
+        self.assertEqual((layout.lab_home / 'config.toml.before-rsi').read_text(), 'model = [unclosed\n')
+        self.assertFalse((layout.lab_home / 'config.toml.before-rsi-2').exists())
+
+    def test_an_empty_copy_is_reported_never_taken_as_nothing_to_import(self):
+        layout = bare(self); layout.lab_home.mkdir()
+        (layout.lab_home / 'config.toml.before-rsi').write_bytes(b'')      # what the old copy left on a full disk
+        (layout.lab_home / 'config.toml').write_text(CONFIG)
+        report = init(layout, SEED)
+        self.assertEqual((layout.lab_home / 'config.toml.before-rsi-2').read_text(), CONFIG)
+        self.assertEqual((report['envelope'], report['envelope_source'], report['original']['dropped']),
+                         ('imported', 'codex-home/config.toml.before-rsi-2', ['projects', 'tui']))
+        lone = bare(self, 'lone'); lone.lab_home.mkdir()
+        (lone.lab_home / 'config.toml.before-rsi').write_bytes(b'')
+        report = init(lone, SEED)
+        self.assertEqual(report['envelope'], 'default')
+        self.assertTrue(any('config.toml.before-rsi 是空的' in line for line in report['problems']), report['problems'])
 
     def test_a_deleted_envelope_is_imported_again_from_the_kept_original_never_from_the_generated_file(self):
         layout = bare(self); layout.lab_home.mkdir()
