@@ -3,15 +3,23 @@
 Every configuration carries its own permission profiles. Each profile first denies the whole RSI root, then opens
 only what that agent may touch (design §5.1 and appendix): records, tasks, the owner's files, the control program,
 the version store and both Codex homes stay out of reach of the agents' commands and local tool servers.
+
+Codex itself runs outside those profiles. So everything Codex reads or contacts on the agents' behalf is checked
+here: role files are copies in the Lab home (which no agent can write), and a tool server reached by URL must
+resolve only to public addresses and may carry a secret only to the host the owner tied it to.
 """
 import copy
+import ipaddress
 import os
+import shutil
+import socket
 import tomllib
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from rsi.codexrun import codex_program
 from rsi.paths import Layout, Refused
-from rsi.settings import SETTINGS, Settings, is_workspace_path
+from rsi.settings import ROLE, SETTINGS, Settings, is_workspace_path, show
 from rsi.tomlout import render_file
 
 ENVELOPE = 'lab-envelope.toml'
@@ -21,6 +29,14 @@ TOOL_FOLDERS = ('/opt/homebrew/bin', '/opt/homebrew/Cellar', '/opt/homebrew/opt'
 SYSTEM_PATH = '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 NETWORK_OFF = {'enabled': False}
 NETWORK_ON = {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}}
+
+
+def _tool_secrets(envelope: dict, source: str = ENVELOPE) -> dict[str, str]:
+    """envelope['rsi']['tool_secrets']: environment-variable name → the one host its value may be sent to."""
+    secrets = envelope.get('rsi', {}).get('tool_secrets', {})
+    if not isinstance(secrets, dict) or not all(isinstance(value, str) and value for value in secrets.values()):
+        raise Refused(f'{source} 的 rsi.tool_secrets 必须是“环境变量名 = 主机名”的表')
+    return secrets
 
 
 def _extra_read_list(envelope: dict, source: str) -> list[str]:
@@ -53,6 +69,7 @@ def load_envelope(owner: Path) -> dict:
         if not isinstance(envelope[key], dict):
             raise Refused(f'{path} 的 {key} 必须是一个表')
     _extra_read_list(envelope, str(path))
+    _tool_secrets(envelope, str(path))
     return envelope
 
 
@@ -111,6 +128,12 @@ def _shell(layout: Layout, workspace: Path) -> dict:
     return {'inherit': 'core', 'set': {'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout)}}
 
 
+def _codex_path() -> str:
+    """The Codex program as an absolute path, looked up in the control program's own PATH (the wrapper's PATH
+    starts with Homebrew, which may hold another Codex); the bare name when it cannot be found."""
+    return shutil.which(codex_program()) or codex_program()
+
+
 def _local_server(layout: Layout, workspace: Path, profile: str, server: dict) -> dict:
     """A local tool server started through `codex sandbox` under the run's profile, or its _net variant when the
     server has network. Workspace paths in its command and arguments become absolute paths in this workspace.
@@ -124,7 +147,7 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict) -
         sandbox = ['sandbox', '-P', profile + '_net', '--enable', 'network_proxy']
     else:
         sandbox = ['sandbox', '-P', profile]
-    return {'command': codex_program(), 'args': [*sandbox, '--', command, *args],
+    return {'command': _codex_path(), 'args': [*sandbox, '--', command, *args],
             'env': {'CODEX_HOME': str(layout.lab_home), 'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout)},
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
 
@@ -142,10 +165,111 @@ def _disabled(table: dict, ids: list[str], key: str, problems: list[str]) -> dic
     return out
 
 
-def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, interactive: bool = False) -> dict:
+def role_folder(layout: Layout, *, trial: bool) -> Path:
+    """Where the checked copies of the role files of work/ or trial/ live: inside the Lab home, which every
+    profile denies, so no agent can change a role while Codex may read it."""
+    return layout.lab_home / 'rsi' / 'roles' / ('trial' if trial else 'work')
+
+
+def _replace(path: Path, text: str) -> None:
+    """Write path through a temporary name, so it is never seen half-written."""
+    temporary = path.with_name(path.name + '.rsi-new')
+    temporary.write_text(text, encoding='utf-8')
+    os.replace(temporary, path)
+
+
+def write_role_files(layout: Layout, settings: Settings, *, trial: bool) -> None:
+    """Write each checked role, with only the allowed keys, to role_folder(); remove every other file there.
+
+    The content comes from what load_settings checked, never from the workspace file again. Call it before each
+    run whose configuration lab_config builds.
+    """
+    folder = role_folder(layout, trial=trial)
+    folder.mkdir(parents=True, exist_ok=True)
+    wanted = set()
+    for name, role in settings.roles.items():
+        if not ROLE.fullmatch(name):
+            raise ValueError(f'role name {name!r} was not checked')
+        table = {'name': name, 'description': role['description'],
+                 'developer_instructions': role['developer_instructions']}
+        if role.get('model') is not None:
+            table['model'] = role['model']
+        if role.get('effort') is not None:
+            table['model_reasoning_effort'] = role['effort']
+        _replace(folder / (name + '.toml'), render_file(table))
+        wanted.add(name + '.toml')
+    for entry in folder.iterdir():
+        if entry.name not in wanted:
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+
+
+def _local_address(text: str) -> bool:
+    """Whether a resolved address is anything but a plain public one."""
+    try:
+        address = ipaddress.ip_address(text.split('%', 1)[0])
+    except ValueError:
+        return True
+    forms = [address] + ([address.ipv4_mapped] if getattr(address, 'ipv4_mapped', None) else [])
+    return any(not form.is_global or form.is_loopback or form.is_private or form.is_link_local or form.is_multicast
+               or form.is_reserved or form.is_unspecified for form in forms)
+
+
+def _url_server_problems(envelope: dict, settings: Settings, resolve) -> dict[str, list[str]]:
+    secrets = _tool_secrets(envelope)
+    out = {}
+    for name in sorted(settings.tool_servers):
+        server = settings.tool_servers[name]
+        if 'url' not in server:
+            continue
+        where, problems = f'{SETTINGS}：工具服务 {show(name)}', []
+        try:
+            parts = urlsplit(server['url'])
+            host, port = parts.hostname, parts.port or 443
+        except ValueError:
+            host, port = None, None
+        if not host:
+            problems.append(f'{where} 的网址没有主机名')
+        else:
+            try:
+                addresses = sorted({str(info[4][0]) for info in resolve(host, port, type=socket.SOCK_STREAM)})
+            except (OSError, UnicodeError, ValueError, TypeError, IndexError) as error:
+                addresses = None
+                problems.append(f'{where} 的主机 {show(host)} 解析不了（{" ".join(str(error).split())}）')
+            if addresses is not None and not addresses:
+                problems.append(f'{where} 的主机 {show(host)} 解析不到任何地址')
+            local = [address for address in addresses or [] if _local_address(address)]
+            if local:
+                problems.append(f'{where} 的主机 {show(host)} 解析到本机、局域网或保留地址 {show(", ".join(local))}；'
+                                'Codex 在沙箱外连它，不允许')
+        variable = server.get('bearer_token_env_var')
+        if variable is not None:
+            allowed = secrets.get(variable)
+            if allowed is None:
+                problems.append(f'{where} 用了密钥 {show(variable)}，但 {ENVELOPE} 的 rsi.tool_secrets 没有把它绑定到主机')
+            elif host is None or allowed.lower() != host.lower():
+                problems.append(f'{where} 用了密钥 {show(variable)}，它只能发给 {show(allowed)}，不能发给 {show(host)}')
+        if problems:
+            out[name] = problems
+    return out
+
+
+def tool_server_problems(envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo) -> list[str]:
+    """Problems of the tool servers reached by URL, one Chinese line each, naming the server: a host that does not
+    resolve, or resolves to any loopback, private, link-local, multicast, reserved or unspecified address; a bearer
+    token whose variable the owner did not tie to exactly that host in rsi.tool_secrets."""
+    return [line for lines in _url_server_problems(envelope, settings, resolve).values() for line in lines]
+
+
+def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, interactive: bool = False,
+               resolve=socket.getaddrinfo) -> dict:
     """The complete Codex configuration of a Lab run in work/ (trial=False) or trial/ (trial=True).
 
-    Disabled ids missing from the envelope are added to settings.problems (once each) and ignored.
+    Disabled ids missing from the envelope are added to settings.problems (once each) and ignored. Tool servers
+    named by tool_server_problems are left out. Roles point at the copies of write_role_files, which the caller
+    writes before the run.
     """
     workspace, base = (layout.trial, 'trial') if trial else (layout.work, 'lab')
     config = {'approval_policy': envelope['approval_policy'] if interactive else 'never',
@@ -162,9 +286,10 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     agents = {'max_depth': settings.max_depth, 'max_concurrent_threads_per_session': settings.max_threads}
     for name, role in settings.roles.items():
         agents[name] = {'description': role['description'],
-                        'config_file': str(workspace / 'codex' / 'agents' / (name + '.toml'))}
+                        'config_file': str(role_folder(layout, trial=trial) / (name + '.toml'))}
+    refused = _url_server_problems(envelope, settings, resolve)
     servers = {name: dict(server) if 'url' in server else _local_server(layout, workspace, base, server)
-               for name, server in settings.tool_servers.items()}
+               for name, server in settings.tool_servers.items() if name not in refused}
     config.update({
         'features': features,
         'shell_environment_policy': _shell(layout, workspace),
@@ -201,13 +326,9 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
     return config
 
 
-def write_home_config(layout: Layout, envelope: dict, settings: Settings) -> None:
-    """codex-home/config.toml for opening the Lab Codex by hand: the task-run configuration, but interactive.
-
-    Written to a temporary name first, so the file is never seen half-written.
-    """
-    text = render_file(lab_config(layout, envelope, settings, trial=False, interactive=True))
-    layout.lab_home.mkdir(parents=True, exist_ok=True)
-    temporary = layout.lab_home / 'config.toml.rsi-new'
-    temporary.write_text(text, encoding='utf-8')
-    os.replace(temporary, layout.lab_home / 'config.toml')
+def write_home_config(layout: Layout, envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo) -> None:
+    """codex-home/config.toml for opening the Lab Codex by hand: the task-run configuration, but interactive,
+    with the role copies of work/ written first."""
+    text = render_file(lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve))
+    write_role_files(layout, settings, trial=False)
+    _replace(layout.lab_home / 'config.toml', text)

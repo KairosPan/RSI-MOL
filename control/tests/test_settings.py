@@ -153,8 +153,8 @@ class SettingsTests(unittest.TestCase):
         good = GOOD_ROLE
         s = load_settings(self.ws('', {'literature': good + 'model = "m"\nmodel_reasoning_effort = "low"\n'}))
         role = s.roles['literature']
-        self.assertEqual((role['model'], role['effort'], role['file'].name, s.problems),
-                         ('m', 'low', 'literature.toml', []))
+        self.assertEqual((role['model'], role['effort'], role['file'].name, role['developer_instructions'], s.problems),
+                         ('m', 'low', 'literature.toml', 'i', []))
         bad = {'max_depth': good.replace('literature', 'max_depth'),
                'literature': good.replace('developer_instructions', 'x'),
                '.literature': good, 'worker': good.replace('literature', 'worker')}

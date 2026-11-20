@@ -1,5 +1,6 @@
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import tomllib
@@ -8,13 +9,35 @@ from pathlib import Path
 from unittest import mock
 
 from rsi.codexrun import codex_program
-from rsi.compose import lab_config, load_envelope, meta_config, profiles, write_home_config
+from rsi.compose import (lab_config, load_envelope, meta_config, profiles, tool_server_problems, write_home_config,
+                          write_role_files)
 from rsi.paths import Layout, Refused
 from rsi.settings import load_settings
 from rsi.tomlout import render_file, render_flags
 from tests.support import needs_codex
 
 LITERATURE = 'name = "literature"\ndescription = "d"\ndeveloper_instructions = "i"\n'
+
+
+def resolving_to(*addresses):
+    """A stand-in for socket.getaddrinfo that answers every host with these addresses; it records its calls."""
+    def resolve(host, port, *args, **kwargs):
+        resolve.calls.append((host, port))
+        return [(socket.AF_INET6 if ':' in address else socket.AF_INET, socket.SOCK_STREAM, 6, '', (address, port))
+                for address in addresses]
+    resolve.calls = []
+    return resolve
+
+
+def unresolvable(host, port, *args, **kwargs):
+    raise socket.gaierror(socket.EAI_NONAME, 'nodename nor servname provided, or not known')
+
+
+def no_lookup(*args, **kwargs):
+    raise AssertionError('no host should be resolved')
+
+
+PUBLIC = resolving_to('93.184.215.14')
 
 
 class ComposeTests(unittest.TestCase):
@@ -57,9 +80,9 @@ class ComposeTests(unittest.TestCase):
     def test_tool_server_is_wrapped(self):
         text = ('[tool_servers.lit]\ncommand = "python3"\nargs = ["tools/lit/server.py"]\nnetwork = true\n'
                 '[tool_servers.far]\nurl = "https://e/mcp"\n')
-        c = lab_config(self.layout, self.envelope, self.settings(text), trial=False)
+        c = lab_config(self.layout, self.envelope, self.settings(text), trial=False, resolve=PUBLIC)
         lit = c['mcp_servers']['lit']
-        self.assertEqual(lit['command'], 'codex')
+        self.assertEqual(lit['command'], shutil.which('codex') or 'codex')
         self.assertEqual(lit['args'][:6], ['sandbox', '-P', 'lab_net', '--enable', 'network_proxy', '--'])
         self.assertEqual(lit['args'][6:], ['python3', str(self.layout.work / 'tools/lit/server.py')])
         self.assertEqual(lit['env']['CODEX_HOME'], str(self.layout.lab_home))
@@ -74,7 +97,7 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual((c['apps']['conn_a'], c['plugins']['pdf@x']), ({'enabled': False}, {'enabled': False}))
         self.assertTrue(any('nope' in p for p in s.problems))
         self.assertEqual(c['agents']['literature']['config_file'],
-                         str(self.layout.work / 'codex/agents/literature.toml'))
+                         str(self.layout.lab_home / 'rsi/roles/work/literature.toml'))
 
     def test_meta(self):
         c = meta_config(self.layout, self.envelope, {'model_reasoning_effort': 'low'})
@@ -109,7 +132,7 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual((c['model'], c['model_reasoning_effort'], c['web_search']), ('m', 'high', 'cached'))
         self.assertEqual(c['agents'], {'max_depth': 2, 'max_concurrent_threads_per_session': 5,
                                        'literature': {'description': 'd', 'config_file':
-                                                      str(self.layout.work / 'codex/agents/literature.toml')}})
+                                                      str(self.layout.lab_home / 'rsi/roles/work/literature.toml')}})
         path = env + '/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
         self.assertEqual(c['shell_environment_policy'],
                          {'inherit': 'core', 'set': {'TMPDIR': str(self.layout.work / '.tmp'), 'PATH': path}})
@@ -139,15 +162,26 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(c['mcp_servers']['lit']['env']['TMPDIR'], str(trial / '.tmp'))
         self.assertEqual((c['mcp_servers']['lit']['default_tools_approval_mode'],
                           c['mcp_servers']['lit']['startup_timeout_sec']), ('approve', 30))
-        self.assertEqual(c['agents']['literature']['config_file'], str(trial / 'codex/agents/literature.toml'))
+        self.assertEqual(c['agents']['literature']['config_file'],
+                         str(self.layout.lab_home / 'rsi/roles/trial/literature.toml'))
         self.assertNotIn('network_proxy', c['features'])
         fs = c['permissions']['trial']['filesystem']
         self.assertEqual((fs[str(trial)], fs[str(trial / '.codex')]), ('write', 'read'))
 
-    def test_codex_program_names_the_wrapper(self):
-        os.environ['RSI_CODEX'] = '/x/codex'
-        c = lab_config(self.layout, self.envelope, self.settings('[tool_servers.t]\ncommand = "c"\n'), trial=False)
-        self.assertEqual(c['mcp_servers']['t']['command'], '/x/codex')
+    def test_the_wrapper_starts_codex_by_absolute_path(self):
+        folder = self.layout.root / 'bin'; folder.mkdir()
+        fake = folder / 'fake-codex'; fake.write_text('#!/bin/sh\n'); fake.chmod(0o755)
+        s = self.settings('[tool_servers.t]\ncommand = "c"\n')
+
+        def wrapper():
+            config = lab_config(self.layout, self.envelope, s, trial=False, resolve=no_lookup)
+            return config['mcp_servers']['t']['command']
+        os.environ['RSI_CODEX'] = str(fake)
+        self.assertEqual(wrapper(), str(fake))
+        os.environ['RSI_CODEX'] = 'fake-codex'; os.environ['PATH'] = str(folder) + os.pathsep + os.environ['PATH']
+        self.assertEqual(wrapper(), str(fake))
+        os.environ['RSI_CODEX'] = str(self.layout.root / 'missing-codex')
+        self.assertEqual(wrapper(), str(self.layout.root / 'missing-codex'))
 
     def test_disabling_twice_reports_once(self):
         s = self.settings('[disable]\nplugins = ["nope"]\n')
@@ -176,13 +210,19 @@ class ComposeTests(unittest.TestCase):
         tomllib.loads(render_file(c))
 
     def test_home_config(self):
+        (self.layout.work / 'codex' / 'agents').mkdir(parents=True)
+        (self.layout.work / 'codex' / 'agents' / 'literature.toml').write_text(LITERATURE)
         write_home_config(self.layout, self.envelope, self.settings('network = true\n'))
         written = tomllib.loads((self.layout.lab_home / 'config.toml').read_text())
         expected = tomllib.loads(render_file(lab_config(self.layout, self.envelope, self.settings('network = true\n'),
                                                         trial=False, interactive=True)))
         self.assertEqual(written, expected)
         self.assertEqual((written['approval_policy'], written['default_permissions']), ('on-request', 'lab_net'))
-        self.assertEqual(sorted(p.name for p in self.layout.lab_home.iterdir()), ['config.toml'])
+        self.assertEqual(sorted(p.name for p in self.layout.lab_home.iterdir()), ['config.toml', 'rsi'])
+        roles = self.layout.lab_home / 'rsi/roles/work'
+        self.assertEqual(sorted(p.name for p in roles.iterdir()), ['literature.toml'])
+        self.assertEqual(written['agents']['literature']['config_file'],
+                         str(self.layout.lab_home / 'rsi/roles/work/literature.toml'))
 
     def test_envelope(self):
         owner = self.layout.owner; owner.mkdir()
@@ -192,13 +232,91 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(envelope, {'approval_policy': 'on-request', 'features': {'apps': True},
                                     'apps': {'conn_a': {'enabled': True}}, 'plugins': {},
                                     'rsi': {'extra_read': ['/opt/x']}})
-        for text in ('sandbox_mode = "x"\n', 'not toml [[[', 'apps = 1\n', '[rsi]\nextra_read = "/opt/x"\n'):
+        (owner / 'lab-envelope.toml').write_text('[rsi.tool_secrets]\nRSI_TOOL_X = "api.example.org"\n')
+        self.assertEqual(load_envelope(owner)['rsi'], {'tool_secrets': {'RSI_TOOL_X': 'api.example.org'}})
+        for text in ('sandbox_mode = "x"\n', 'not toml [[[', 'apps = 1\n', '[rsi]\nextra_read = "/opt/x"\n',
+                     '[rsi]\ntool_secrets = "x"\n', '[rsi.tool_secrets]\nRSI_TOOL_X = 1\n'):
             (owner / 'lab-envelope.toml').write_text(text)
             with self.assertRaises(Refused, msg=text):
                 load_envelope(owner)
         (owner / 'lab-envelope.toml').unlink()
         with self.assertRaises(Refused):
             load_envelope(owner)
+
+    def role(self, name='literature', text=LITERATURE):
+        (self.layout.work / 'codex' / 'agents').mkdir(parents=True, exist_ok=True)
+        (self.layout.work / 'codex' / 'agents' / (name + '.toml')).write_text(text)
+
+    def test_role_files_are_copied_out_of_the_agents_reach(self):
+        self.role(text=LITERATURE + 'model = "m"\n'); self.role('critic', LITERATURE.replace('literature', 'critic'))
+        s = self.settings()
+        in_workspace = self.layout.work / 'codex/agents/literature.toml'
+        in_workspace.write_text(LITERATURE + 'sandbox_mode = "danger-full-access"\n')      # rewritten after the check
+        write_role_files(self.layout, s, trial=False)
+        copy = self.layout.lab_home / 'rsi/roles/work/literature.toml'
+        allowed = {'name': 'literature', 'description': 'd', 'developer_instructions': 'i', 'model': 'm'}
+        self.assertEqual(tomllib.loads(copy.read_text()), allowed)
+        in_workspace.write_text(LITERATURE + 'sandbox_mode = "danger-full-access"\n')      # and after the copy
+        self.assertEqual(tomllib.loads(copy.read_text()), allowed)
+        c = lab_config(self.layout, self.envelope, s, trial=False)
+        self.assertEqual(c['agents']['literature']['config_file'], str(copy))
+        home = str(self.layout.lab_home)                  # under the denied root; only the plugin cache is opened
+
+        def opened(profile):
+            return [path for path in profile['filesystem'] if path == home or path.startswith(home + '/')]
+        for profile in c['permissions'].values():
+            self.assertEqual(opened(profile), [home + '/plugins/cache'])
+        self.assertEqual(opened(meta_config(self.layout, self.envelope, {})['permissions']['meta']), [])
+
+    def test_stale_role_copies_are_removed(self):
+        self.role(); self.role('critic', LITERATURE.replace('literature', 'critic'))
+        write_role_files(self.layout, self.settings(), trial=False)
+        write_role_files(self.layout, self.settings(), trial=True)
+        work, trial = self.layout.lab_home / 'rsi/roles/work', self.layout.lab_home / 'rsi/roles/trial'
+        (work / 'old.toml').write_text('name = "old"\n')
+        (self.layout.work / 'codex/agents/critic.toml').unlink()
+        write_role_files(self.layout, self.settings(), trial=False)
+        self.assertEqual(sorted(p.name for p in work.iterdir()), ['literature.toml'])
+        self.assertEqual(sorted(p.name for p in trial.iterdir()), ['critic.toml', 'literature.toml'])
+        (self.layout.work / 'codex/agents/literature.toml').write_text(LITERATURE + 'sandbox_mode = "x"\n')
+        write_role_files(self.layout, self.settings(), trial=False)
+        self.assertEqual(list(work.iterdir()), [])
+
+    def test_url_servers_must_resolve_to_public_addresses(self):
+        s = self.settings('[tool_servers.far]\nurl = "https://e:8443/mcp"\n[tool_servers.near]\ncommand = "c"\n')
+        cases = {'127.0.0.1': True, '10.0.0.5': True, '169.254.169.254': True, '::1': True, '::ffff:127.0.0.1': True,
+                 '192.168.1.2': True, '100.64.0.1': True, '224.0.0.1': True, '0.0.0.0': True, 'fe80::1%en0': True,
+                 '93.184.215.14': False, '2606:4700::1111': False}
+        for address, refused in cases.items():
+            resolve = resolving_to(address)
+            problems = tool_server_problems(self.envelope, s, resolve=resolve)
+            self.assertEqual(bool(problems), refused, (address, problems))
+            self.assertEqual(resolve.calls, [('e', 8443)])
+            self.assertTrue(all('far' in p and '\n' not in p for p in problems), problems)
+            c = lab_config(self.layout, self.envelope, s, trial=False, resolve=resolving_to(address))
+            self.assertEqual(sorted(c['mcp_servers']), ['near'] if refused else ['far', 'near'], address)
+        self.assertTrue(tool_server_problems(self.envelope, s, resolve=resolving_to('93.184.215.14', '10.0.0.5')))
+        self.assertTrue(tool_server_problems(self.envelope, s, resolve=resolving_to()))
+        problems = tool_server_problems(self.envelope, s, resolve=unresolvable)
+        self.assertEqual(len(problems), 1); self.assertIn('far', problems[0])
+        c = lab_config(self.layout, self.envelope, s, trial=False, resolve=unresolvable)
+        self.assertNotIn('far', c['mcp_servers'])
+        local = self.settings('[tool_servers.near]\ncommand = "c"\n')
+        self.assertEqual(tool_server_problems(self.envelope, local, resolve=no_lookup), [])
+
+    def test_bearer_tokens_go_only_to_the_owners_host(self):
+        s = self.settings('[tool_servers.far]\nurl = "https://api.example.org/mcp"\n'
+                          'bearer_token_env_var = "RSI_TOOL_X"\n')
+        server = {'url': 'https://api.example.org/mcp', 'bearer_token_env_var': 'RSI_TOOL_X'}
+        self.assertTrue(any('RSI_TOOL_X' in p for p in tool_server_problems(self.envelope, s, resolve=PUBLIC)))
+        for secrets, refused in (({}, True), ({'RSI_TOOL_X': 'other.example.org'}, True),
+                                 ({'RSI_TOOL_Y': 'api.example.org'}, True), ({'RSI_TOOL_X': 'API.Example.org'}, False)):
+            envelope = dict(self.envelope, rsi={'extra_read': [], 'tool_secrets': secrets})
+            problems = tool_server_problems(envelope, s, resolve=PUBLIC)
+            self.assertEqual(bool(problems), refused, (secrets, problems))
+            self.assertTrue(all('far' in p for p in problems), problems)
+            c = lab_config(self.layout, envelope, s, trial=False, resolve=PUBLIC)
+            self.assertEqual(c['mcp_servers'].get('far'), None if refused else server, secrets)
 
     @needs_codex
     def test_the_real_codex_accepts_whole_configurations(self):
@@ -209,8 +327,11 @@ class ComposeTests(unittest.TestCase):
                           '[tool_servers.lit]\ncommand = "python3"\nargs = ["tools/lit/server.py"]\n'
                           '[tool_servers.far]\nurl = "https://e/mcp"\nbearer_token_env_var = "RSI_TOOL_FAR"\n')
         self.layout.meta.mkdir(); (self.layout.root / 'scratch-home').mkdir()
-        for config in (lab_config(self.layout, self.envelope, s, trial=False),
-                       lab_config(self.layout, self.envelope, s, trial=False, interactive=True),
+        envelope = dict(self.envelope, rsi={'extra_read': ['/opt/x'], 'tool_secrets': {'RSI_TOOL_FAR': 'e'}})
+        write_role_files(self.layout, s, trial=False)
+        task = lab_config(self.layout, envelope, s, trial=False, resolve=PUBLIC)
+        self.assertEqual(sorted(task['mcp_servers']), ['far', 'lit'])
+        for config in (task, lab_config(self.layout, envelope, s, trial=False, interactive=True, resolve=PUBLIC),
                        meta_config(self.layout, self.envelope, {'model': 'm', 'model_reasoning_effort': 'low'})):
             done = subprocess.run([codex_program(), 'sandbox', *render_flags(config), '--', '/usr/bin/true'],
                                   env={**os.environ, 'CODEX_HOME': str(self.layout.root / 'scratch-home')},

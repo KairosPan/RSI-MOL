@@ -48,7 +48,8 @@ class Settings:
     disabled_connectors: list[str] = field(default_factory=list)
     disabled_plugins: list[str] = field(default_factory=list)
     tool_servers: dict[str, dict] = field(default_factory=dict)  # name → {command, args, network} or {url, bearer…}
-    roles: dict[str, dict] = field(default_factory=dict)         # name → {description, file, model, effort}
+    # name → {description, file, model, effort, developer_instructions}: what was checked, for compose to copy
+    roles: dict[str, dict] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
 
 
@@ -319,7 +320,8 @@ def _roles(settings: Settings, workspace: Path) -> None:
             problems.append(f'{label}：model_reasoning_effort 只能是 {"、".join(EFFORTS)} 之一')
         if len(problems) == before:
             settings.roles[name] = {'description': table['description'], 'file': folder / file_name,
-                                    'model': table.get('model'), 'effort': table.get('model_reasoning_effort')}
+                                    'model': table.get('model'), 'effort': table.get('model_reasoning_effort'),
+                                    'developer_instructions': table['developer_instructions']}
 
 
 def load_settings(workspace: Path) -> Settings:
