@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from rsi import cli
-from rsi.check import CHECK_FILE, PROBE, gate, owner_fingerprints, program_fingerprints, run_check
+from rsi.check import CHECK_FILE, PROBE, _static_problems, gate, owner_fingerprints, program_fingerprints, run_check
 from rsi.codexrun import PROXY_VARIABLES, codex_version
 from rsi.compose import native_codex
 from rsi.labrun import run_task
@@ -35,9 +35,11 @@ WANTED = (('lab', 'read_records'), ('lab_net', 'local_tcp'), ('lab_net', 'local_
           ('lab', 'shell_read_owner'), ('lab', 'shell_allow_rule_outside'), ('lab', 'shell_rules_not_loaded'),
           ('meta', 'shell_write_inside'), ('meta', 'shell_write_work'), ('meta', 'shell_write_records'),
           ('meta', 'shell_read_owner'), ('meta', 'shell_allow_rule_outside'), ('meta', 'shell_rules_not_loaded'))
-# Every create case tries mkdir, rename-to and a link, for three letter cases, in every writable root of its profile:
-# lab work/, library/, env/; trial trial/; meta meta/, candidate/.
-CREATE_ATTEMPTS = {'lab': 27, 'lab_net': 27, 'trial': 9, 'trial_net': 9, 'meta': 18}
+# Every create case tries mkdir, rename-to and a link, for each spelling (three letter cases; for .agents also .agentſ,
+# with a long s, which the file system takes for .agents), in every writable root of its profile: lab work/, library/,
+# env/; trial trial/; meta meta/, candidate/.
+CREATE_ATTEMPTS = {'create_dot_codex': {'lab': 27, 'lab_net': 27, 'trial': 9, 'trial_net': 9, 'meta': 18},
+                   'create_dot_agents': {'lab': 36, 'lab_net': 36, 'trial': 12, 'trial_net': 12, 'meta': 24}}
 INFO = {('meta', 'meta_planted_skill_loaded'), ('lab', 'lab_can_create_dot_agents'),
         ('lab', 'lab_can_write_in_existing_dot_agents'), ('lab', 'edit_layer_without_apps_and_plugins'),
         ('meta', 'edit_layer_without_apps_and_plugins')}
@@ -78,10 +80,10 @@ class Check(unittest.TestCase):
             for wanted in WANTED:
                 self.assertIn(wanted, names)
             self.assertTrue(all(r['expected'] in ('allowed', 'blocked') for r in report['results']))
-            for profile in CREATE_ATTEMPTS:
-                for name in ('create_dot_codex', 'create_dot_agents'):
+            for name, attempts in CREATE_ATTEMPTS.items():
+                for profile, count in attempts.items():
                     [r] = [r for r in report['results'] if (r['profile'], r['name']) == (profile, name)]
-                    self.assertEqual(r['detail'].count(' blocked'), CREATE_ATTEMPTS[profile], r)
+                    self.assertEqual(r['detail'].count(' blocked'), count, r)
             self.assertEqual({(i['profile'], i['name']) for i in report['info']}, INFO)
             self.assertTrue(all(i['value'] in (True, False, None) for i in report['info']))
             [apps] = [i for i in report['info']
@@ -235,6 +237,24 @@ class Gate(unittest.TestCase):
             path.write_text(text)
             self.assertIsNone(gate(root.layout))
             self.assertEqual((root.records.calls(), root.model.requests), ([], []))
+
+
+class Static(unittest.TestCase):
+    def test_a_root_holding_what_codex_loads_fails_the_check(self):
+        # The root is a git repository, so Codex may take it for the project root of work/ and load these from it.
+        with Root(passed_check=False) as root:
+            self.assertEqual(_static_problems(root.layout, None), [])
+            for name in ('AGENTS.md', 'AGENTS.override.md', '.agents', '.codex'):
+                path = root.path / name
+                path.mkdir() if name.startswith('.') else path.write_text('x')
+                problems = _static_problems(root.layout, None)
+                self.assertTrue(any(name in line and 'git' in line for line in problems), problems)
+                path.rmdir() if name.startswith('.') else path.unlink()
+            (root.path / 'AGENTS.md').write_text('x')
+            with mock.patch('rsi.check._cases', return_value=[Command.RESULT]):
+                report = run_check(root.layout)
+            self.assertFalse(report['passed'])
+            self.assertTrue(any('AGENTS.md' in line for line in report['problems']), report['problems'])
 
 
 class Fingerprints(unittest.TestCase):

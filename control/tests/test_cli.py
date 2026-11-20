@@ -248,6 +248,16 @@ class Init(unittest.TestCase):
         self.assertEqual(VersionStore(layout.versions).log()[0]['author'], 'init')
         self.assertEqual(len(notes(layout, 'sealed')), 1)
 
+    def test_a_root_holding_what_codex_loads_is_refused_before_anything_is_made(self):
+        # The root is a git repository, so Codex may take it for the project root of work/ and load these from it.
+        for name in ('AGENTS.md', 'AGENTS.override.md', '.agents', '.codex'):
+            layout = bare(self, env=False)
+            (layout.root / name).mkdir() if name.startswith('.') else (layout.root / name).write_text('x')
+            with self.assertRaises(Refused) as refusal:
+                init(layout, SEED)
+            self.assertIn(name, str(refusal.exception)); self.assertIn('git', str(refusal.exception))
+            self.assertEqual(os.listdir(layout.root), [name])
+
     def test_a_root_codex_cannot_sandbox_is_refused_before_anything_is_made(self):
         layout = bare(self, 'a[b', env=False)
         with self.assertRaises(Refused):
@@ -480,6 +490,19 @@ class Commands(unittest.TestCase):
             self.assertEqual(run('rollback', 'V0001')[0], 0); self.assertEqual(run('rollback', '../x')[0], 3)
             self.assertEqual((root.store.head(), (root.layout.work / 'NOTES.md').exists()), ('V0003', False))
             self.assertEqual(json.loads(run('status', '--json')[1])['releases'][0]['kind'], 'rollback')
+
+    @needs_codex
+    def test_a_task_run_that_ended_exits_0_even_when_the_meta_round_after_it_is_refused(self):
+        with Root() as root:
+            root.add_task('T1')
+            (root.layout.owner / 'limits.toml').write_text('[day]\ncalls = 1\n')       # the task run takes it
+            root.model.push(say('lab done'))
+            code, out, err = run('task', 'T1')
+            self.assertEqual((code, err), (0, ''))
+            self.assertIn('R0001（Lab 任务 T1）：完成', out)
+            line = next(line for line in out.splitlines() if 'Meta' in line)
+            self.assertIn('day.calls', line)
+            self.assertEqual(len(root.records.calls()), 1); self.assertFalse((root.layout.records / 'rounds').exists())
 
     @needs_codex
     def test_meta_command_takes_every_task_call_no_round_had(self):

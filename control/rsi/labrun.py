@@ -74,6 +74,8 @@ class _Run:
     context: dict                                           # purpose, task, round: for notes
     notes: list[str] = field(default_factory=list)         # problems found before the call
     version_before: str | None = None
+    envelope: dict | None = None                            # a task run: for the owner's Lab config afterwards
+    resolve: object = None
 
 
 def _now() -> str:
@@ -411,7 +413,7 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
                   'task': task.id, 'probe': None, 'round': None, 'workspace': 'work', **fields,
                   'settings_problems': settings_problems + skill_lines}
         run = _Run('work', task, task.id, prompt_for(task), config, limits.lab_seconds, fields, context, notes,
-                   version_before)
+                   version_before, envelope, resolve)
     return _execute(layout, records, store, run)
 
 
@@ -544,11 +546,15 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
         with _problem(problems, '没能写 diff.patch'):
             with open(call_dir / 'diff.patch', 'x', encoding='utf-8') as stream:
                 stream.write(diff)
-        restaged = []                       # what of the new head's skills/ the owner's work/ lacks: told at once
+        restaged, settings = [], None       # what of the new head's skills/ the owner's work/ lacks: told at once
         with _problem(problems, 'work/ 没能换成最新版本'):
-            _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, problems,
-                     skill_lines=restaged)
+            staged, head_settings = _stage(layout, store, store.head())
+            _move_in(layout, records, root_fd, staged, 'work', context, problems, skill_lines=restaged)
+            settings = head_settings
         problems += [RESTAGED + line for line in restaged]
+        if settings is not None:            # the owner's manual Lab Codex uses the version now in work/
+            with _problem(problems, 'Lab 的 Codex 配置（codex-home/config.toml）没能更新'):
+                write_home_config(layout, run.envelope, settings, resolve=run.resolve)
 
 
 def _saver(store: VersionStore, run: _Run, call_id: str, end: dict):

@@ -437,8 +437,15 @@ def _task(layout: Layout, task: str, meta: bool) -> int:
         load_task(layout.tasks, task)           # an unknown task or a bad id: refused before anything runs
     call = run_task(layout, task)
     _print(_call_lines(layout, call))
-    if meta:
-        _print(_round_lines(layout, run_round(layout, [call['id']])))
+    if meta:                                    # the task run is done: its exit code is 0 whatever the round does
+        try:
+            record = run_round(layout, [call['id']])
+        except Refused as error:
+            _print([f'这次任务运行之后没有跑 Meta：{safe(error, ERROR_CHARS)}'])
+        except Exception as error:
+            _print([f'这次任务运行之后的 Meta 轮没能完成：{type(error).__name__}: {safe(error, ERROR_CHARS)}'])
+        else:
+            _print(_round_lines(layout, record))
     _print(_footer(layout))
     return 0
 

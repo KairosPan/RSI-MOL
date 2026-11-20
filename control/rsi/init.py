@@ -44,11 +44,14 @@ from rsi.records import STARTED, Records
 from rsi.settings import Settings
 from rsi.tomlout import render_file
 from rsi.versions import VersionStore
-from rsi.workspace import SEALED, keep, kind, open_folder, seal
+from rsi.workspace import SEALED, has_entry, keep, kind, open_folder, seal
 
 DEFAULT_PYTHON = '/opt/homebrew/bin/python3'
 IMPORTED = ('features', 'apps', 'plugins')      # tables of that file the envelope takes (and approval_policy)
 UNSAFE_IN_ROOT = '"[]*?\n\r'                    # Codex's own sandbox cannot confine a path with these
+# What Codex loads from a project root. The RSI root is a git repository, so Codex may take it for the project root of
+# work/ (and meta/): none of these may be in it.
+LOADED_AT_ROOT = ('AGENTS.md', 'AGENTS.override.md', '.agents', '.codex')
 OWNER_FOLDERS = ('owner', 'tasks', 'records', 'versions', 'staging', 'sealed', 'codex-home', 'codex-home-meta')
 AGENT_FOLDERS = ('meta', 'library')             # env/ is made by venv; work/ is renamed in; trial/, candidate/ later
 OWNER_SEED = (Path('limits.toml'), Path('meta', 'AGENTS.md'), Path('meta', 'settings.toml'))
@@ -81,6 +84,13 @@ def locked(layout: Layout):
 
 
 # init
+
+def loaded_at_root(layout: Layout) -> list[str]:
+    """One Chinese line for each name of LOADED_AT_ROOT the RSI root holds, in whatever spelling the file system takes
+    for it (workspace.has_entry, which also says yes when it cannot tell)."""
+    return [f'RSI 文件夹里有 {name}：这个文件夹是 git 版本库，Codex 可能把它当作 work/ 的项目根目录，从这里读入说明、'
+            f'技能或配置；请把它移出 RSI 文件夹' for name in LOADED_AT_ROOT if has_entry(layout.root, name)]
+
 
 def _report() -> dict:
     return {'folders': [], 'files': [], 'envelope': None, 'first_version': None, 'version': None, 'work': None,
@@ -354,6 +364,9 @@ def init(layout: Layout, seed: Path) -> dict:
                       '请换一个路径')
     if layout.root.is_symlink() or not layout.root.is_dir():
         raise Refused(f'{layout.root} 不是文件夹')
+    found = loaded_at_root(layout)
+    if found:
+        raise Refused('；'.join(found))
     report, context = _report(), {'command': 'init'}
     with root_descriptor(layout) as root_fd:
         _folders(layout, root_fd, report)

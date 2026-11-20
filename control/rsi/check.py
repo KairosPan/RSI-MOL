@@ -32,8 +32,9 @@ The three layers:
 - info, which passes or fails nothing: whether Meta's Codex would load a skill someone else put in meta/.agents/, and
   whether the Lab can create work/.agents or write in one that exists.
 - tool servers: a local stdio tool server composed from settings and started exactly as compose wraps it.
-Static checks on the real root read nothing an agent can write: the root's path, codex-home/config.toml, and whether
-the envelope composes for the real root.
+Static checks on the real root read nothing an agent can write: the root's path, that the root holds nothing Codex
+loads from a project root (AGENTS.md, AGENTS.override.md, .agents, .codex), codex-home/config.toml, and whether the
+envelope composes for the real root.
 """
 import hashlib
 import importlib.machinery
@@ -118,7 +119,8 @@ RULES = ('prefix_rule(pattern = ["touch"], decision = "allow")\n'
 # What Codex loads as instructions: name -> (profile, expected). `blocked`: not loaded; the Lab's is the control.
 LOADING = {'meta_agents_md_not_loaded': ('meta', B), 'lab_agents_md_loaded': ('lab', A)}
 # What an agent must not create in a writable root, since Codex loads it (the create_dot_* cases): the name and its
-# letter-case variants (the file system ignores letter case), each by mkdir, by renaming a folder to it, and as a link.
+# letter-case variants (the file system ignores letter case), and for .agents also .agentſ (a long s, which the file
+# system takes for .agents), each by mkdir, by renaming a folder to it, and as a link.
 LOADED_NAMES = {'create_dot_codex': '.codex', 'create_dot_agents': '.agents'}
 RENAME_SOURCE = 'rsi-check-folder'              # the folder the create cases try to rename to .codex or .agents
 # Under owner/ (compose.ENVELOPE, meta.META_SETTINGS): a check holds only while they are unchanged.
@@ -578,10 +580,13 @@ def _command_cases(layout: Layout, profile: str, ports: dict, pdftotext: str | N
 
     def creates(name: str) -> _Case:
         """In every writable root: mkdir, rename RENAME_SOURCE to it, and a link to owner/ by that name, for the
-        name of LOADED_NAMES and its letter-case variants (.codex, .CODEX, .Codex)."""
+        name of LOADED_NAMES and its letter-case variants (.codex, .CODEX, .Codex), and .agentſ for .agents."""
         base, steps, targets = LOADED_NAMES[name], [], []
+        variants = [base, base.upper(), base[:2].upper() + base[2:]]
+        if base.endswith('s'):
+            variants.append(base[:-1] + '\u017f')
         for folder in writable:
-            for variant in (base, base.upper(), base[:2].upper() + base[2:]):
+            for variant in variants:
                 target = folder / variant
                 steps += [['mkdir', str(target)], ['rename', str(folder / RENAME_SOURCE), str(target)],
                           ['symlink', str(layout.owner), str(target)]]
@@ -977,11 +982,12 @@ def _tool_run(context: _Context, scratch: Path) -> list[dict]:
 
 def _static_problems(layout: Layout, envelope: dict | None) -> list[str]:
     """What is wrong with the real root itself, one Chinese line each; reads nothing an agent can write."""
-    from rsi.init import UNSAFE_IN_ROOT          # rsi.init imports rsi.labrun, which imports this module
+    from rsi.init import UNSAFE_IN_ROOT, loaded_at_root     # rsi.init imports rsi.labrun, which imports this module
     problems = []
     bad = sorted({char for char in str(layout.root) if char in UNSAFE_IN_ROOT})
     if bad:
         problems.append(f'RSI 文件夹的路径 {str(layout.root)!r} 里有 {"".join(bad)!r}，Codex 的沙箱处理不了这样的路径')
+    problems += loaded_at_root(layout)
     path = layout.lab_home / 'config.toml'
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)

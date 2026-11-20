@@ -14,7 +14,9 @@ snapshots it on refs/rounds/<round>; then a checkout of that snapshot is staged 
 so Meta goes on from exactly what was snapshotted. A tree that has settings problems is not snapshotted and is
 renamed back, so Meta can fix it; one that cannot be stored at all (a link, a `.codex`, something that must be left
 out but cannot be moved out) is kept under sealed/ and candidate/ starts again from the round's last snapshot or the
-current version. Of meta/ the program only creates meta/.tmp and meta/notes when missing.
+current version. A round that releases nothing keeps its candidate all the same: snapshotted on the round's ref
+(final_candidate in round.json) when it can be and is new, kept under sealed/ when it cannot be. Of meta/ the program
+only creates meta/.tmp and meta/notes when missing.
 
 Everything in a decision is untrusted: ids are checked before any path or git command is built from them. A release
 needs real evidence: Lab runs that ended (finished, failed or timed_out) on exactly the tree being released. Whether
@@ -42,7 +44,7 @@ from rsi.records import CALL_ID, Records
 from rsi.sessions import collect_sessions
 from rsi.settings import load_settings, show, workspace_problems
 from rsi.versions import AUTHOR, VERSION, VersionStore
-from rsi.workspace import kind, open_folder, prepare_for_commit, seal
+from rsi.workspace import has_entry, kind, open_folder, prepare_for_commit, seal
 
 INSTRUCTIONS = Path('meta', 'AGENTS.md')        # under owner/: Meta's standing instructions, the first prompt
 META_SETTINGS = Path('meta', 'settings.toml')   # under owner/: Meta's model and reasoning effort
@@ -277,6 +279,7 @@ class _Round:
     thread: str | None = None
     last: str | None = None         # the round's last snapshot
     released: str | None = None
+    final: str | None = None        # the candidate kept at the end of a round without a release (a snapshot)
     calls: list[str] = field(default_factory=list)
     trials: list[dict] = field(default_factory=list)
     decisions: list[dict] = field(default_factory=list)
@@ -323,9 +326,12 @@ class _Round:
                 entry['reply'] = reply
                 reply = f'{reply}\n\n{self._left()}'
                 prompt = reply if self.thread is not None else f'{first}\n\n{reply}'
+        if self.released is None:
+            self._keep_final()
         record = {'id': self.round_id, 'trigger': list(trigger), 'started': started, 'ended': now(),
                   'outcome': outcome, 'reason': reason, 'version_before': self.version,
-                  'version_after': self.released, 'calls': self.calls, 'decisions': self.decisions,
+                  'version_after': self.released, 'final_candidate': self.final, 'calls': self.calls,
+                  'decisions': self.decisions,
                   'trials': self.trials, 'applications': self.applications,
                   'limits': {'calls': self.limits.meta_calls, 'trials': self.limits.meta_trials,
                              'seconds_per_call': self.limits.meta_seconds},
@@ -700,6 +706,47 @@ class _Round:
         except Exception as error:
             lines.append(f'candidate/ 没能换成新的内容：{type(error).__name__}: {error}')
             return False
+
+    def _keep_final(self) -> None:
+        """Keep the candidate of a round that released nothing (§5.5: 没有发布的候选版也留档). It is sealed; when it
+        passes the checks a trial snapshot needs and its tree differs from main's head and from the round's last
+        snapshot, it is snapshotted on refs/rounds/<round> (final_candidate); then it is renamed back as candidate/.
+        One that cannot be snapshotted is kept under sealed/ with a note. Never fails the round: a problem line."""
+        layout, store, label = self.layout, self.store, f'final-{self.round_id}'
+        context, left, unstorable, lines = {**self.context, 'final': True}, [], [], []
+        try:
+            entry = seal(self.root_fd, 'candidate', label)
+            if entry is None:
+                return
+            path = layout.root / entry
+            if kind(entry, self.root_fd) != 'folder':
+                unstorable.append('本轮结束时 candidate/ 不是文件夹（可能是符号链接），没有跟着它走')
+            else:
+                try:
+                    lines, moved, blocked = prepare_for_commit(path, layout.sealed / label / 'left-out',
+                                                               f'{layout.sealed.name}/{label}/left-out')
+                    if moved:
+                        left.append(f'有 {moved} 处内容没有存进快照，已移到 {layout.sealed.name}/{label}/left-out/')
+                    if blocked:
+                        found = [f'有 {blocked} 处应排除在版本之外的内容没能移出去']
+                    elif has_entry(path, '.codex'):
+                        found = ['里面有 .codex']
+                    else:
+                        found = workspace_problems(path) + tool_server_problems(
+                            self.envelope, load_settings(path), resolve=self.resolve)
+                    if found:
+                        unstorable.append(f'本轮结束时的候选版存不成快照：{"；".join(found)}')
+                    elif store.tree_of_dir(path) not in {store.tree_of(store.head()),
+                                                         *([store.tree_of(self.last)] if self.last else [])}:
+                        self.final = store.snapshot(path, self.round_id, f'Meta 轮 {self.round_id} 结束时没有发布的候选版')
+                except WORKSPACE_ERRORS as error:
+                    unstorable.append(f'本轮结束时的候选版存不成快照（{type(error).__name__}: {error}）')
+            self.problems.extend(lines)
+            if unstorable or not self._rename_back(entry, label, left, context, _Taken()):
+                dispose(layout, self.records, self.root_fd, entry, 'candidate', label, left + unstorable, context,
+                        self.problems)
+        except Exception as error:
+            self.problems.append(f'本轮结束时没能把候选版留档：{type(error).__name__}: {error}')
 
     def _start_over(self, taken: _Taken, context: dict) -> None:
         """candidate/ from the round's last snapshot, or the current version when there is none."""

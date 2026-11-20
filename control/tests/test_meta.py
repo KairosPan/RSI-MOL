@@ -335,6 +335,35 @@ class MoreMetaRounds(unittest.TestCase):
             self.assertEqual([name for name in os.listdir(root.layout.root) if name.startswith('.sealed-')], [])
             self.assertEqual((root.layout.work / 'RULES.md').read_text(), 'r\n')
 
+    def test_a_candidate_that_was_not_released_is_kept(self):
+        with Root() as root:                                 # snapshotted on the round's ref
+            root.model.push(add_file('../candidate/RULES.md', 'r'), say(decision('no_change')))
+            rnd = run_round(root.layout, [])
+            final = rnd['final_candidate']
+            self.assertEqual((rnd['outcome'], root.store.resolve(final)), ('no_change', final))
+            self.assertIn('RULES.md', root.store.diff('V0001', final)); self.assertEqual(root.store.head(), 'V0001')
+            self.assertEqual(json.loads((root.layout.records / 'rounds' / 'M0001' / 'round.json').read_text())
+                             ['final_candidate'], final)
+            self.assertEqual((root.layout.candidate / 'RULES.md').read_text(), 'r\n')     # candidate/ as Meta left it
+            self.assertEqual((rnd['problems'], index(root, 'sealed')), ([], []))
+            self.assertEqual([name for name in os.listdir(root.layout.root) if name.startswith('.sealed-')], [])
+        with Root() as root:                                 # one that cannot be snapshotted: kept under sealed/
+            root.model.push(add_file('../candidate/codex/settings.toml', 'not toml [[['), say(decision('no_change')))
+            rnd = run_round(root.layout, [])
+            self.assertIsNone(rnd['final_candidate'])
+            [kept] = root.layout.sealed.glob('*/candidate/codex/settings.toml')
+            self.assertEqual(kept.read_text(), 'not toml [[[\n')
+            [note] = index(root, 'sealed')
+            self.assertEqual((note['workspace'], note['round']), ('candidate', 'M0001'))
+            self.assertTrue(any('candidate/' in line for line in rnd['problems']), rnd['problems'])
+        with Root() as root:                                 # unchanged since the round's last snapshot: nothing new
+            root.add_task('T1', check=PASS_CHECK)
+            root.model.push(add_file('../candidate/RULES.md', 'r'),
+                            say(decision('trial', trials=MetaRounds.TRIAL)), *MetaRounds.LAB_OK,
+                            say(decision('no_change')))
+            rnd = run_round(root.layout, [])
+            self.assertEqual((rnd['outcome'], len(rnd['trials']), rnd['final_candidate']), ('no_change', 1, None))
+
     def test_owner_edits_in_work_become_a_version_before_the_candidate_is_cut(self):
         with Root() as root:
             root.add_task('T1'); (root.layout.work / 'mine.txt').write_text('by hand')

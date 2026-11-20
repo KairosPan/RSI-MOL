@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -115,6 +116,15 @@ class LabRuns(unittest.TestCase):
             with self.assertRaises(Refused): run_task(root.layout, 'T1')
             self.assertEqual(root.records.calls(), []); self.assertEqual(root.model.requests, [])
             self.assertEqual(len(index(root, 'refusal')), 2)
+
+    def test_the_owners_lab_config_follows_the_version_put_back_into_work(self):
+        with Root() as root:
+            root.add_task('T1')
+            root.model.push(add_file('codex/settings.toml', 'network = true\n'), say('done'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['version_after'], call['problems']), ('V0002', []))
+            config = tomllib.loads((root.layout.lab_home / 'config.toml').read_text())
+            self.assertEqual((config['default_permissions'], config['approval_policy']), ('lab_net', 'never'))
 
     def test_settings_problems_are_recorded_not_fatal(self):
         with Root() as root:

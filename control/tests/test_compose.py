@@ -334,7 +334,7 @@ class ComposeTests(unittest.TestCase):
         (self.layout.work / 'tools/probe/server.py').write_text(PROBE_SERVER)
         envelope = dict(self.envelope, features={'apps': False, 'plugins': False}, apps={}, plugins={})
         s = self.settings('[tool_servers.probe]\ncommand = "python3"\nargs = ["tools/probe/server.py"]\n')
-        write_home_config(self.layout, envelope, s, resolve=no_lookup)   # the wrapper reads its profile from here
+        write_home_config(self.layout, envelope, s, resolve=no_lookup)   # as before a run: role copies, wrapper home
         model = ScriptedModel(); os.environ['RSI_TEST_MODEL_ENDPOINT'] = model.start(); self.addCleanup(model.stop)
         model.push(run_js('text(JSON.stringify(await tools.mcp__probe__rsi_probe_ping({})));\n'), say('done'))
         result = run_codex(home=self.layout.lab_home, cwd=self.layout.work, prompt='go', timeout=120,
