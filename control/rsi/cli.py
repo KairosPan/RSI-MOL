@@ -1,6 +1,8 @@
 """Command line of the control program. For now it only lists the subcommands."""
 import sys
 
+from rsi.workspace import raise_open_files_limit
+
 USAGE = """用法：rsi <子命令>
 
   init              建目录和版本库，生成两份 Codex 配置，检查两个 Codex 目录是否已登录
@@ -13,5 +15,6 @@ USAGE = """用法：rsi <子命令>
 
 
 def main() -> int:
+    raise_open_files_limit()        # macOS starts programs with 256 open files
     print(USAGE, file=sys.stderr)
     return 2

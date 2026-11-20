@@ -1,8 +1,10 @@
 import os
 import unittest
+from unittest import mock
 
-from rsi.tasks import (SECTIONS, clear, collect_out, load_task, place_inputs, prompt_for, real_folder, run_check,
-                       set_aside_git)
+from rsi import tasks
+from rsi.tasks import SECTIONS, collect_out, load_task, place_inputs, prompt_for, run_check
+from rsi.workspace import clear
 from tests.support import PASS_CHECK, Root
 
 
@@ -21,6 +23,7 @@ class TaskFiles(unittest.TestCase):
             root.add_task('T1', check='import time\nprint("x" * 100000, flush=True)\ntime.sleep(600)\n')
             result = run_check(load_task(root.layout.tasks, 'T1'), root.layout.root, timeout=2)
             self.assertEqual((result['passed'], len(result['message']) <= 500), (False, True))
+            self.assertEqual((result['message'], result['exit_code']), ('检查脚本超时', None))
 
     def test_collect_out_never_follows_links(self):
         with Root() as root:
@@ -61,11 +64,12 @@ class MoreTaskFiles(unittest.TestCase):
         with Root() as root:
             os.environ['PYTHONPATH'] = '/nowhere'
             root.add_task('T1', check='import os, sys\nprint(os.getcwd(), sys.argv[1], os.environ.get("PYTHONPATH"),'
-                                      ' os.environ["PATH"])\nprint("second line")\nsys.exit(3)\n')
+                                      ' os.environ["PATH"], sys.flags.no_user_site)\nprint("second line")\n'
+                                      'sys.exit(3)\n')
             task = load_task(root.layout.tasks, 'T1')
             result = run_check(task, root.layout.root / 'some out')
             self.assertEqual(result, {'passed': False, 'exit_code': 3, 'message': f'{task.folder} '
-                                      f'{root.layout.root / "some out"} None /usr/bin:/bin:/usr/sbin:/sbin'})
+                                      f'{root.layout.root / "some out"} None /usr/bin:/bin:/usr/sbin:/sbin 1'})
 
     def test_check_output_is_cut_and_stderr_is_not_reported(self):
         with Root() as root:
@@ -121,38 +125,6 @@ class MoreTaskFiles(unittest.TestCase):
             self.assertEqual((dest / 'h.txt').read_text(), 'shared')
             self.assertFalse(os.path.lexists(out)); self.assertTrue(root.layout.owner.is_dir())
 
-    def test_control_folders_are_made_real(self):
-        with Root() as root:
-            work, outside = root.layout.work, root.layout.root / 'outside'
-            outside.mkdir(); (outside / 'x').write_text('x')
-            os.symlink(outside, work / '.tmp')
-            self.assertEqual(len(real_folder(work, '.tmp')), 1)
-            self.assertTrue((work / '.tmp').is_dir()); self.assertFalse((work / '.tmp').is_symlink())
-            self.assertEqual(os.listdir(outside), ['x']); self.assertEqual(real_folder(work, '.tmp'), [])
-            (work / '.tmp' / 'y').write_text('kept')                            # a real folder is left as it is
-            self.assertEqual(real_folder(work, '.tmp'), []); self.assertTrue((work / '.tmp' / 'y').is_file())
-
-    def test_nested_git_entries_are_set_aside(self):
-        with Root() as root:
-            work, outside = root.layout.work, root.layout.root / 'outside'
-            (work / 'sub' / '.git').mkdir(parents=True); (work / 'sub' / '.git' / 'config').write_text('c')
-            (work / 'sub' / '.git.rsi-kept').mkdir()                           # the name is taken: -2
-            (work / 'a' / 'b').mkdir(parents=True); (work / 'a' / 'b' / '.GIT').write_text('gitdir: x')
-            (work / 'odd').mkdir(); (work / 'odd' / 'git~1').write_text('x'); (work / 'odd' / '.git ').mkdir()
-            os.symlink('target', work / 'odd' / '.gitmodules')
-            (outside / '.git').mkdir(parents=True); os.symlink(outside, work / 'linked')
-            (work / 'out').mkdir(); (work / 'out' / '.git').mkdir()                # never versioned: left alone
-            problems = set_aside_git(work)
-            self.assertEqual(len(problems), 5)
-            self.assertTrue(any('sub/.git' in line and 'sub/.git.rsi-kept-2' in line for line in problems))
-            self.assertEqual((work / 'sub' / '.git.rsi-kept-2' / 'config').read_text(), 'c')
-            self.assertTrue((work / 'a' / 'b' / '.git.rsi-kept').is_file())
-            self.assertEqual(sorted(os.listdir(work / 'odd')),
-                             ['.git.rsi-kept', '.git.rsi-kept-2', '.gitmodules.rsi-kept'])
-            self.assertTrue((outside / '.git').is_dir()); self.assertTrue((work / 'out' / '.git').is_dir())
-            self.assertIsNotNone(root.store.commit(work, 'owner (manual)', 'x'))   # versioning goes through now
-            self.assertEqual(set_aside_git(work), [])
-
     def test_collected_results_are_made_readable(self):
         with Root() as root:
             locked = root.layout.work / 'out' / 'T1' / 'locked'; locked.mkdir(parents=True)
@@ -160,6 +132,49 @@ class MoreTaskFiles(unittest.TestCase):
             dest = root.layout.root / 'dest'
             self.assertEqual(collect_out(root.layout.work, 'T1', dest), [])
             self.assertEqual((dest / 'locked' / 'a.txt').read_text(), 'a')
+
+    def test_results_over_the_budget_are_left_out(self):
+        with Root() as root:
+            out = root.layout.work / 'out' / 'T1'; out.mkdir(parents=True)
+            for number in range(6):
+                (out / f'f{number}.txt').write_text('12345')
+            (out / 'big.bin').write_text('x' * 40)
+            with mock.patch.object(tasks, 'MAX_RESULT_BYTES', 30), mock.patch.object(tasks, 'MAX_RESULT_FILES', 4):
+                problems = collect_out(root.layout.work, 'T1', root.layout.root / 'dest')
+            kept = sorted(os.listdir(root.layout.root / 'dest'))
+            self.assertEqual(kept, ['f0.txt', 'f1.txt', 'f2.txt', 'f3.txt'])        # 'big.bin' sorts first: 40 > 30
+            self.assertTrue(any('big.bin' in line and '字节' in line for line in problems))
+            self.assertEqual(sum('个文件' in line for line in problems), 2)
+            self.assertFalse(os.path.lexists(out))
+            sparse = root.layout.work / 'out' / 'T2'; sparse.mkdir(parents=True)
+            with open(sparse / 'huge', 'wb') as stream:
+                stream.truncate((1 << 40))                                         # 1 TiB, nothing allocated
+            problems = collect_out(root.layout.work, 'T2', root.layout.root / 'dest2')
+            self.assertEqual((os.listdir(root.layout.root / 'dest2'), len(problems)), ([], 1))
+
+    def test_unreadable_folders_of_the_control_program_are_opened(self):
+        with Root() as root:
+            work = root.layout.work; (work / 'out' / 'T1').mkdir(parents=True)
+            (work / 'out' / 'T1' / 'a.txt').write_text('a'); (work / 'out').chmod(0)
+            dest = root.layout.root / 'dest'
+            self.assertEqual(collect_out(work, 'T1', dest), []); self.assertEqual((dest / 'a.txt').read_text(), 'a')
+            (work / 'in' / 'T1').mkdir(parents=True); (work / 'in' / 'T1').chmod(0); (work / 'in').chmod(0)
+            self.assertEqual(clear(work, 'in', 'T1'), []); self.assertFalse(os.path.lexists(work / 'in'))
+
+    def test_inputs_are_never_written_through_a_swapped_in(self):
+        with Root() as root:
+            root.add_task('T1', inputs={'data.txt': 'd'}); work = root.layout.work
+            outside = root.layout.root / 'outside'; outside.mkdir()
+            original = tasks._copy_into
+
+            def swap_then_copy(source, folder_fd, name, depth=1):
+                os.rename(work / 'in', work / 'in-moved'); os.symlink(outside, work / 'in')    # a stray process
+                return original(source, folder_fd, name, depth)
+
+            with mock.patch.object(tasks, '_copy_into', swap_then_copy):
+                place_inputs(load_task(root.layout.tasks, 'T1'), work)
+            self.assertEqual(os.listdir(outside), [])
+            self.assertEqual((work / 'in-moved' / 'T1' / 'data.txt').read_text(), 'd')
 
     def test_out_that_is_a_link_or_a_file_is_refused(self):
         with Root() as root:

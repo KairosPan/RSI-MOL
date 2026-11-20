@@ -1,18 +1,21 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from rsi import workspace
 from rsi.codexrun import codex_version
 from rsi.labrun import run_task, run_trial
-from rsi.mockmodel import add_file, say, slow
+from rsi.mockmodel import add_file, say, slow, with_usage
 from rsi.paths import Refused
 from rsi.sessions import collect_sessions
 from rsi.versions import VersionStore
 from tests.support import PASS_CHECK, Root, needs_codex
+from tests.test_workspace import DEPTH, few_open_files
 
 
 @needs_codex
@@ -194,9 +197,85 @@ class MoreLabRuns(unittest.TestCase):
             root.add_task('T2', check=PASS_CHECK, inputs={'data.txt': 'd'}); root.model.push(say('ok'))
             with mock.patch('rsi.labrun.run_check', side_effect=KeyboardInterrupt):     # while collecting
                 with self.assertRaises(KeyboardInterrupt): run_task(root.layout, 'T2')
-            self.assertEqual([(call['status'], call['usage']) for call in root.records.calls()],
-                             [('interrupted', None), ('interrupted', None)])
+            first, second = root.records.calls()
+            self.assertEqual((first['status'], first['usage']), ('interrupted', None))
+            # Codex had ended: the call keeps its status and usage, and says what was not done.
+            self.assertEqual((second['status'], second['usage']['input_tokens']), ('finished', 0))
+            self.assertTrue(any('KeyboardInterrupt' in line for line in second['problems']))
             self.assertFalse(os.path.lexists(root.layout.work / 'in'))
+
+    def test_unusable_control_folders_never_block_a_run(self):
+        with Root() as root:
+            root.add_task('T1', check=PASS_CHECK, inputs={'data.txt': 'd'}); work = root.layout.work
+            for name in ('.tmp', 'out/T1', 'in/T1'):
+                (work / name).mkdir(parents=True)
+            for name in ('out/T1', 'in/T1', '.tmp', 'out', 'in'):
+                (work / name).chmod(0)
+            root.model.push(add_file('out/T1/answer.json', '{"x": 3, "y": -1}'), say('done'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['check']['passed']), ('finished', True))
+            self.assertTrue(os.access(work / '.tmp', os.R_OK | os.W_OK | os.X_OK))
+
+    def test_a_deep_tree_never_blocks_a_run_with_few_open_files(self):
+        few_open_files(self)
+        with Root() as root:
+            root.add_task('T1'); work = root.layout.work
+            (work / ('a/' * DEPTH) / '.git').mkdir(parents=True); (work / 'a' / 'keep.txt').write_text('k')
+            (work / 'out' / 'T1' / ('b/' * DEPTH)).mkdir(parents=True)                # stale and deep
+            root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0002'))
+            self.assertTrue(any('library/moved/manual/a' in line for line in call['problems']))
+            self.assertFalse(os.path.lexists(work / 'out'))
+
+    def test_a_git_failure_after_the_call_keeps_its_status_and_usage(self):
+        with Root() as root:
+            root.add_task('T1'); root.model.push(add_file('notes/n.md', 'x'), with_usage(say('ok'), 5, 2))
+            original = VersionStore.commit
+
+            def commit(store, folder, author, message):
+                if author.startswith('lab '):
+                    raise subprocess.TimeoutExpired(['git', 'add'], 600)
+                return original(store, folder, author, message)
+
+            with mock.patch.object(VersionStore, 'commit', commit):
+                call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['usage']['input_tokens'], call['usage']['output_tokens']),
+                             ('finished', 5, 2))
+            self.assertEqual((call['version_after'], call['commit_failed']), (None, True))
+            self.assertTrue(any('TimeoutExpired' in line for line in call['problems']))
+            self.assertEqual(root.records.load_call(call['id'])['status'], 'finished')
+            root.model.push(say('again'))
+            second = run_task(root.layout, 'T1')
+            self.assertEqual(second['version_before'], 'V0002')
+            newest = root.store.log()[0]
+            self.assertEqual(newest['author'], f'owner (manual) with lab {call["id"]}')
+            self.assertIn(call['id'], newest['message'])
+
+    def test_unreadable_and_oversize_files_never_block_a_run(self):
+        with Root() as root:
+            root.add_task('T1'); work = root.layout.work
+            (work / 'notes').mkdir(); (work / 'notes' / 'x.txt').write_text('x'); (work / 'notes' / 'x.txt').chmod(0)
+            (work / 'data').mkdir()
+            with open(work / 'data' / 'huge.bin', 'wb') as stream:
+                stream.truncate(workspace.BIG_FILE + 1)                         # sparse: nothing allocated
+            root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0002'))
+            self.assertTrue((root.layout.library / 'moved' / 'manual' / 'data' / 'huge.bin').is_file())
+            self.assertTrue(any('data/huge.bin' in line for line in call['problems']))
+            self.assertIn('b/notes/x.txt', root.store.diff('V0001', 'V0002'))
+
+    def test_a_trial_starts_from_an_empty_trial_folder(self):
+        with Root() as root:
+            root.add_task('T1', check=PASS_CHECK); trial = root.layout.trial
+            (trial / '.tmp').mkdir(); (trial / '.tmp' / 'junk').write_text('j'); (trial / '.tmp').chmod(0)
+            (trial / 'out' / 'T1').mkdir(parents=True)
+            (trial / 'out' / 'T1' / 'answer.json').write_text('{"x": 3, "y": -1}')     # an earlier trial's answer
+            root.model.push(say('nothing written'))
+            call = run_trial(root.layout, commit=root.store.resolve('V0001'), round_id='M0001', task_id='T1')
+            self.assertEqual((call['status'], call['check']['passed']), ('finished', False))
+            self.assertEqual(os.listdir(trial / '.tmp'), [])
 
     def test_probe_results_are_collected(self):
         with Root() as root:
