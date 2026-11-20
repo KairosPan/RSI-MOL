@@ -159,8 +159,8 @@ class ComposeTests(unittest.TestCase):
         c = meta_config(self.layout, self.envelope, {'model_reasoning_effort': 'low'})
         fs = c['permissions']['meta']['filesystem']
         root = str(self.layout.root)
-        self.assertEqual((fs[root], fs[root + '/records'], fs[root + '/work'], fs[root + '/meta']),
-                         ('deny', 'read', 'read', 'write'))
+        self.assertEqual((fs[root], fs[root + '/records'], fs[root + '/work'], fs[root + '/meta'],
+                          fs[root + '/candidate']), ('deny', 'read', 'read', 'write', 'write'))
         self.assertEqual((c['features'], c['model_reasoning_effort']), ({'apps': False, 'plugins': False}, 'low'))
 
     @needs_codex
@@ -477,8 +477,9 @@ class ComposeTests(unittest.TestCase):
         c = meta_config(self.layout, self.envelope, {})
         fs = c['permissions']['meta']['filesystem']; root = str(self.layout.root)
         self.assertEqual((c['approval_policy'], c['default_permissions'], c['web_search']), ('never', 'meta', 'live'))
-        self.assertEqual((fs[':minimal'], fs[root + '/library'], fs[root + '/env'], fs[root + '/meta/.codex']),
-                         ('read', 'read', 'read', 'read'))
+        self.assertEqual((fs[':minimal'], fs[root + '/library'], fs[root + '/env'], fs[root + '/meta/.codex'],
+                          fs[root + '/candidate/.codex']), ('read', 'read', 'read', 'read', 'read'))
+        self.assertNotIn(root + '/meta/candidate', fs); self.assertNotIn(root + '/meta/candidate/.codex', fs)
         self.assertNotIn(root + '/tasks', fs); self.assertNotIn(root + '/trial', fs); self.assertNotIn('/opt/x', fs)
         self.assertEqual(c['permissions']['meta']['network'], {'enabled': False})
         self.assertEqual(c['shell_environment_policy']['set']['TMPDIR'], str(self.layout.meta / '.tmp'))
@@ -486,6 +487,26 @@ class ComposeTests(unittest.TestCase):
         self.assertNotIn('model', c); self.assertNotIn('model_reasoning_effort', c)
         self.assertEqual(meta_config(self.layout, self.envelope, {'model': 'm'})['model'], 'm')
         tomllib.loads(render_file(c))
+
+    @needs_codex
+    def test_the_real_sandbox_lets_meta_write_the_candidate_and_its_notes_only(self):
+        os.environ.pop('RSI_CODEX', None)
+        for folder in (self.layout.meta / '.tmp', self.layout.candidate / '.codex', self.layout.work,
+                       self.layout.records, self.layout.lab_home):
+            folder.mkdir(parents=True, exist_ok=True)
+        config = meta_config(self.layout, self.envelope, {})
+
+        def sandboxed(command):
+            return subprocess.run([native_codex(self.layout), 'sandbox',
+                                   *render_flags({'permissions': config['permissions']}), '-P', 'meta', '--',
+                                   '/bin/sh', '-c', command], cwd=self.layout.meta, capture_output=True, timeout=60,
+                                  env={**os.environ, 'CODEX_HOME': str(self.layout.lab_home)}).returncode
+        self.assertEqual(sandboxed('echo c > ../candidate/c.txt && echo n > notes.txt'), 0)
+        self.assertEqual(((self.layout.candidate / 'c.txt').read_text(), (self.layout.meta / 'notes.txt').read_text()),
+                         ('c\n', 'n\n'))
+        for target in ('../work/w.txt', '../candidate/.codex/config.toml', '../records/r.txt', '../trial.txt'):
+            self.assertNotEqual(sandboxed(f'echo x > {target}'), 0, target)
+            self.assertFalse((self.layout.meta / target).exists(), target)
 
     def test_home_config(self):
         (self.layout.work / 'codex' / 'agents').mkdir(parents=True)

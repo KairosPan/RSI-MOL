@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[2]
 class Paths(unittest.TestCase):
     def test_layout(self):
         layout = Layout(Path('/x'))
-        self.assertEqual(layout.candidate, Path('/x/meta/candidate'))
+        self.assertEqual(layout.candidate, Path('/x/candidate'))         # sealable by a rename in the root
+        self.assertEqual(layout.notes, Path('/x/meta/notes'))
         self.assertEqual(layout.versions, Path('/x/versions/lab.git'))
         self.assertEqual(layout.lab_home, Path('/x/codex-home'))
         self.assertEqual(layout.meta_home, Path('/x/codex-home-meta'))

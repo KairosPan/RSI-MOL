@@ -41,7 +41,9 @@ class Layout:
 
     @property
     def candidate(self) -> Path:
-        return self.meta / 'candidate'
+        """Meta's candidate copy of the Lab workspace. It sits in the root, beside work/ and trial/, so the control
+        program can seal it by a rename in the root (a folder inside meta/ could not be sealed that way)."""
+        return self.root / 'candidate'
 
     @property
     def notes(self) -> Path:

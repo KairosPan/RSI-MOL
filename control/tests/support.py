@@ -1,4 +1,6 @@
-"""Helpers shared by the tests: a skip for machines without Codex, a confined config, and a temporary RSI root."""
+"""Helpers shared by the tests: a skip for machines without Codex, a confined config, a temporary RSI root, and the
+text of a Meta decision."""
+import json
 import os
 import shutil
 import subprocess
@@ -31,6 +33,14 @@ ENVELOPE = 'approval_policy = "never"\n\n[features]\napps = false\nplugins = fal
 LIMITS = ('[lab]\nseconds_per_run = 1800\n\n'
           '[meta]\ncalls_per_round = 8\ntrials_per_round = 4\nseconds_per_call = 900\n\n'
           '[day]\ncalls = 60\ntokens = 0\n')
+
+
+def decision(kind: str, **more) -> str:
+    """The JSON text of a Meta decision of that kind: every key with a placeholder value, then `more` over them."""
+    base = {'decision': kind, 'observations': [], 'problem': 'p', 'likely_cause': 'c', 'other_explanations': 'o',
+            'change': 'ch', 'expected_effect': 'e', 'risks': 'r', 'uncertain': 'u', 'trials': [], 'evidence': [],
+            'applications': []}
+    return json.dumps({**base, **more}, ensure_ascii=False)
 
 
 def scratch_config(root: Path, workspace: Path) -> dict:

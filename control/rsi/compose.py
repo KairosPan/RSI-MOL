@@ -441,12 +441,13 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
 
 
 def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
-    """The complete Codex configuration of a Meta call: reads records, work, library and env; writes meta/ only;
-    no apps, no plugins, live web search, commands offline. Only model and model_reasoning_effort are taken from
-    meta_settings. The envelope is the Lab's and does not widen Meta."""
+    """The complete Codex configuration of a Meta call: reads records, work, library and env; writes meta/ (its
+    notes) and candidate/ only; no apps, no plugins, live web search, commands offline. Only model and
+    model_reasoning_effort are taken from meta_settings. The envelope is the Lab's and does not widen Meta."""
     filesystem = {':minimal': 'read', str(layout.root): 'deny', str(layout.records): 'read', str(layout.work): 'read',
                   str(layout.library): 'read', str(layout.env): 'read', str(layout.meta): 'write',
-                  str(layout.meta / '.codex'): 'read', str(layout.candidate / '.codex'): 'read'}
+                  str(layout.candidate): 'write', str(layout.meta / '.codex'): 'read',
+                  str(layout.candidate / '.codex'): 'read'}
     for folder in _tool_folders():
         filesystem.setdefault(folder, 'read')
     for closed in temp_folders() + list(_homes()):

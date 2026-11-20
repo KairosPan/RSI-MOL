@@ -50,6 +50,24 @@ class Versions(unittest.TestCase):
         self.assertEqual(self.store.tree_of(commit), self.store.tree_of_dir(self.b))
         self.assertIn('changed', self.store.diff('V0001', commit))
 
+    def test_commit_tree_puts_an_existing_commits_content_on_main(self):
+        (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
+        self.store.checkout('V0001', self.b); (self.b / 'g.txt').write_text('g')
+        snapshot = self.store.snapshot(self.b, 'M0001', 'candidate')
+        self.assertEqual(self.store.commit_tree(snapshot, 'meta M0001', 'release'), 'V0002')
+        self.assertEqual(self.store.tree_of('V0002'), self.store.tree_of(snapshot))
+        self.assertEqual((self.store.log()[0]['author'], self.store.log()[0]['message']), ('meta M0001', 'release'))
+        self.assertIsNone(self.store.commit_tree(snapshot, 'meta M0001', 'again'))       # equals head: no version
+        self.assertEqual(self.store.commit_tree('V0001', 'owner', 'back'), 'V0003')       # a rollback
+        self.assertEqual(self.store.tree_of('V0003'), self.store.tree_of('V0001'))
+        for name in ('../V0001', 'V0009', 'HEAD', self.store.tree_of('V0001'), None):
+            with self.assertRaises(ValueError):
+                self.store.commit_tree(name, 'owner', 'x')
+        for author in ('', 'a\nb', 'a <b@c>'):
+            with self.assertRaises(ValueError):
+                self.store.commit_tree('V0002', author, 'x')
+        self.assertEqual(self.store.head(), 'V0003')
+
     def test_symlink_is_kept_as_a_link(self):
         os.symlink('/etc/hosts', self.a / 'link'); self.store.commit(self.a, 'init', 'one')
         self.store.checkout('V0001', self.b)

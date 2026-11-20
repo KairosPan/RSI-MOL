@@ -1,7 +1,7 @@
 """Versions of the Lab workspace, kept in one git store outside the folders it versions.
 
-The store is a bare repository serving several folders: staged and sealed copies of work/ and trial/ (the control
-program never runs git on a folder an agent can still write), and meta/candidate/. Every git call that touches a
+The store is a bare repository serving several folders: staged and sealed copies of work/, trial/ and candidate/
+(the control program never runs git on a folder an agent can still write). Every git call that touches a
 folder sets GIT_WORK_TREE to it and GIT_INDEX_FILE to that folder's own index inside the store, so no folder ever
 gets a `.git` entry; the index is removed again once the call is done. Versions are commits on refs/heads/main,
 each tagged V0001, V0002, ...; a snapshot is a commit on refs/rounds/<round> whose parent is the head of main.
@@ -35,6 +35,11 @@ STORE_CONFIG = (
 # info/attributes outranks every .gitattributes: no end-of-line, ident, filter or encoding conversion, and diff
 # decides text or binary by itself.
 ATTRIBUTES = '* -text -ident -filter -working-tree-encoding !diff !merge\n'
+
+
+def _check_author(author) -> None:
+    if not isinstance(author, str) or not AUTHOR.fullmatch(author):
+        raise ValueError(f'作者名不合规：{author!r}')
 
 
 def _any_case(name: str) -> str:
@@ -92,21 +97,15 @@ class VersionStore:
 
     def commit(self, folder: Path, author: str, message: str) -> str | None:
         """A new version on main from the folder's content; None if that content equals the head version."""
-        if not isinstance(author, str) or not AUTHOR.fullmatch(author):
-            raise ValueError(f'作者名不合规：{author!r}')
-        tree = self._stage(folder)
-        parent = self._main()
-        if parent is not None and tree == self._out('rev-parse', '--verify', f'{parent}^{{tree}}'):
-            return None
-        commit = self._commit_tree(tree, parent, message, author)
-        names = self._versions()
-        number = int(names[-1][1:]) + 1 if names else 1
-        version = f'V{number:04d}'
-        main = f'update {MAIN} {commit} {parent}' if parent is not None else f'create {MAIN} {commit}'
-        # One transaction: the tag and main move together or not at all.
-        self._git('update-ref', '-m', f'version {version}', '--stdin',
-                  stdin=f'create refs/tags/{version} {commit}\n{main}\n'.encode())
-        return version
+        _check_author(author)
+        return self._new_version(self._stage(folder), author, message)
+
+    def commit_tree(self, name: str, author: str, message: str) -> str | None:
+        """A new version on main whose content is that of an existing version or commit of this store (a round's
+        snapshot when Meta releases it, an old version for a rollback); None if that content equals the head
+        version. ValueError for a name resolve() refuses or a bad author."""
+        _check_author(author)
+        return self._new_version(self.tree_of(name), author, message)
 
     def snapshot(self, folder: Path, ref: str, message: str) -> str:
         """A commit of the folder on refs/rounds/<ref> whose parent is main's head; main does not move."""
@@ -188,6 +187,21 @@ class VersionStore:
     def _main(self) -> str | None:
         done = self._git('rev-parse', '--verify', '--quiet', f'{MAIN}^{{commit}}', check=False)
         return done.stdout.decode().strip() if done.returncode == 0 else None
+
+    def _new_version(self, tree: str, author: str, message: str) -> str | None:
+        """Commit the tree on main as the next version; None if it equals the head version's tree."""
+        parent = self._main()
+        if parent is not None and tree == self._out('rev-parse', '--verify', f'{parent}^{{tree}}'):
+            return None
+        commit = self._commit_tree(tree, parent, message, author)
+        names = self._versions()
+        number = int(names[-1][1:]) + 1 if names else 1
+        version = f'V{number:04d}'
+        main = f'update {MAIN} {commit} {parent}' if parent is not None else f'create {MAIN} {commit}'
+        # One transaction: the tag and main move together or not at all.
+        self._git('update-ref', '-m', f'version {version}', '--stdin',
+                  stdin=f'create refs/tags/{version} {commit}\n{main}\n'.encode())
+        return version
 
     def _commit_tree(self, tree: str, parent: str | None, message: str, author: str | None) -> str:
         """A commit object; the message goes in on stdin, verbatim, and the author through the environment."""
