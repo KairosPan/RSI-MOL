@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Launcher of the RSI control program: puts control/ (beside this file's real path) on sys.path and runs it."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / 'control'))
+
+from rsi.cli import main  # noqa: E402
+
+sys.exit(main())
