@@ -1,0 +1,12 @@
+codex-home/
+codex-home-meta/
+work/
+trial/
+meta/
+records/
+library/
+env/
+versions/
+.rsi.lock
+.superpowers/
+__pycache__/

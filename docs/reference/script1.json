@@ -1,0 +1,11 @@
+[
+ [
+  {
+   "type": "custom_tool_call",
+   "id": "ctc_1",
+   "call_id": "call_1",
+   "name": "exec",
+   "input": "\nconst M = \"<the scratch layout root>\";\nconst add = (p) => \"*** Begin Patch\\n*** Add File: \" + p + \"\\n+# probe\\n*** End Patch\\n\";\nconst cases = [\n  [\"inside-workspace\", add(\"probe-inside.txt\")],\n  [\"outside-absolute-denied\", add(M + \"/records/direct.txt\")],\n  [\"outside-via-symlink\", add(\"l-rec/via-symlink.txt\")],\n  [\"outside-via-dotdot\", add(\"../records/dotdot.txt\")],\n  [\"outside-not-granted\", add(\"<a folder that is neither granted nor denied>/probe-ungranted.txt\")],\n  [\"workspace-dot-codex\", add(\".codex/config.toml\")],\n  [\"update-existing-record\", \"*** Begin Patch\\n*** Update File: \" + M + \"/records/existing.txt\\n@@\\n-original record\\n+tampered record\\n*** End Patch\\n\"],\n  [\"delete-existing-record\", \"*** Begin Patch\\n*** Delete File: \" + M + \"/records/existing.txt\\n*** End Patch\\n\"],\n];\nfor (const [label, patch] of cases) {\n  try {\n    const r = await tools.apply_patch(patch);\n    text(label + \" => RETURNED \" + JSON.stringify(r).slice(0, 260));\n  } catch (e) {\n    text(label + \" => THREW \" + String(e && e.message ? e.message : e).slice(0, 260));\n  }\n}\n"
+  }
+ ]
+]
