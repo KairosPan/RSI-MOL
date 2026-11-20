@@ -1,15 +1,56 @@
-#!/usr/bin/env python3
-"""Launcher of the RSI control program: puts control/ (beside this file's real path) on sys.path and runs it.
+#!/bin/sh
+# Launcher of the RSI control program. It never looks a program up in PATH: the owner's shell may have a folder an
+# agent writes first on it (<RSI root>/env/bin, after activating that venv). The Python is $RSI_PYTHON (an absolute
+# path outside the RSI folder) or the first Python 3.11 or newer of a fixed list, started with -I (no PYTHONPATH, no
+# user site-packages, not the script's folder) and -B (no bytecode written) on control/rsi/__main__.py beside this
+# file's real path. Besides the shell's own built-ins, only /usr/bin/readlink is run here. Every variable next to
+# non-ASCII text is written in braces: in a Latin-1 locale, bash 3.2 would read a following byte as part of its name.
 
-Its own folder is taken off sys.path first, so nothing at the RSI root can shadow a module.
-"""
-import sys
-from pathlib import Path
+refuse() {
+    printf '%s\n' "rsi：${1}" >&2
+    exit 2
+}
 
-here = Path(__file__).resolve().parent
-sys.path[:] = [entry for entry in sys.path if Path(entry or '.').resolve() != here]
-sys.path.insert(0, str(here / 'control'))
+real() {                # the real path of $1 (every link followed, letter case as on disk); fails when it is missing
+    /usr/bin/readlink -f -- "$1" 2>/dev/null
+}
 
-from rsi.cli import main  # noqa: E402
+inside() {              # whether the path $1 is the folder $2 or lies under it (never when $2 is empty)
+    [ -n "$2" ] || return 1
+    case "$1/" in "$2"/*) return 0 ;; esac
+    return 1
+}
 
-sys.exit(main())
+usable() {              # whether $1 is an executable Python 3.11 or newer (it is run once, isolated, to tell)
+    [ -f "$1" ] && [ -x "$1" ] && "$1" -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' >/dev/null 2>&1
+}
+
+self=$(real "$0") || refuse "找不到启动脚本本身（${0}）"
+here=${self%/*}
+
+if [ -n "${RSI_PYTHON+set}" ]; then
+    case $RSI_PYTHON in
+        /*) ;;
+        *) refuse "\$RSI_PYTHON 必须是 Python 3.11 或更新版本的绝对路径，现在是“${RSI_PYTHON}”" ;;
+    esac
+    python=$(real "$RSI_PYTHON") || refuse "\$RSI_PYTHON 指向的 ${RSI_PYTHON} 不存在"
+    spelled=$(real "${RSI_PYTHON%/*}")/${RSI_PYTHON##*/}       # the path as given, its folder's links followed
+    for root in "$here" "$(real "${RSI_ROOT:-$here}")"; do
+        if inside "$python" "$root" || inside "$spelled" "$root"; then
+            refuse "\$RSI_PYTHON（${RSI_PYTHON}）在 RSI 文件夹 ${root} 里，agent 改得到，不能用它运行 rsi"
+        fi
+    done
+    usable "$python" || refuse "\$RSI_PYTHON（${RSI_PYTHON}）不是 Python 3.11 或更新的版本"
+else
+    python=
+    for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3; do
+        if usable "$candidate"; then
+            python=$candidate
+            break
+        fi
+    done
+    [ -n "$python" ] || refuse "找不到 Python 3.11 或更新的版本（试过 /opt/homebrew/bin/python3、/usr/local/bin/python3、\
+/usr/bin/python3）；请把 \$RSI_PYTHON 设成它的绝对路径"
+fi
+
+exec "$python" -I -B "$here/control/rsi/__main__.py" "$@"

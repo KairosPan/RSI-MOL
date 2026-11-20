@@ -1,6 +1,8 @@
 import errno
+import importlib.machinery
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -15,7 +17,7 @@ from rsi.compose import native_codex
 from rsi.labrun import run_task
 from rsi.meta import run_round
 from rsi.paths import Layout, Refused
-from tests.support import Root, needs_codex
+from tests.support import Root, needs_codex, plant_programs
 from tests.test_cli import run
 
 WANTED = (('lab', 'read_records'), ('lab_net', 'local_tcp'), ('lab_net', 'local_unix_socket'), ('trial', 'write_work'),
@@ -62,6 +64,9 @@ class Check(unittest.TestCase):
         home, sockets = set(os.listdir(Path.home())), sockets_left()
         with Root(passed_check=False) as root:
             (root.layout.owner / 'lab-envelope.toml').write_text(APPS_ON)
+            marker = root.path / 'planted-ran'                      # programs an agent could plant on the PATH
+            plant_programs(root.layout.env / 'bin', marker)
+            os.environ['PATH'] = f'{root.layout.env / "bin"}{os.pathsep}{os.environ["PATH"]}'     # Root restores it
             self.assertIsNotNone(gate(root.layout))
             work, records = tree(root.layout.work), tree(root.layout.records)
             report = run_check(root.layout)
@@ -103,6 +108,7 @@ class Check(unittest.TestCase):
             self.assertEqual(tree(root.layout.records) - records, {CHECK_FILE, 'index.jsonl'})
             lines = (root.layout.records / 'index.jsonl').read_text().splitlines()
             self.assertEqual([json.loads(line)['kind'] for line in lines], ['check'])
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else '')
         self.assertEqual(sockets_left(), sockets)
         new = set(os.listdir(Path.home())) - home
         self.assertEqual([name for name in new if 'rsi' in name.lower() or 'codex' in name.lower()], [])
@@ -231,8 +237,28 @@ class Gate(unittest.TestCase):
             self.assertEqual((root.records.calls(), root.model.requests), ([], []))
 
 
+class Fingerprints(unittest.TestCase):
+    def test_everything_python_could_import_from_the_program_folder_is_covered(self):
+        tmp = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, tmp)
+        (tmp / 'a.py').write_text('x = 1\n')
+        with mock.patch('rsi.check.PROGRAM', tmp):
+            before = program_fingerprints()
+            self.assertEqual(list(before), ['a.py'])
+            (tmp / '__pycache__').mkdir(); (tmp / '__pycache__' / 'a.cpython-314.pyc').write_bytes(b'x')   # never read
+            (tmp / '.DS_Store').write_bytes(b'x')                                                    # never imported
+            self.assertEqual(program_fingerprints(), before)
+            planted = {'a.pyc': lambda path: path.write_bytes(b'x'),               # loaded beside its source too
+                       'a' + importlib.machinery.EXTENSION_SUFFIXES[0]: lambda path: path.write_bytes(b'x'),
+                       'b': lambda path: path.mkdir(),                              # a package or namespace portion
+                       'c.py': lambda path: path.symlink_to(tmp / 'a.py')}
+            for name, make in planted.items():
+                make(tmp / name)
+                self.assertIn(name, program_fingerprints())
+            self.assertEqual(program_fingerprints()['a.py'], before['a.py'])
+
+
 class Command(unittest.TestCase):
-    RESULT = {'name': 'read_records', 'profile': 'lab', 'expected': 'blocked', 'observed': 'blocked', 'ok': True,
+    RESULT ={'name': 'read_records', 'profile': 'lab', 'expected': 'blocked', 'observed': 'blocked', 'ok': True,
               'detail': ''}
 
     def report(self, *results, problems=()):

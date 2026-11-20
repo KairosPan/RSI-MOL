@@ -147,6 +147,9 @@ class FakeCodex(unittest.TestCase):
             f'json.dump(seen, open({str(self.tmp / "seen.json")!r}, "w"))\nprint({output!r})\n')
         program.chmod(0o755)
         os.environ['RSI_CODEX'] = str(program)
+        # Not a native program, so the real resolution (rsi.programs.native_codex) would refuse it.
+        patcher = mock.patch('rsi.codexrun.codex_program', return_value=str(program))
+        patcher.start(); self.addCleanup(patcher.stop)
         return program
 
     def seen(self) -> dict:
@@ -172,9 +175,11 @@ class FakeCodex(unittest.TestCase):
                           PYTHONPATH='/x', RSI_TEST_MODEL_ENDPOINT='http://127.0.0.1:9/v1')
         (self.tmp / 'work').mkdir(); (self.tmp / 's.json').write_text('{}')
         here = os.getcwd(); os.chdir(self.tmp); self.addCleanup(os.chdir, here)
+        os.environ['PATH'] = os.pathsep.join([str(self.tmp / 'env' / 'bin'), 'bin', '', '/usr/bin', '/bin'])
         result = run_codex(home=Path('home'), cwd=Path('work'), prompt='go', config={}, record_dir=Path('r'),
-                           timeout=30, schema=Path('s.json'))
+                           timeout=30, schema=Path('s.json'), root=self.tmp)
         seen = self.seen(); env = seen['env']
+        self.assertEqual(env['PATH'], '/usr/bin:/bin')           # no entry inside the root, and none relative
         self.assertEqual((env['CODEX_HOME'], seen['cwd']), (str(self.tmp / 'home'), str(self.tmp / 'work')))
         self.assertEqual((env['RSI_TOOL_FAR'], env['LC_CTYPE']), ('secret', 'UTF-8'))
         for gone in ('SSH_AUTH_SOCK', 'OPENAI_API_KEY', 'PYTHONPATH', 'RSI_TEST_MODEL_ENDPOINT', 'RSI_CODEX'):
@@ -221,6 +226,19 @@ class MissingCodex(unittest.TestCase):
         self.assertEqual(result.command[0], str(tmp / 'no-such-codex'))
         for name in ('prompt.txt', 'events.jsonl', 'stderr.txt', 'last-message.txt'):
             self.assertTrue((tmp / 'r' / name).is_file())
+
+    def test_a_codex_that_is_not_a_native_program_is_never_started(self):
+        tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        script = tmp / 'codex'; script.write_text(f'#!/bin/sh\ntouch {tmp / "ran"}\necho codex-cli 0.170.0\n')
+        script.chmod(0o755)
+        with mock.patch.dict(os.environ, {'RSI_CODEX': str(script)}):
+            result = run_codex(home=tmp / 'home', cwd=tmp, prompt='go', config={}, record_dir=tmp / 'r', timeout=10)
+            with self.assertRaisesRegex(RuntimeError, 'RSI_CODEX'):
+                codex_version()
+        self.assertEqual((result.status, result.exit_code), ('failed', None))
+        self.assertIn('RSI_CODEX', (tmp / 'r' / 'stderr.txt').read_text())
+        self.assertFalse((tmp / 'ran').exists())
 
 
 @needs_codex

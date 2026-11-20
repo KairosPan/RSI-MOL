@@ -18,6 +18,7 @@ from rsi.labrun import run_task
 from rsi.limits import usage_by_class
 from rsi.meta import RELEASE_FILE, rollback, run_round
 from rsi.paths import Layout, Refused, find_layout
+from rsi.programs import clean_path, inside
 from rsi.records import ENDED, UNREADABLE, Records
 from rsi.tasks import load_task
 from rsi.versions import VERSION, VersionStore
@@ -105,7 +106,10 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE)
         return 0
     layout = find_layout()
+    if 'PATH' in os.environ:                        # what every program rsi starts inherits: nothing agents write
+        os.environ['PATH'] = clean_path(layout.root)
     try:
+        _own_python(layout)
         if command == 'status':
             return _status(layout, options['json'])
         with locked(layout):
@@ -119,6 +123,15 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         _error(f'出错了：{type(error).__name__}: {error}')
         return 1
+
+
+def _own_python(layout: Layout) -> None:
+    """Refused when the Python running the control program lies inside the RSI root, which agents partly write (the
+    launcher never picks such a one; this also covers starting the program some other way)."""
+    for path in (sys.executable, sys.prefix, sys.base_prefix):
+        if not path or inside(path, str(layout.root)):
+            raise Refused(f'运行 rsi 的 Python（{path!r}）在 RSI 文件夹里（或不明），agent 改得到；请用 RSI 文件夹以外的 Python '
+                          '（./rsi 会自己选，也可以用 $RSI_PYTHON 指定）')
 
 
 # What the commands print. Everything that comes from records or from an agent (ids, task names, check messages,

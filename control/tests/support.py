@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from rsi.check import CHECK_FILE, owner_fingerprints, program_fingerprints
-from rsi.codexrun import codex_program, codex_version
+from rsi.codexrun import codex_version
 from rsi.mockmodel import ScriptedModel
 from rsi.paths import Layout
 from rsi.records import Records
@@ -36,6 +36,17 @@ ENVELOPE = 'approval_policy = "never"\n\n[features]\napps = false\nplugins = fal
 LIMITS = ('[lab]\nseconds_per_run = 1800\n\n'
           '[meta]\ncalls_per_round = 8\ntrials_per_round = 4\nseconds_per_call = 900\n\n'
           '[day]\ncalls = 60\ntokens = 0\n')
+
+
+def plant_programs(folder: Path, marker: Path) -> list[str]:
+    """Scripts in folder named like the programs the control program, Codex or the npm shim could start through a
+    PATH lookup (codex, git, python3, node, ...); each appends its name to marker when run, then fails. Their names."""
+    folder.mkdir(parents=True, exist_ok=True)
+    names = ['codex', 'git', 'python3', 'python', 'node', 'readlink', 'dirname', 'xcrun', 'ps']
+    for name in names:
+        (folder / name).write_text(f'#!/bin/sh\necho {name} >> "{marker}"\nexit 1\n')
+        (folder / name).chmod(0o755)
+    return names
 
 
 def decision(kind: str, **more) -> str:
@@ -90,7 +101,7 @@ def write_passing_check(layout: Layout) -> None:
     """records/check.json as a passed `rsi check` for the installed Codex, the owner files and the control program's
     code as they are now would leave it (without its cases), so that the gate lets agents start; nothing when Codex
     reports no version."""
-    version = _installed_codex(codex_program())
+    version = _installed_codex(os.environ.get('RSI_CODEX', 'codex'))
     if version is not None:
         (layout.records / CHECK_FILE).write_text(json.dumps(
             {'codex_version': version, 'owner_files': owner_fingerprints(layout), 'program': program_fingerprints(),

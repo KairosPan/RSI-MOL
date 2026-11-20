@@ -1,6 +1,6 @@
 """`rsi check`: the proof, under the real Codex binary, that the permission profiles confine the two agents, and the
 gate that lets agents start only once that proof holds for the Codex version installed now, for the owner files
-(owner/lab-envelope.toml, owner/meta/settings.toml) and for the control program's own code (rsi/*.py) as they are now.
+(owner/lab-envelope.toml, owner/meta/settings.toml) and for the control program's own code (rsi/) as they are now.
 
 Run it again whenever Codex changes version. A case that fails is reported as it is: it is never weakened or
 skipped, since the point is to find out when an assumption stops holding.
@@ -36,6 +36,7 @@ Static checks on the real root read nothing an agent can write: the root's path,
 the envelope composes for the real root.
 """
 import hashlib
+import importlib.machinery
 import json
 import os
 import secrets
@@ -627,6 +628,7 @@ def _command_cases(layout: Layout, profile: str, ports: dict, pdftotext: str | N
 
 @dataclass
 class _Context:
+    root: Path                                  # the real RSI root (the scratch roots lie inside it)
     codex: str                                  # the native Codex program, as the tool-server wrapper starts it
     python: str                                 # the probe's interpreter
     envelope: dict
@@ -650,7 +652,8 @@ def _sandbox(context: _Context, config: dict, profile: str, home: Path, cwd: Pat
     command = [context.codex, 'sandbox', *render_flags({'permissions': config['permissions'], 'features': features}),
                '-P', profile, *(['--enable', 'network_proxy'] if net else []), '--',
                context.python, '-I', '-B', '-c', PROBE, json.dumps(spec)]
-    env = {key: value for key, value in codex_environment(home, secrets=False).items() if key not in PROXY_VARIABLES}
+    env = {key: value for key, value in codex_environment(home, secrets=False, root=context.root).items()
+           if key not in PROXY_VARIABLES}
     env.update(config['shell_environment_policy']['set'])
     code, out, err = _run(command, cwd=cwd, env=env, timeout=PROBE_SECONDS)
     found = {}
@@ -692,7 +695,7 @@ def _command_layer(context: _Context, scratch: Path, profile: str) -> list[dict]
         workspace = _workspace(layout, profile)
         config = (meta_config(layout, context.envelope, {}) if profile == 'meta'
                   else lab_config(layout, context.envelope, load_settings(workspace),
-                                  trial=profile.startswith('trial'), resolve=_no_lookup))
+                                  trial=profile.startswith('trial'), resolve=_no_lookup, codex=context.codex))
         home = layout.meta_home if profile == 'meta' else layout.lab_home
         tcp = _Listener(socket.AF_INET, ('127.0.0.1', 0), context.token.encode())
         try:
@@ -877,7 +880,8 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
         settings = load_settings(layout.work)                        # as before a task run
         write_home_config(layout, envelope, settings, resolve=_no_lookup)
         write_role_files(layout, settings, trial=False)
-        config, home = lab_config(layout, envelope, settings, trial=False, resolve=_no_lookup), layout.lab_home
+        config = lab_config(layout, envelope, settings, trial=False, resolve=_no_lookup, codex=context.codex)
+        home = layout.lab_home
     for table in ('apps', 'plugins'):
         config.pop(table, None)
     features = context.envelope.get('features', {})
@@ -892,7 +896,7 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
                                    [(name, command) for name, command, _ in commands])), say('rsi check'))
     with _scripted(url):
         result = run_codex(home=home, cwd=workspace, prompt='rsi check：按脚本逐项尝试修改文件。', config=config,
-                           record_dir=layout.root / 'call', timeout=EXEC_SECONDS)
+                           record_dir=layout.root / 'call', timeout=EXEC_SECONDS, root=context.root)
     requests = model.requests[first:]
     outputs = '\n'.join(model.tool_outputs()) if len(requests) > 1 else ''
     complete = result.status == 'finished' and DONE in outputs
@@ -952,7 +956,7 @@ def _tool_run(context: _Context, scratch: Path) -> list[dict]:
     if settings.problems:
         raise ValueError('；'.join(settings.problems))
     write_role_files(layout, settings, trial=False)                 # as before a run: the wrapper's empty home
-    config = lab_config(layout, context.envelope, settings, trial=False, resolve=_no_lookup)
+    config = lab_config(layout, context.envelope, settings, trial=False, resolve=_no_lookup, codex=context.codex)
     results = []
     for profile in TOOL_PROFILES:
         server = config['mcp_servers'][f'rsicheck{profile.replace("_", "")}']
@@ -1024,7 +1028,7 @@ def _cases(layout: Layout, envelope: dict, problems: list[str], notes: list[str]
             problems.append(f'在 {SYSTEM_PATH} 里找不到 python3，命令层的检查没法运行')
             return []
         sockets = _Sockets()
-        context = _Context(codex, python, envelope, f'RSI-CHECK-TOKEN-{secrets.token_hex(8)}', sockets,
+        context = _Context(layout.root, codex, python, envelope, f'RSI-CHECK-TOKEN-{secrets.token_hex(8)}', sockets,
                            shutil.which('pdftotext', path=SYSTEM_PATH), notes, info)
         results = []
         for profile in PROFILES:
@@ -1081,9 +1085,24 @@ def owner_fingerprints(layout: Layout) -> dict[str, str | None]:
 
 
 def program_fingerprints() -> dict[str, str]:
-    """sha256 of every module of the control program (rsi/*.py), by file name, sorted: a check holds only for this
-    code. OSError when one cannot be read."""
-    return {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(PROGRAM.glob('*.py'))}
+    """A fingerprint of everything Python could import from the control program's own folder (rsi/), by name, sorted:
+    a check holds only for this code. A regular file whose name ends as a module does (.py, .pyc beside its source,
+    a compiled extension) by its sha256; a folder (a package or namespace portion) or a link by what it is. Left out:
+    __pycache__ (the program never reads bytecode, see rsi/__main__.py) and files no import looks at (.DS_Store).
+    OSError when one cannot be read."""
+    suffixes = tuple(importlib.machinery.all_suffixes())
+    out = {}
+    for path in sorted(PROGRAM.iterdir()):
+        mode = path.lstat().st_mode
+        if path.name == '__pycache__':
+            continue
+        if stat.S_ISREG(mode) and path.name.endswith(suffixes):
+            out[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif stat.S_ISDIR(mode):
+            out[path.name] = '文件夹'
+        elif stat.S_ISLNK(mode):
+            out[path.name] = '符号链接'
+    return out
 
 
 def run_check(layout: Layout) -> dict:
@@ -1102,7 +1121,7 @@ def run_check(layout: Layout) -> dict:
         program = {}
         problems.append(f'控制程序的代码读不了（{error.strerror or error}）')
     try:
-        version = codex_version()
+        version = codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         version = None
         problems.append(f'Codex 报不出版本：{error}')
@@ -1166,7 +1185,7 @@ def gate(layout: Layout) -> str | None:
         return (f'控制程序的代码（{PROGRAM.name}/ 里的 {names}）在上一次 rsi check 之后改过、新增或删除了，'
                 'agent 不能启动：请重新运行 rsi check')
     try:
-        installed = codex_version()
+        installed = codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         return f'Codex 程序用不了（{error}），不能确认 rsi check 的结果对它有效'
     if data.get('codex_version') != installed:

@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 from rsi.paths import safe_id
+from rsi.programs import git_program
 
 VERSION = re.compile(r'V[0-9]{4,}')
 COMMIT_ID = re.compile(r'[0-9a-f]{40}')
@@ -24,6 +25,7 @@ COMMIT_ID = re.compile(r'[0-9a-f]{40}')
 AUTHOR = re.compile(r'[^\x00-\x20\x7f<>,:;"\'\\](?:[^\x00-\x1f\x7f<>]*[^\x00-\x20\x7f<>,:;"\'\\])?')
 MAIN = 'refs/heads/main'
 TIMEOUT = 600  # seconds for one git call
+GIT_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'  # the PATH git runs with
 # With the system and global configuration switched off, these are all the settings git reads. The reflog keeps
 # every snapshot a round ref once pointed at.
 STORE_CONFIG = (
@@ -176,7 +178,7 @@ class VersionStore:
     def diff(self, old: str, new: str, limit: int = 1_000_000) -> str:
         """`git diff` from one version or commit to another, cut after `limit` bytes of output (with a note)."""
         old, new = self.resolve(old), self.resolve(new)
-        command = ['git', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', old, new, '--']
+        command = [git_program(), 'diff', '--no-color', '--no-ext-diff', '--no-textconv', old, new, '--']
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self._env(None),
                               cwd=self.git_dir) as process:
             data = process.stdout.read(limit + 1)
@@ -295,10 +297,11 @@ class VersionStore:
         return self.git_dir / 'indexes' / hashlib.sha256(str(folder).encode()).hexdigest()[:32]
 
     def _env(self, folder: Path | None, author: str | None = None) -> dict:
-        """The caller's environment without any GIT_* variable, pointed at this store only."""
+        """The caller's environment without any GIT_* variable, pointed at this store only, with a PATH no agent can
+        write (git itself is rsi.programs.git_program, never looked up in a PATH)."""
         env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
         env.update(GIT_DIR=str(self.git_dir), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
-                   GIT_ATTR_NOSYSTEM='1', GIT_TERMINAL_PROMPT='0')
+                   GIT_ATTR_NOSYSTEM='1', GIT_TERMINAL_PROMPT='0', PATH=GIT_PATH)
         if folder is not None:
             env.update(GIT_WORK_TREE=str(folder), GIT_INDEX_FILE=str(self._index(folder)))
         if author is not None:
@@ -307,7 +310,7 @@ class VersionStore:
 
     def _git(self, *args: str, folder: Path | None = None, stdin: bytes = b'', author: str | None = None,
              check: bool = True) -> subprocess.CompletedProcess:
-        done = subprocess.run(['git', *args], input=stdin, capture_output=True, env=self._env(folder, author),
+        done = subprocess.run([git_program(), *args], input=stdin, capture_output=True, env=self._env(folder, author),
                               cwd=folder or self.git_dir, timeout=TIMEOUT)
         if check and done.returncode != 0:
             raise RuntimeError(f'git {args[0]} failed ({done.returncode}): '

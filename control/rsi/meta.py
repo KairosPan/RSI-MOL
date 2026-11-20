@@ -459,7 +459,7 @@ class _Round:
         try:
             result = run_codex(home=self.layout.meta_home, cwd=self.layout.meta, prompt=prompt, config=self.config,
                                record_dir=call_dir, timeout=self.limits.meta_seconds, resume=self.thread,
-                               schema=schema, on_start=process_recorder(records, call_id))
+                               schema=schema, on_start=process_recorder(records, call_id), root=self.layout.root)
         except BaseException:
             end_interrupted(records, call_id)
             raise
@@ -726,7 +726,7 @@ def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo)
         envelope = load_envelope(layout.owner)
         config = meta_config(layout, envelope, _meta_settings(layout))
         instructions = _instructions(layout)
-        codex = usable_codex_version()
+        codex = usable_codex_version(layout)
         problems = []
         # What sits in work/ becomes a version first (as before a task run), so the candidate is cut from it.
         take_work(layout, records, store, root_fd, calls, context, problems)

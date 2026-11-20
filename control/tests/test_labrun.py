@@ -15,7 +15,7 @@ from rsi.mockmodel import add_file, say, slow, with_usage
 from rsi.paths import Refused
 from rsi.sessions import collect_sessions
 from rsi.versions import VersionStore
-from tests.support import PASS_CHECK, Root, needs_codex
+from tests.support import PASS_CHECK, Root, needs_codex, plant_programs
 from tests.test_workspace import DEPTH, deny, few_open_files
 
 
@@ -56,6 +56,20 @@ class LabRuns(unittest.TestCase):
                              (1, True, []))
             self.assertEqual((call['problems'], leftovers(root)), ([], []))
             self.assertFalse(root.layout.sealed.exists())
+
+    def test_programs_planted_in_env_bin_are_never_run(self):
+        # The owner's shell may have <root>/env/bin first on PATH (an activated venv), and the Lab writes env/.
+        with Root() as root:
+            root.add_task('T1', check=PASS_CHECK)
+            marker = root.path / 'planted-ran'
+            plant_programs(root.layout.env / 'bin', marker)
+            os.environ['PATH'] = f'{root.layout.env / "bin"}{os.pathsep}{os.environ["PATH"]}'     # Root restores it
+            root.model.push(add_file('out/T1/answer.json', '{"x": 3, "y": -1}'), add_file('notes/n.md', 'n'),
+                            say('done'))
+            call = run_task(root.layout, 'T1')
+            self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else '')
+            self.assertEqual((call['status'], call['version_after'], call['check']['passed']),
+                             ('finished', 'V0002', True))
 
     def test_sessions_are_fetched_by_exact_id_only(self):
         home = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, home, True)

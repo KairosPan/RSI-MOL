@@ -11,9 +11,7 @@ resolve only to public addresses and may carry a secret only to the host the own
 import copy
 import errno
 import ipaddress
-import json
 import os
-import platform
 import shutil
 import socket
 import stat
@@ -22,8 +20,9 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from rsi.codexrun import codex_program
+from rsi import programs
 from rsi.paths import Layout, Refused
+from rsi.programs import NATIVE_TARGETS, TEMP_FOLDERS, inside as _inside, temp_folders  # noqa: F401 (kept names)
 from rsi.settings import EFFORTS, MODEL, ROLE, SETTINGS, Settings, is_workspace_path, show
 from rsi.tomlout import render_file, toml_value
 
@@ -32,20 +31,10 @@ ENVELOPE_TABLES = ('features', 'apps', 'plugins', 'rsi')
 TOOL_FOLDERS = ('/opt/homebrew/bin', '/opt/homebrew/Cellar', '/opt/homebrew/opt', '/opt/homebrew/lib',
                 '/opt/homebrew/share', '/opt/homebrew/etc/fonts')
 SYSTEM_PATH = '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
-# Shared temp folders. `:minimal` leaves them writable, so every profile denies them by their real paths (agents
-# would otherwise pass data through them); each run's TMPDIR is inside its own workspace instead.
-TEMP_FOLDERS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp')
+# The shared temp folders (rsi.programs.temp_folders): `:minimal` leaves them writable, so every profile denies them
+# by their real paths (agents would otherwise pass data through them); each run's TMPDIR is inside its own workspace.
 # The PATH of the unsandboxed `codex sandbox` wrapper: nothing an agent can write.
 WRAPPER_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
-# (system, machine) → (npm platform package, target triple), as in the npm package's bin/codex.js.
-NATIVE_TARGETS = {('Darwin', 'arm64'): ('codex-darwin-arm64', 'aarch64-apple-darwin'),
-                  ('Darwin', 'x86_64'): ('codex-darwin-x64', 'x86_64-apple-darwin'),
-                  ('Linux', 'x86_64'): ('codex-linux-x64', 'x86_64-unknown-linux-musl'),
-                  ('Linux', 'aarch64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl'),
-                  ('Linux', 'arm64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl')}
-HOW_TO_SET_CODEX = ('请把 $RSI_CODEX 设成 Codex 原生程序的绝对路径（npm 安装的在 '
-                    '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），'
-                    '它不能在 RSI 文件夹或 /tmp 这类公用临时文件夹里')
 HOME_CONFIG = 'config.toml'
 OWNER_BACKUP = 'config.toml.before-rsi'      # the owner's own config.toml, kept before rsi replaces it
 BACKUP_NAMES = 100                           # config.toml.before-rsi, config.toml.before-rsi-2, ... -100
@@ -109,42 +98,6 @@ def _homes() -> tuple[str, str]:
     return str(home / '.codex'), str(home / '.codex-rsi-lab')
 
 
-def _within(path: str, folder: str) -> bool:
-    return path == folder or path.startswith(folder.rstrip('/') + '/')
-
-
-def _inside(path: str, folder: str) -> bool:
-    """Whether path is folder or lies under it, never judged by spelling alone: by file identity (os.path.samestat
-    of the path and each of its ancestors against the folder) where they exist, and also by case-insensitive
-    spelling of their absolute and real forms, so a path in another letter case is caught; it refuses more, not
-    less."""
-    forms = {os.path.abspath(path), os.path.realpath(path)}
-    limits = {os.path.abspath(folder), os.path.realpath(folder)}
-    if any(_within(form.casefold(), limit.casefold()) for form in forms for limit in limits):
-        return True
-    try:
-        target = os.stat(folder)
-    except OSError:
-        return False
-    for form in forms:
-        for ancestor in (form, *map(str, Path(form).parents)):
-            try:
-                if os.path.samestat(os.stat(ancestor), target):
-                    return True
-            except OSError:
-                continue
-    return False
-
-
-def temp_folders() -> list[str]:
-    """The real paths of the shared temp folders that exist, each once."""
-    out = []
-    for folder in TEMP_FOLDERS:
-        if os.path.exists(folder) and os.path.realpath(folder) not in out:
-            out.append(os.path.realpath(folder))
-    return out
-
-
 def _extra_read(layout: Layout, envelope: dict) -> list[str]:
     """The owner's extra read-only folders; one inside the RSI root or an everyday Codex home is refused."""
     out = []
@@ -204,53 +157,10 @@ def _shell(layout: Layout, workspace: Path) -> dict:
                                        'TMPPREFIX': _tmpprefix(workspace)}}
 
 
-def _script(path: str) -> bool:
-    with open(path, 'rb') as stream:
-        return stream.read(2) == b'#!'
-
-
-def _shim_targets(shim: str) -> list[str]:
-    """Where the npm package that owns the shim `<package>/bin/codex.js` keeps the native program."""
-    package = os.path.dirname(os.path.dirname(shim))
-    try:
-        name = json.loads(Path(package, 'package.json').read_text(encoding='utf-8')).get('name')
-    except (OSError, ValueError, AttributeError):
-        return []
-    target = NATIVE_TARGETS.get((platform.system(), platform.machine()))
-    if name != '@openai/codex' or target is None:
-        return []
-    platform_package, triple = target
-    tail = os.path.join('vendor', triple, 'bin', 'codex')
-    return [os.path.join(package, 'node_modules', '@openai', platform_package, tail),
-            os.path.join(os.path.dirname(package), platform_package, tail), os.path.join(package, tail)]
-
-
 def native_codex(layout: Layout) -> str:
-    """The real path of Codex's native program, for the unsandboxed wrapper of local tool servers.
-
-    $RSI_CODEX must be absolute when set; otherwise `codex` is looked up in the control program's own PATH. An npm
-    shim (`#!/usr/bin/env node`, which would look node up in a PATH) is followed to its package's native program.
-    The result must exist, be executable, not be a script, and lie outside the RSI root (which agents can write)
-    and outside the shared temp folders (which anyone can write); anything else is refused rather than guessed.
-    """
-    program = codex_program()
-    if 'RSI_CODEX' in os.environ and not os.path.isabs(program):
-        raise Refused(f'$RSI_CODEX 必须是绝对路径，现在是 {program!r}。{HOW_TO_SET_CODEX}')
-    found = program if os.path.isabs(program) else shutil.which(program)
-    reachable = [str(layout.root), *TEMP_FOLDERS, *temp_folders()]       # what an agent or anyone may write
-
-    def outside(path: str) -> bool:
-        return not any(_inside(path, folder) for folder in reachable)
-
-    if not found or not os.path.isfile(found) or not outside(found):
-        raise Refused(f'找不到可用的 Codex 程序（{program!r}）。{HOW_TO_SET_CODEX}')
-    real = os.path.realpath(found)
-    candidates = _shim_targets(real) if _script(real) else [real]
-    for candidate in candidates:
-        if (os.path.isabs(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK)
-                and outside(candidate) and not _script(candidate)):
-            return os.path.realpath(candidate)
-    raise Refused(f'{found} 不是 Codex 的原生程序，也找不到它对应的原生程序。{HOW_TO_SET_CODEX}')
+    """The real path of Codex's native program for this RSI root (rsi.programs.native_codex): what the tool-server
+    wrappers, the check and every call start."""
+    return programs.native_codex(layout.root)
 
 
 def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, codex: str, permissions: dict) -> dict:
@@ -420,12 +330,13 @@ def tool_server_problems(envelope: dict, settings: Settings, *, resolve=socket.g
 
 
 def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, interactive: bool = False,
-               resolve=socket.getaddrinfo) -> dict:
+               resolve=socket.getaddrinfo, codex: str | None = None) -> dict:
     """The complete Codex configuration of a Lab run in work/ (trial=False) or trial/ (trial=True).
 
     Disabled ids missing from the envelope are added to settings.problems (once each) and ignored. Tool servers
     named by tool_server_problems are left out. Roles point at the copies of write_role_files, which the caller
-    writes before the run.
+    writes before the run. The wrappers of local tool servers start `codex` (default native_codex(layout); `rsi
+    check`, which composes for scratch roots inside the real one, passes the program it validated for the real root).
     """
     workspace, base = (layout.trial, 'trial') if trial else (layout.work, 'lab')
     config = {'approval_policy': envelope['approval_policy'] if interactive else 'never',
@@ -445,7 +356,8 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
                         'config_file': str(role_folder(layout, trial=trial) / (name + '.toml'))}
     refused = _url_server_problems(envelope, settings, resolve)
     kept = {name: server for name, server in settings.tool_servers.items() if name not in refused}
-    codex = native_codex(layout) if any('url' not in server for server in kept.values()) else None
+    if any('url' not in server for server in kept.values()):
+        codex = codex or native_codex(layout)
     permissions = profiles(layout, envelope)
     servers = {name: dict(server) if 'url' in server
                else _local_server(layout, workspace, base, server, codex, permissions) for name, server in kept.items()}

@@ -34,7 +34,7 @@ from datetime import datetime
 from pathlib import Path
 
 from rsi import check
-from rsi.codexrun import codex_program, codex_version, run_codex
+from rsi.codexrun import codex_version, run_codex
 from rsi.compose import lab_config, load_envelope, tool_server_problems, write_home_config, write_role_files
 from rsi.limits import Limits, load_limits, refusal
 from rsi.paths import Layout, Refused, safe_id
@@ -190,11 +190,11 @@ def _own_interpreter(layout: Layout, task: Task | None) -> None:
                       '请用 RSI 文件夹以外的 python3 运行 rsi。')
 
 
-def _codex_version() -> str:
+def _codex_version(layout: Layout) -> str:
     try:
-        return codex_version()
+        return codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-        raise Refused(f'Codex 程序（{codex_program()}）用不了：{error}') from None
+        raise Refused(f'Codex 程序用不了：{error}') from None
 
 
 def _compose(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, resolve) -> tuple[dict, list[str]]:
@@ -377,7 +377,7 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
         store = _store(layout)
         envelope = load_envelope(layout.owner)
         _own_interpreter(layout, task)
-        codex = _codex_version()
+        codex = _codex_version(layout)
         notes, skill_lines = [], []
         _take_work(layout, records, store, root_fd, calls, context, notes)
         try:
@@ -423,7 +423,7 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
         limits, _ = _admit(layout, records)
         envelope = load_envelope(layout.owner)
         _own_interpreter(layout, task)
-        codex = _codex_version()
+        codex = _codex_version(layout)
         with _refusing('版本库用不了'):
             tree = store.tree_of(commit_id)
             head, work_settings = _stage(layout, store, store.head())      # for the owner's own Lab config:
@@ -467,7 +467,8 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
         call_dir = records.call_dir(call_id)
         records.start_call(call_id, {**run.fields, 'started': _now()})
         result = run_codex(home=layout.lab_home, cwd=layout.root / run.name, prompt=run.prompt, config=run.config,
-                           record_dir=call_dir, timeout=run.timeout, on_start=process_recorder(records, call_id))
+                           record_dir=call_dir, timeout=run.timeout, on_start=process_recorder(records, call_id),
+                           root=layout.root)
     except BaseException:
         if call_id is not None:
             _end_interrupted(records, call_id)
@@ -582,8 +583,8 @@ def open_store(layout: Layout) -> VersionStore:
     return _store(layout)
 
 
-def usable_codex_version() -> str:
-    return _codex_version()
+def usable_codex_version(layout: Layout) -> str:
+    return _codex_version(layout)
 
 
 def stage(layout: Layout, store: VersionStore, version: str, task: Task | None = None) -> tuple[Path, Settings]:

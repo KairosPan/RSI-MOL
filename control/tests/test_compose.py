@@ -18,6 +18,7 @@ from rsi.compose import (NATIVE_TARGETS, keep_owner_config, lab_config, load_env
                           profiles, temp_folders, tool_server_problems, write_home_config, write_role_files)
 from rsi.mockmodel import ScriptedModel, run_js, say
 from rsi.paths import Layout, Refused
+from rsi.programs import clean_path
 from rsi.settings import load_settings
 from rsi.tomlout import render_file, render_flags, toml_value
 from tests.support import needs_codex
@@ -256,11 +257,25 @@ class ComposeTests(unittest.TestCase):
         link = self.outside / 'link-to-planted'; link.symlink_to(planted / 'codex')
         for program in (None, str(planted / 'codex'), str(link)):
             if program is None:
-                os.environ.pop('RSI_CODEX')                          # found on PATH, in the agents' env/bin
+                os.environ.pop('RSI_CODEX')                         # on PATH only in the agents' env/bin: passed over
+                os.environ['PATH'] = f'{planted}{os.pathsep}{self.outside / "relative"}{os.pathsep}/usr/bin:/bin'
             else:
                 os.environ['RSI_CODEX'] = program
             with self.assertRaises(Refused, msg=program):
                 self.wrapper()
+
+    @needs_codex
+    def test_codex_is_looked_up_past_the_path_entries_an_agent_can_write(self):
+        os.environ.pop('RSI_CODEX')
+        real = native_codex(self.layout)
+        planted = self.layout.env / 'bin'; executable(planted / 'codex')
+        for entry in (str(planted), 'env/bin', str(Path(temp_folders()[0]))):
+            os.environ['PATH'] = entry + os.pathsep + os.environ['PATH']
+        self.assertEqual(native_codex(self.layout), real)
+        self.assertEqual(self.wrapper()['mcp_servers']['t']['command'], real)
+        kept = clean_path(self.layout.root).split(os.pathsep)
+        self.assertEqual({str(planted), 'env/bin', temp_folders()[0]} & set(kept), set())
+        self.assertTrue(set(kept) <= set(os.environ['PATH'].split(os.pathsep)))
 
     def test_codex_must_be_an_absolute_native_program(self):
         for program in ('codex', 'bin/codex', '', str(self.outside / 'missing')):

@@ -215,6 +215,16 @@ class Versions(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in outside.iterdir()), ['f', 'x'])
         self.assertEqual((outside / 'f').read_text(), 'outside')
 
+    def test_git_is_never_looked_up_in_the_path(self):
+        planted = self.tmp / 'bin'; planted.mkdir()
+        (planted / 'git').write_text(f'#!/bin/sh\ntouch {self.tmp / "planted-git-ran"}\nexit 1\n')
+        (planted / 'git').chmod(0o755)
+        with mock.patch.dict(os.environ, {'PATH': f'{planted}{os.pathsep}{os.environ["PATH"]}'}):
+            (self.a / 'f.txt').write_text('1')
+            self.assertEqual(self.store.commit(self.a, 'init', 'one'), 'V0001')
+            self.assertEqual(self.store.diff('V0001', 'V0001'), '')
+        self.assertFalse((self.tmp / 'planted-git-ran').exists())
+
     def test_inherited_git_variables_and_the_owners_git_setup_are_ignored(self):
         home = self.tmp / 'home'; (home / 'hooks').mkdir(parents=True); (home / 'git').mkdir()
         hook = home / 'hooks' / 'reference-transaction'

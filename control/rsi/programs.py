@@ -1,0 +1,141 @@
+"""The programs the control program starts, never taken from where an agent (or anyone) can write.
+
+Agents write folders of the RSI root (env/bin among them, which the owner may have put first on PATH by activating
+the venv), and anyone may write the shared temp folders. So Codex is the validated native program (native_codex,
+looked up past such PATH entries), git comes from a fixed list of absolute paths (git_program), and the PATH that
+child processes get has no entry that is relative or lies inside the root or a shared temp folder (clean_path). The
+launcher `rsi` picks the control program's own Python from a fixed list in the same way.
+"""
+import functools
+import json
+import os
+import platform
+import shutil
+from pathlib import Path
+
+from rsi.paths import Refused
+
+# Shared temp folders: anyone may write them.
+TEMP_FOLDERS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp')
+# (system, machine) → (npm platform package, target triple), as in the npm package's bin/codex.js.
+NATIVE_TARGETS = {('Darwin', 'arm64'): ('codex-darwin-arm64', 'aarch64-apple-darwin'),
+                  ('Darwin', 'x86_64'): ('codex-darwin-x64', 'x86_64-apple-darwin'),
+                  ('Linux', 'x86_64'): ('codex-linux-x64', 'x86_64-unknown-linux-musl'),
+                  ('Linux', 'aarch64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl'),
+                  ('Linux', 'arm64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl')}
+HOW_TO_SET_CODEX = ('请把 $RSI_CODEX 设成 Codex 原生程序的绝对路径（npm 安装的在 '
+                    '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），'
+                    '它不能在 RSI 文件夹或 /tmp 这类公用临时文件夹里')
+GIT_PROGRAMS = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')     # tried in this order
+
+
+def _within(path: str, folder: str) -> bool:
+    return path == folder or path.startswith(folder.rstrip('/') + '/')
+
+
+def inside(path: str, folder: str) -> bool:
+    """Whether path is folder or lies under it, never judged by spelling alone: by file identity (os.path.samestat
+    of the path and each of its ancestors against the folder) where they exist, and also by case-insensitive
+    spelling of their absolute and real forms, so a path in another letter case is caught; it refuses more, not
+    less."""
+    forms = {os.path.abspath(path), os.path.realpath(path)}
+    limits = {os.path.abspath(folder), os.path.realpath(folder)}
+    if any(_within(form.casefold(), limit.casefold()) for form in forms for limit in limits):
+        return True
+    try:
+        target = os.stat(folder)
+    except OSError:
+        return False
+    for form in forms:
+        for ancestor in (form, *map(str, Path(form).parents)):
+            try:
+                if os.path.samestat(os.stat(ancestor), target):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def temp_folders() -> list[str]:
+    """The real paths of the shared temp folders that exist, each once."""
+    out = []
+    for folder in TEMP_FOLDERS:
+        if os.path.exists(folder) and os.path.realpath(folder) not in out:
+            out.append(os.path.realpath(folder))
+    return out
+
+
+def _reachable(root: Path) -> list[str]:
+    """What an agent or anyone may write: the RSI root and the shared temp folders."""
+    return [str(root), *TEMP_FOLDERS, *temp_folders()]
+
+
+def clean_path(root: Path, value: str | None = None) -> str:
+    """value (default: this process's PATH) without the entries that are empty or relative, or lie inside the RSI
+    root or a shared temp folder; each entry kept once, in order."""
+    reachable, kept = _reachable(root), []
+    for entry in (os.environ.get('PATH', '') if value is None else value).split(os.pathsep):
+        if entry and os.path.isabs(entry) and entry not in kept and \
+                not any(inside(entry, folder) for folder in reachable):
+            kept.append(entry)
+    return os.pathsep.join(kept)
+
+
+def _script(path: str) -> bool:
+    with open(path, 'rb') as stream:
+        return stream.read(2) == b'#!'
+
+
+def _shim_targets(shim: str) -> list[str]:
+    """Where the npm package that owns the shim `<package>/bin/codex.js` keeps the native program."""
+    package = os.path.dirname(os.path.dirname(shim))
+    try:
+        name = json.loads(Path(package, 'package.json').read_text(encoding='utf-8')).get('name')
+    except (OSError, ValueError, AttributeError):
+        return []
+    target = NATIVE_TARGETS.get((platform.system(), platform.machine()))
+    if name != '@openai/codex' or target is None:
+        return []
+    platform_package, triple = target
+    tail = os.path.join('vendor', triple, 'bin', 'codex')
+    return [os.path.join(package, 'node_modules', '@openai', platform_package, tail),
+            os.path.join(os.path.dirname(package), platform_package, tail), os.path.join(package, tail)]
+
+
+def native_codex(root: Path) -> str:
+    """The real path of Codex's native program: the only Codex the control program ever starts.
+
+    $RSI_CODEX must be absolute when set; otherwise `codex` is looked up in the control program's PATH without the
+    entries clean_path drops. An npm shim (`#!/usr/bin/env node`, which would look node up in a PATH) is followed to
+    its package's native program, never run. The result must exist, be executable, not be a script, and lie outside
+    the RSI root (which agents can write) and outside the shared temp folders (which anyone can write); anything else
+    is Refused rather than guessed.
+    """
+    program = os.environ.get('RSI_CODEX')
+    if program is not None and not os.path.isabs(program):
+        raise Refused(f'$RSI_CODEX 必须是绝对路径，现在是 {program!r}。{HOW_TO_SET_CODEX}')
+    found = program if program is not None else shutil.which('codex', path=clean_path(root))
+    reachable = _reachable(root)
+
+    def outside(path: str) -> bool:
+        return not any(inside(path, folder) for folder in reachable)
+
+    if not found or not os.path.isfile(found) or not outside(found):
+        raise Refused(f'找不到可用的 Codex 程序（{program or "codex"!r}）。{HOW_TO_SET_CODEX}')
+    real = os.path.realpath(found)
+    candidates = _shim_targets(real) if _script(real) else [real]
+    for candidate in candidates:
+        if (os.path.isabs(candidate) and os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+                and outside(candidate) and not _script(candidate)):
+            return os.path.realpath(candidate)
+    raise Refused(f'{found} 不是 Codex 的原生程序，也找不到它对应的原生程序。{HOW_TO_SET_CODEX}')
+
+
+@functools.cache
+def git_program() -> str:
+    """git: the first of GIT_PROGRAMS that is an executable file, resolved once (never looked up in a PATH);
+    RuntimeError when none is."""
+    for program in GIT_PROGRAMS:
+        if os.path.isfile(program) and os.access(program, os.X_OK):
+            return program
+    raise RuntimeError(f'找不到 git（试过 {"、".join(GIT_PROGRAMS)}）')

@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rsi.mockmodel import provider_config
-from rsi.paths import safe_id
+from rsi.paths import Refused, find_layout, safe_id
+from rsi.programs import clean_path, native_codex
 from rsi.tomlout import render_flags
 
 KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL of a call's process group
@@ -37,16 +38,26 @@ class CallResult:
     command: list[str]
 
 
-def codex_program() -> str:
-    """The Codex program to start: $RSI_CODEX, default `codex`."""
-    return os.environ.get('RSI_CODEX', 'codex')
+def _root(root: Path | None) -> Path:
+    """The RSI root whose folders no program may come from: the given one, else find_layout()'s."""
+    return find_layout().root if root is None else Path(root)
 
 
-def codex_environment(home: Path, *, secrets: bool = True) -> dict:
+def codex_program(root: Path | None = None) -> str:
+    """The Codex program to start: the validated native program (rsi.programs.native_codex: $RSI_CODEX, else
+    `codex` from the PATH entries outside the RSI root and the shared temp folders). Refused when there is none."""
+    return native_codex(_root(root))
+
+
+def codex_environment(home: Path, *, secrets: bool = True, root: Path | None = None) -> dict:
     """The environment a Codex process starts with: the few basics of KEPT_VARIABLES and LC_*, the owner's
-    RSI_TOOL_* secrets (unless secrets is false) and CODEX_HOME. Nothing else of os.environ reaches Codex."""
+    RSI_TOOL_* secrets (unless secrets is false) and CODEX_HOME. Nothing else of os.environ reaches Codex, and its
+    PATH keeps no entry that is relative or lies inside the RSI root or a shared temp folder (Codex itself starts
+    programs, git among them, by PATH, outside the sandbox)."""
     env = {key: value for key, value in os.environ.items()
            if key in KEPT_VARIABLES or key.startswith('LC_') or (secrets and key.startswith('RSI_TOOL_'))}
+    if 'PATH' in env:
+        env['PATH'] = clean_path(_root(root), env['PATH'])
     env['CODEX_HOME'] = str(home)
     return env
 
@@ -58,17 +69,21 @@ def _with_local_hosts(value: str | None) -> str:
     return ','.join(hosts)
 
 
-def codex_version() -> str:
-    """The version Codex reports, e.g. '0.170.0'; RuntimeError (in Chinese) when it reports none.
+def codex_version(root: Path | None = None) -> str:
+    """The version Codex reports, e.g. '0.170.0'; RuntimeError (in Chinese) when it reports none or there is no
+    usable Codex program (codex_program).
 
     Codex writes helper files into its home even for --version, so this runs with a throwaway home, in its own
     process group, which is killed afterwards.
     """
-    program = codex_program()
+    try:
+        program = codex_program(root)
+    except Refused as error:
+        raise RuntimeError(str(error)) from None
     with tempfile.TemporaryDirectory() as home:
         process = subprocess.Popen([program, '--version'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True, start_new_session=True,
-                                   env=codex_environment(Path(home), secrets=False))
+                                   env=codex_environment(Path(home), secrets=False, root=root))
         try:
             out, err = process.communicate(timeout=60)
         except subprocess.TimeoutExpired:
@@ -133,17 +148,23 @@ def _read_events(path: Path) -> tuple[str | None, dict | None, bool]:
 
 
 def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: Path, timeout: float,
-              resume: str | None = None, schema: Path | None = None, on_start=None) -> CallResult:
+              resume: str | None = None, schema: Path | None = None, on_start=None,
+              root: Path | None = None) -> CallResult:
     """Run one `codex exec` (or `codex exec resume <thread>`) with the prompt on stdin and CODEX_HOME=home.
 
     When $RSI_TEST_MODEL_ENDPOINT is set the call goes to that scripted endpoint instead of a model.
     on_start(pid) is called once the process exists. Status is `finished` (exit code 0 and a turn.completed
-    event), `timed_out` (the process group got SIGTERM, then SIGKILL) or `failed`. The paths are made absolute
-    first. Codex gets codex_environment(home), not the control program's whole environment.
+    event), `timed_out` (the process group got SIGTERM, then SIGKILL) or `failed` (also when there is no usable
+    Codex program for the RSI root `root`, default find_layout()'s: nothing is started then). The paths are made
+    absolute first. Codex gets codex_environment(home), not the control program's whole environment.
     """
     home, cwd, record_dir = Path(home).resolve(), Path(cwd).resolve(), Path(record_dir).resolve()
     schema = Path(schema).resolve() if schema is not None else None
-    env = codex_environment(home)
+    env = codex_environment(home, root=root)
+    try:
+        program, unusable = codex_program(root), None
+    except Refused as error:
+        program, unusable = os.environ.get('RSI_CODEX', 'codex'), str(error)
     endpoint = os.environ.get('RSI_TEST_MODEL_ENDPOINT')
     if endpoint:
         config = _merge(config, provider_config(endpoint))
@@ -154,7 +175,7 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
     last_message = record_dir / 'last-message.txt'
     # --ignore-user-config skips only $CODEX_HOME/config.toml; --ignore-rules also skips the saved command rules
     # ($CODEX_HOME/rules/*.rules), where an `allow` rule the owner approved by hand could run a command unsandboxed.
-    command = [codex_program(), '--no-daemon', 'exec', *(['resume'] if resume is not None else []),
+    command = [program, '--no-daemon', 'exec', *(['resume'] if resume is not None else []),
                '--skip-git-repo-check', '--json', '--ignore-user-config', '--ignore-rules', *render_flags(config),
                *(['--output-schema', str(schema)] if schema is not None else []),
                '-o', str(last_message), *([resume] if resume is not None else []), '-']
@@ -170,12 +191,15 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
     timed_out = False
     with open(record_dir / 'prompt.txt', 'rb') as stdin, open(record_dir / 'events.jsonl', 'xb') as stdout, \
             open(record_dir / 'stderr.txt', 'xb') as stderr:
-        try:
-            process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
-                                       start_new_session=True)
-        except OSError as error:
-            stderr.write(f'could not start {command[0]}: {error}\n'.encode())
-            process = None
+        process = None
+        if unusable is not None:
+            stderr.write(f'could not start Codex: {unusable}\n'.encode())
+        else:
+            try:
+                process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
+                                           start_new_session=True)
+            except OSError as error:
+                stderr.write(f'could not start {command[0]}: {error}\n'.encode())
         if process is not None:
             deadline = time.monotonic() + timeout
             try:

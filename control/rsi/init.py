@@ -6,7 +6,8 @@ folders and, before anything can rewrite it, keeps a verified copy of the owner'
 envelope, imported from the newest usable copy, and the seed's limits and Meta files), creates the version store
 and, when the store has no version, seals what sits in work/, makes V0001 from the seed in staging/ (author
 `init`), and then adds to the sealed tree the seed files it lacks (nothing in it is replaced) before committing it
-as `manual or leftover`, as before a task run; then main's head is staged and renamed in as work/. It creates env/ with `<python> -m venv` when env/ is missing, writes the Lab home's
+as `manual or leftover`, as before a task run; then main's head is staged and renamed in as work/. It creates env/
+with `<python> -m venv` when env/ is missing, writes the Lab home's
 config.toml (naming the top-level keys of the owner's original it does not carry over), and reports whether each
 Codex home is signed in.
 
@@ -320,14 +321,15 @@ def _kill_group(pid: int) -> None:
         pass
 
 
-def signed_in(home: Path) -> bool | None:
-    """Whether `codex login status`, run with CODEX_HOME=home, exits 0; None when it cannot be run or does not end.
-    Only the exit code is used: its output is discarded and no file of the home is read here."""
+def signed_in(home: Path, root: Path) -> bool | None:
+    """Whether `codex login status` (the validated Codex of the RSI root `root`), run with CODEX_HOME=home, exits 0;
+    None when it cannot be run or does not end. Only the exit code is used: its output is discarded and no file of
+    the home is read here."""
     try:
-        process = subprocess.Popen([codex_program(), 'login', 'status'], stdin=subprocess.DEVNULL,
+        process = subprocess.Popen([codex_program(root), 'login', 'status'], stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                   env=codex_environment(home, secrets=False))
-    except OSError:
+                                   env=codex_environment(home, secrets=False, root=root))
+    except (OSError, Refused):
         return None
     try:
         code = process.wait(timeout=LOGIN_SECONDS)
@@ -370,7 +372,7 @@ def init(layout: Layout, seed: Path) -> dict:
         if original is not None:
             report['original'] = {'path': f'codex-home/{source.name}',
                                   'dropped': sorted(set(original) - {'approval_policy', *IMPORTED})}
-    report['signed_in'] = {home.name: signed_in(home) for home in (layout.lab_home, layout.meta_home)}
+    report['signed_in'] = {home.name: signed_in(home, layout.root) for home in (layout.lab_home, layout.meta_home)}
     return report
 
 
