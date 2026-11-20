@@ -234,7 +234,9 @@ class Gate(unittest.TestCase):
             for program in ('/elsewhere/bin/codex', None):          # another program, or a check that has none
                 data = json.loads(text); data['codex_program'] = program; path.write_text(json.dumps(data))
                 reason = gate(root.layout)
-                self.assertIn('Codex program', reason); self.assertIn('rsi check', reason)
+                self.assertIn('Codex program', reason); self.assertIn('Run rsi check again', reason)
+                self.assertNotIn('NoneType', reason)
+                self.assertEqual('PATH' in reason, program is not None)     # a record without one: its own sentence
                 with self.assertRaises(Refused): run_task(root.layout, 'T1')
             path.write_text(text)
             self.assertIsNone(gate(root.layout))

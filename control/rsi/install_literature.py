@@ -23,6 +23,11 @@ from rsi.tomlout import toml_value
 ROLE = 'codex/agents/literature.toml'
 PACKAGE = 'tools/literature'
 NOTE = 'literature_install'
+SOURCES = 'sources.json'        # in PACKAGE: the Lab's own list of local sources (runtime.py), kept by a reinstall
+
+
+class NotInWork(Exception):
+    """The new version was saved, but it could not be put into work/: the command failed, and says why."""
 
 
 def _no_links(staged: Path, relative: Path) -> Path:
@@ -84,8 +89,10 @@ def _extend_role(text: str, role: dict, addition: str) -> str:
 
 
 def _install_package(staged: Path, seed: Path) -> list[str]:
-    """Make the checkout's tools/literature/ exactly the seed's (__pycache__ left out). One line for each entry the
-    version had there that is gone now (the seed lacks it) or holds other bytes now."""
+    """Make the checkout's tools/literature/ exactly the seed's (__pycache__ left out), except sources.json: the
+    version's own is kept as it is (the seed's is installed only when the version has none). One line for each entry
+    the version had there that is gone now (the seed lacks it) or holds other bytes now, and one for a kept
+    sources.json."""
     source = seed / PACKAGE
     wanted = {}
     for path in sorted(source.rglob('*')):
@@ -95,10 +102,12 @@ def _install_package(staged: Path, seed: Path) -> list[str]:
     if 'server.py' not in wanted:
         raise Refused('The Literature service entry point is missing from the seed')
     folder = _no_links(staged, Path(PACKAGE))
-    found = {}
+    found, aside = {}, staged / ('.rsi-kept-' + SOURCES)
     if os.path.lexists(folder):
         if not folder.is_dir():
             raise Refused(f'Literature install expected a folder at {PACKAGE}')
+        if os.path.lexists(folder / SOURCES):
+            os.rename(folder / SOURCES, aside)               # whatever it is, moved as it is
         for top, folders, names in os.walk(folder):         # a link is listed, never followed
             for name in folders + names:
                 path = Path(top) / name
@@ -113,6 +122,11 @@ def _install_package(staged: Path, seed: Path) -> list[str]:
              for name in sorted(found.keys() - wanted.keys())]
     lines += [f"{PACKAGE}/{name} was replaced by the seed's" for name in sorted(found.keys() & wanted.keys())
               if found[name] != wanted[name]]
+    if os.path.lexists(aside):
+        if os.path.lexists(folder / SOURCES) and not (folder / SOURCES).is_dir():
+            (folder / SOURCES).unlink()                      # the seed's, written just now
+        os.rename(aside, folder / SOURCES)
+        lines.append(f"{PACKAGE}/{SOURCES} was kept: it is the Lab's list of local sources")
     return lines
 
 
@@ -162,17 +176,20 @@ def _install_files(staged: Path, seed: Path) -> list[str]:
     return lines
 
 
-def _restage(layout: Layout, records: Records, store, envelope: dict, root_fd: int, context: dict) -> list[str]:
-    """Put the newest version back into work/ (sealed before the install) and rewrite the Lab home's config.toml for
-    it; one line per problem. Never raises an Exception, so it cannot hide the install's own error."""
-    lines, settings = [], None
+def _restage(layout: Layout, records: Records, store, envelope: dict, root_fd: int,
+             context: dict) -> tuple[list[str], bool]:
+    """Put the newest version back into work/ (sealed before the install) and, once it is there, rewrite the Lab
+    home's config.toml for it; (one line per problem, whether work/ holds the newest version now). Never raises an
+    Exception, so it cannot hide the install's own error."""
+    lines, settings, placed = [], None, False
     with problem(lines, 'work/ could not be replaced by the newest version'):
-        staged, settings = stage(layout, store, store.head())
+        staged, head_settings = stage(layout, store, store.head())
         move_in(layout, records, root_fd, staged, 'work', context, lines)
-    if settings is not None:
+        settings, placed = head_settings, True
+    if placed:
         with problem(lines, "The Lab's Codex configuration (codex-home/config.toml) could not be updated"):
             write_home_config(layout, envelope, settings)
-    return lines
+    return lines, placed
 
 
 def _note(records: Records, data: dict, lines: list[str]) -> None:
@@ -184,10 +201,12 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
     """Install the seed's Literature (seed: the seed's work/ folder) into a new version; (the version before, the
     version after), equal when nothing changed. Called under the normal command lock.
 
-    lines, if given, gets one English line for each entry of tools/literature/ that was removed or replaced, and for
-    each problem met while putting the newest version back into work/. Each outcome (installed, unchanged, refused,
-    failed) is noted in records/index.jsonl as a `literature_install` line with those lines, and a refusal also as
-    every command's is (`refusal`). A refusal whose clean-up met problems names them too."""
+    lines, if given, gets one English line for each entry of tools/literature/ that was removed, replaced or kept
+    (sources.json), and for each problem met while putting the newest version back into work/. Each outcome
+    (installed, unchanged, either `_but_not_in_work`, refused, failed) is noted in records/index.jsonl as a
+    `literature_install` line with those lines, and a refusal also as every command's is (`refusal`). A refusal whose
+    clean-up met problems names them too. NotInWork when the version was saved (or already there) but could not be
+    put into work/."""
     lines = [] if lines is None else lines
     records = Records(layout.records)
     context = {'command': 'install-literature'}
@@ -196,8 +215,9 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
         store, envelope = open_store(layout), load_envelope(layout.owner)
         notes = []
         take_work(layout, records, store, root_fd, records.calls(), context, notes)
-        baseline = store.head()
+        baseline = None
         try:
+            baseline = store.head()                     # work/ is sealed by now: any failure puts it back
             if notes:
                 raise Refused('The pre-install workspace needed attention: ' + ' '.join(notes))
             staged, _ = stage(layout, store, baseline)
@@ -210,7 +230,7 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
             finally:
                 discard(staged)
         except BaseException as error:
-            restaged = _restage(layout, records, store, envelope, root_fd, context)
+            restaged, _ = _restage(layout, records, store, envelope, root_fd, context)
             outcome = 'refused' if isinstance(error, Refused) else 'failed'
             _note(records, {'outcome': outcome, 'baseline': baseline, 'version': None, 'lines': restaged,
                             **context}, restaged)
@@ -218,8 +238,14 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
             if isinstance(error, Refused) and restaged:
                 raise Refused(f'{error} Afterwards: {"; ".join(restaged)}') from None
             raise
-        restaged = _restage(layout, records, store, envelope, root_fd, context)
+        restaged, placed = _restage(layout, records, store, envelope, root_fd, context)
         lines += changed + restaged
-        _note(records, {'outcome': 'installed' if version != baseline else 'unchanged', 'baseline': baseline,
-                        'version': version, 'lines': changed + restaged, **context}, lines)
+        outcome = ('installed' if version != baseline else 'unchanged') + ('' if placed else '_but_not_in_work')
+        _note(records, {'outcome': outcome, 'baseline': baseline, 'version': version, 'lines': changed + restaged,
+                        **context}, lines)
+        if not placed:
+            saved = (f'Literature was installed in {version} (roll back with: rsi rollback {baseline})'
+                     if version != baseline else f'Literature was already installed in {version}')
+            raise NotInWork(f'{saved}, but work/ could not be replaced by that version, so there is no usable work/ '
+                            f'now: {"; ".join(restaged)}. Run rsi recover to put the newest version into work/.')
     return baseline, version

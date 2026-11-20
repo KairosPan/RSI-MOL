@@ -1432,6 +1432,9 @@ def gate(layout: Layout) -> str | None:
         program = native_codex(layout)
     except Refused as error:
         return f'{error} So it cannot be confirmed that the result of rsi check holds for it.'
+    if not isinstance(data.get('codex_program'), str):
+        return ('The last rsi check was made before rsi recorded which Codex program a check measured, so it cannot be '
+                'confirmed that its result holds for the one that would be started now. Run rsi check again.')
     if data.get('codex_program') != program:
         return (f'The last rsi check that passed measured the Codex program {show(data.get("codex_program"))}, and '
                 f'{show(program)} would be started now (PATH or $RSI_CODEX picks another one). Run rsi check again, '

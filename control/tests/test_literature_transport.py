@@ -3,6 +3,7 @@ no request leaves this machine), and the server itself staying up through every 
 import hashlib
 import json
 import os
+import queue
 import shutil
 import socketserver
 import subprocess
@@ -31,6 +32,7 @@ else:
     sys.modules['pypdf'] = _PYPDF
 
 CAP = 1024                      # the byte limit of the direct transport tests
+ANSWER_SECONDS = 60             # how long the server test waits for one answer of the server
 PDF = _pdf('Fetched Page')
 PROXIES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
            'no_proxy')
@@ -57,6 +59,10 @@ FAULTS = {
     'garbled': b'HTTP/1.1 2x0 OK\r\nContent-Length: 0\r\n\r\n',
     'long_header': b'HTTP/1.1 200 OK\r\nX-Long: ' + b'a' * 70000 + b'\r\n\r\n',
     'short': head('200 OK', 'Content-Type: application/pdf', 'Content-Length: 100') + PDF[:20],
+    # Neither a length nor chunks: the body ends where the connection does, here cleanly in the middle of the PDF.
+    'cut_close': b'HTTP/1.0 200 OK\r\nContent-Type: application/pdf\r\nConnection: close\r\n\r\n' + PDF[:40],
+    'whole_close': b'HTTP/1.0 200 OK\r\nContent-Type: application/pdf\r\nConnection: close\r\n\r\n' + PDF,
+    'not_xml': complete(b'this is not XML at all', 'application/xml'),
     'big': complete(b'x' * (CAP + 1)),
     'redirect': head('302 Found', 'Location: /ok', 'Content-Length: 0'),
     'ok': complete(b'{"fine": true}'),
@@ -65,7 +71,8 @@ FAULTS = {
 
 class Host:
     """An HTTP host on 127.0.0.1 that answers each path with scripted bytes; `trickle` sends one header line every
-    0.2 seconds for up to 5 seconds. replies: path -> bytes, or a function of the request target -> bytes."""
+    0.2 seconds for up to 5 seconds, `silent` sends nothing for 5 seconds. replies: path -> bytes, or a function of
+    the request target -> bytes."""
 
     def __init__(self) -> None:
         host = self
@@ -81,6 +88,9 @@ class Host:
                 host.seen.append(target)
                 path = urlsplit(target).path
                 try:
+                    if path.endswith('/silent'):
+                        time.sleep(5)
+                        return
                     if path.endswith('/trickle'):
                         self.wfile.write(b'HTTP/1.1 200 OK\r\n')
                         for number in range(25):
@@ -149,7 +159,22 @@ class Transports(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 'timeout')
                 self.assertLess(time.monotonic() - started, 3)      # each header line came well within 1 second
 
-    def test_a_truncated_download_is_never_archived(self):
+    def test_a_silent_host_is_a_timeout(self):
+        for name, attempt, error in (
+                ('fetch', lambda: transport.fetch('GET', self.host.base + 'silent', {}, None, 1, CAP),
+                 remote.RemoteError),
+                ('provider_fetch', lambda: transport.provider_fetch('GET', self.host.base + 'silent', {}, 1, CAP),
+                 providers.ProviderError)):
+            with self.subTest(name=name):
+                started = time.monotonic()
+                with self.assertRaises(error) as caught:
+                    attempt()
+                self.assertEqual(caught.exception.code, 'timeout')
+                self.assertLess(time.monotonic() - started, 3)
+
+    def acquire(self, path: str) -> tuple[dict, Path]:
+        """acquire_fulltext through the real Literature._fetch of the PDF the local host serves at path; the reply
+        and the library folder."""
         folder = tempfile.TemporaryDirectory()
         self.addCleanup(folder.cleanup)
         work, library = Path(folder.name) / 'work', Path(folder.name) / 'library'
@@ -158,15 +183,26 @@ class Transports(unittest.TestCase):
         class Native:
             def fulltext_candidates(self, provider, paper_ref):
                 return {'status': 'ok', 'provenance': {'provider': provider, 'attempt_count': 1},
-                        'data': {'candidates': [{'url': host.base + 'short', 'format': 'pdf'}]}}
+                        'data': {'candidates': [{'url': host.base + path, 'format': 'pdf'}]}}
         host = self.host
         service = Literature(Runtime(work), native=Native(), resolve=lambda url: urlsplit(url).hostname)
         response, _ = service.call('acquire_fulltext', {'paper_ref': 'MED:1', 'preferred_format': 'pdf'}, 'a' * 32)
-        self.assertEqual(response['status'], 'unavailable')
-        self.assertEqual(response['errors'][0]['code'], 'incomplete_body')
-        self.assertNotIn('document_id', response['data'])
-        self.assertEqual(response['provenance']['download_hosts'], ['127.0.0.1'])
-        self.assertEqual(list(library.rglob('*')), [])
+        return response, library
+
+    def test_a_truncated_download_is_never_archived(self):
+        # A body shorter than its length, and one cut cleanly where only the connection marked its end: the PDF has
+        # no end-of-file marker.
+        for path in ('short', 'cut_close'):
+            with self.subTest(path=path):
+                response, library = self.acquire(path)
+                self.assertEqual(response['status'], 'unavailable')
+                self.assertEqual(response['errors'][0]['code'], 'incomplete_body')
+                self.assertNotIn('document_id', response['data'])
+                self.assertEqual(response['provenance']['download_hosts'], ['127.0.0.1'])
+                self.assertEqual(list(library.rglob('*')), [])
+        response, library = self.acquire('whole_close')                # the whole PDF, delimited the same way
+        self.assertEqual(response['data']['source_sha256'], hashlib.sha256(PDF).hexdigest())
+        self.assertTrue((library / 'objects' / 'sha256' / hashlib.sha256(PDF).hexdigest()).is_file())
 
 
 class Stub:
@@ -271,20 +307,34 @@ class Server(unittest.TestCase):
         self.library = self.work.parent / 'library'
         self.library.mkdir()
         self.host.replies['search'] = self.search
-        for name, fault in (('cut.pdf', 'cut'), ('garbled.pdf', 'garbled'), ('short.pdf', 'short')):
+        for name, fault in (('cut.pdf', 'cut'), ('garbled.pdf', 'garbled'), ('short.pdf', 'short'),
+                            ('closed.pdf', 'cut_close'), ('fullTextXML', 'not_xml')):
             self.host.replies[name] = FAULTS[fault]
         self.host.replies['moved.pdf'] = head('302 Found', 'Location: /fine.pdf', 'Content-Length: 0')
         self.host.replies['fine.pdf'] = complete(PDF, 'application/pdf')
         self.proc = subprocess.Popen([sys.executable, '-B', str(tools / 'fault_server.py'),
                                       self.host.base + 'europepmc/'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, env=no_proxy_environment())
+        self.lines = queue.Queue()                  # the server's stdout, line by line, read by a thread
+        self.reader = threading.Thread(target=self.read, daemon=True)
+        self.reader.start()
         self.addCleanup(self.close)
         self.number = 0
+
+    def read(self):
+        for line in self.proc.stdout:
+            self.lines.put(line)
+        self.lines.put('')
 
     def close(self):
         if self.proc.stdin and not self.proc.stdin.closed:
             self.proc.stdin.close()
-        self.proc.wait(timeout=30)
+        try:
+            self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self.reader.join(timeout=10)
         error = self.proc.stderr.read()
         self.proc.stderr.close()
         self.proc.stdout.close()
@@ -299,6 +349,9 @@ class Server(unittest.TestCase):
         if fault is not None:
             return FAULTS[fault]
         number = query.removeprefix('EXT_ID:').split(' ')[0]
+        if number == '5':                   # an open-access PMC article: its XML full text, at .../PMC5/fullTextXML
+            paper = {'source': 'MED', 'id': number, 'title': 'A paper', 'pmcid': 'PMC5', 'isOpenAccess': 'Y'}
+            return complete(json.dumps({'hitCount': 1, 'resultList': {'result': [paper]}}).encode())
         paper = {'source': 'MED', 'id': number, 'title': 'A paper', 'fullTextUrlList': {'fullTextUrl': [
             {'availability': 'Free', 'documentStyle': 'pdf', 'url': self.host.base + FILES[number]}]}}
         return complete(json.dumps({'hitCount': 1, 'resultList': {'result': [paper]}}).encode())
@@ -308,7 +361,10 @@ class Server(unittest.TestCase):
         self.proc.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': self.number, 'method': method,
                                           'params': params or {}}) + '\n')
         self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        try:
+            line = self.lines.get(timeout=ANSWER_SECONDS)
+        except queue.Empty:
+            self.fail(f'the server did not answer {method} within {ANSWER_SECONDS} seconds')
         self.assertTrue(line, 'the server ended')
         reply = json.loads(line)
         self.assertEqual(reply['id'], self.number)
@@ -336,6 +392,9 @@ class Server(unittest.TestCase):
                   ('acquire_fulltext', {'paper_ref': 'MED:1', 'preferred_format': 'pdf'}, 'transport_failed'),
                   ('acquire_fulltext', {'paper_ref': 'MED:2', 'preferred_format': 'pdf'}, 'transport_failed'),
                   ('acquire_fulltext', {'paper_ref': 'MED:3', 'preferred_format': 'pdf'}, 'incomplete_body'),
+                  ('acquire_fulltext', {'paper_ref': 'MED:6', 'preferred_format': 'pdf'}, 'incomplete_body'),
+                  # a body that is not XML, served as XML: the parser's error is no code of its own
+                  ('acquire_fulltext', {'paper_ref': 'MED:5', 'preferred_format': 'xml'}, 'fulltext_unavailable'),
                   ('read_document', {'document_id': 'doc_' + 'f' * 64}, 'internal_error')]
         for name, arguments, code in faults:
             with self.subTest(name=name, arguments=arguments):
@@ -364,7 +423,7 @@ class Server(unittest.TestCase):
         self.assertNotIn('OPENALEX_API_KEY', json.dumps(listed))
 
 
-FILES = {'1': 'cut.pdf', '2': 'garbled.pdf', '3': 'short.pdf', '4': 'moved.pdf'}
+FILES = {'1': 'cut.pdf', '2': 'garbled.pdf', '3': 'short.pdf', '4': 'moved.pdf', '6': 'closed.pdf'}
 
 
 if __name__ == '__main__':

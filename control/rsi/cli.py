@@ -18,7 +18,7 @@ from rsi.check import CHECK_FILE, check_state, run_check
 from rsi.init import init, locked, recover
 from rsi.labrun import noting_refusals, run_task, unrecovered
 from rsi.limits import usage_by_class
-from rsi.install_literature import install_literature
+from rsi.install_literature import NotInWork, install_literature
 from rsi.meta import RELEASE_FILE, rollback, run_round
 from rsi.paths import Layout, Refused, find_layout
 from rsi.programs import clean_path, inside
@@ -515,7 +515,12 @@ def _recover(layout: Layout) -> int:
 
 def _install_literature(layout: Layout) -> int:
     lines = []
-    baseline, version = install_literature(layout, SEED / 'work', lines)
+    try:
+        baseline, version = install_literature(layout, SEED / 'work', lines)
+    except NotInWork as error:                  # saved, but not in work/: the command failed
+        _error(error)
+        _print([f'  {safe(line)}' for line in lines], sys.stderr)
+        return 1
     if baseline == version:
         out = [f'Literature already installed in {safe(version, ID_CHARS)}.']
     else:

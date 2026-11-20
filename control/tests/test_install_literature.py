@@ -5,9 +5,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from rsi import install_literature as install_module
 from rsi.install_literature import NOTE, install_literature
 from rsi.meta import rollback
 from rsi.paths import Refused
+from rsi.versions import VersionStore
 from tests.support import Root, needs_codex
 from tests.test_cli import run
 
@@ -72,6 +74,60 @@ class InstallLiterature(unittest.TestCase):
             rollback(root.layout, 'V0002', 'owner')
             self.assertEqual((folder / 'server.py').read_text(), 'my own server\n')
             self.assertTrue((folder / 'json.py').is_file())
+
+    @needs_codex
+    def test_the_labs_list_of_local_sources_is_kept_byte_for_byte(self):
+        with Root() as root:
+            folder = root.layout.work / 'tools/literature'
+            folder.mkdir(parents=True)
+            sources = b'{"mine": {"path": "papers/a.xml", "sha256": "0", "media_type": "application/xml"}}\n'
+            (folder / 'sources.json').write_bytes(sources)
+            (folder / 'server.py').write_text('my own server\n')
+            code, out, err = run('install-literature')
+            self.assertEqual((code, err), (0, ''))
+            self.assertEqual((folder / 'sources.json').read_bytes(), sources)
+            self.assertIn("tools/literature/sources.json was kept: it is the Lab's list of local sources", out)
+            self.assertIn("tools/literature/server.py was replaced by the seed's", out)
+            self.assertNotIn('sources.json was removed', out)
+            self.assertEqual({name: data for name, data in package_files(folder).items() if name != 'sources.json'},
+                             package_files(PACKAGE))
+
+    def test_a_version_saved_but_not_put_into_work_is_a_failure_of_the_command(self):
+        with Root() as root:
+            with patch('rsi.install_literature.write_home_config'), \
+                    patch('rsi.install_literature.move_in', side_effect=OSError('the rename failed')):
+                code, out, err = run('install-literature')
+            self.assertEqual(code, 1, (out, err))
+            self.assertNotIn('Literature installed', out)
+            self.assertIn('installed in V0002', err); self.assertIn('rsi rollback V0001', err)
+            self.assertIn('work/ could not be replaced by the newest version', err)
+            self.assertIn('the rename failed', err); self.assertIn('rsi recover', err)
+            self.assertEqual(root.store.head(), 'V0002')
+            note = notes(root, NOTE)[-1]
+            self.assertEqual((note['outcome'], note['version']), ('installed_but_not_in_work', 'V0002'))
+
+    def test_a_failure_to_read_the_newest_version_still_puts_work_back(self):
+        with Root() as root:
+            (root.layout.work / 'mine.txt').write_text('mine\n')
+            take_work, head = install_module.take_work, VersionStore.head
+            calls = []
+
+            def taken(*args, **kwargs):
+                take_work(*args, **kwargs)
+                calls.append('taken')
+
+            def failing_head(store):
+                if calls == ['taken']:
+                    calls.append('failed')
+                    raise RuntimeError('git failed')
+                return head(store)
+            with patch('rsi.install_literature.write_home_config'), \
+                    patch('rsi.install_literature.take_work', side_effect=taken), \
+                    patch.object(VersionStore, 'head', failing_head), self.assertRaisesRegex(RuntimeError, 'git'):
+                install_literature(root.layout, SEED)
+            self.assertEqual(calls, ['taken', 'failed'])
+            self.assertEqual((root.layout.work / 'mine.txt').read_text(), 'mine\n')     # V0002, back in work/
+            self.assertEqual(notes(root, NOTE)[-1]['outcome'], 'failed')
 
     def test_a_literature_server_the_lab_changed_is_refused_and_work_is_kept(self):
         with Root() as root:

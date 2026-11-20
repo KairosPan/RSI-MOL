@@ -23,6 +23,8 @@ DOWNLOAD_BYTES = documents.MAX_SOURCE_BYTES
 TIMEOUT = 20
 XML_TYPES = {'application/xml', 'text/xml', 'application/jats+xml', 'application/tei+xml'}
 XML_FORMATS = {'xml', 'jats', 'tei'}
+PDF_END = b'%%EOF'
+PDF_END_WINDOW = 1024           # how near the end (trailing white space aside) a whole PDF has its end marker
 
 
 def choice(*values):
@@ -166,6 +168,11 @@ def media_format(raw, content_type, declared):
     media = content_type.split(';')[0].strip().lower()
     if declared == 'pdf':
         if media == 'application/pdf' and raw.lstrip().startswith(b'%PDF-'):
+            # A body that only the closed connection ended can be cut off cleanly: a PDF without its end marker is
+            # an incomplete download, never an original.
+            if PDF_END not in raw.rstrip()[-PDF_END_WINDOW:]:
+                raise remote.RemoteError('incomplete_body', 'The PDF ends before its end-of-file marker',
+                                         dispatched=True)
             return media
     elif declared in XML_FORMATS:
         if media in XML_TYPES and b'<!ENTITY' not in raw.replace(b'\0', b'').upper():
@@ -310,7 +317,8 @@ class Literature:
             else:
                 raise ValueError('Full-text redirect limit reached')
         except (remote.RemoteError, OSError, ValueError, ET.ParseError) as exc:
-            return failure(getattr(exc, 'code', 'fulltext_unavailable'),
+            code = getattr(exc, 'code', None)               # ET.ParseError has one too: a number
+            return failure(code if isinstance(code, str) else 'fulltext_unavailable',
                            'The public endpoint or its response did not meet the download contract.',
                            provider=provider, status='unavailable')
         manifest = self.runtime.ingest(raw, media, {'provider': provider, 'paper_ref': paper_ref,

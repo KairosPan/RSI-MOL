@@ -143,6 +143,20 @@ def _body(response, deadline, max_bytes):
     return b''.join(chunks)
 
 
+def _timed_out(error, deadline):
+    """Whether a fault is the end of the exchange's time: the deadline passed, or a socket's own time-out (never set
+    to end before the deadline) ended a step, as error, its reason or a cause of it."""
+    if deadline.expired or deadline.remaining() <= 0:
+        return True
+    seen = set()
+    while error is not None and id(error) not in seen:
+        seen.add(id(error))
+        if isinstance(error, TimeoutError) or isinstance(getattr(error, 'reason', None), TimeoutError):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def _exchange(method, url, headers, body, timeout, max_bytes, redirect):
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) \
             or not 0 < timeout <= 120:
@@ -163,7 +177,7 @@ def _exchange(method, url, headers, body, timeout, max_bytes, redirect):
     except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError) as error:
         if isinstance(error, (remote.RemoteError, providers.ProviderError)):
             raise
-        raise _Fault('timeout' if deadline.expired else 'transport_failed') from error
+        raise _Fault('timeout' if _timed_out(error, deadline) else 'transport_failed') from error
     finally:
         deadline.close()
 

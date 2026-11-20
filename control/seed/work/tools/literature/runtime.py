@@ -286,8 +286,8 @@ class Runtime:
             host = urlsplit(request.get("url", "")).hostname
             if host:
                 hosts.add(host)
-        errors = [{"code": _clean(error.get("code", ""))[:128],
-                   "detail": _clean(error.get("detail", ""))[:512]} for error in result.get("errors", [])[:32]]
+        errors = [{"code": _clean(str(error.get("code", "")))[:128],
+                   "detail": _clean(str(error.get("detail", "")))[:512]} for error in result.get("errors", [])[:32]]
         row = {"at": datetime.now(timezone.utc).isoformat(), "invocation_id": call_id, "tool": _clean(operation)[:128],
                "inputs": _clean(inputs),
                "requested_source": _clean(requested)[:128] if isinstance(requested, str) else provider,
