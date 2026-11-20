@@ -11,12 +11,15 @@ instead, and never commits: it is Meta's evidence, cost class `meta`.
 
 Whatever the Lab leaves behind must never block, crash or starve a later run, and a finished call keeps its status
 and usage:
-- before a call, a failure (the workspace or git included) is a Refused, noted in records/index.jsonl; a bad
-  request is a ValueError;
-- once a call has started it is always finished; after Codex has ended, a failing step becomes a line of the call's
-  `problems` and never changes its status or usage;
 - before every commit the workspace is made storable (rsi.workspace.prepare_for_commit): what git refuses is renamed
-  or moved to library/moved/, and reported.
+  or moved to library/moved/, and reported;
+- before a call, if preparing or committing the workspace still fails, the workspace is quarantined (set apart whole
+  under quarantine/), the last version (task: main's head; trial: the trial commit) is checked out into a fresh
+  folder, a `quarantine` note is written, and the run goes on with a problem line; only if that fails too is the run
+  Refused. Other refusals are noted in records/index.jsonl; a bad request is a ValueError;
+- once a call has started it is always finished; after Codex has ended, a failing step becomes a line of the call's
+  `problems` and never changes its status or usage. If the Lab's commit fails, work/ is quarantined and main's head
+  restored at once, so nothing of that state is later committed as the owner's.
 The workspace is the Lab's and the control program runs outside every sandbox, so nothing in it is followed through
 a link.
 """
@@ -38,7 +41,7 @@ from rsi.sessions import collect_sessions
 from rsi.settings import Settings, load_settings
 from rsi.tasks import Task, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
 from rsi.versions import VersionStore
-from rsi.workspace import clear, empty_folder, prepare_for_commit, real_folder
+from rsi.workspace import clear, empty_folder, kind, open_folder, prepare_for_commit, quarantine, real_folder
 
 MANUAL = 'owner (manual)'
 PROBE = 'probe'                 # the results folder of a probe: out/probe/
@@ -119,8 +122,17 @@ def _store(layout: Layout) -> VersionStore:
 
 
 def _no_codex_entry(workspace: Path) -> None:
-    if os.path.lexists(workspace / '.codex'):
-        raise Refused(f'{workspace} 里有 .codex，不能在这里启动 Lab Codex：请先移走它。')
+    """Refused if the workspace holds a `.codex` entry. A workspace that is not a usable folder is not judged here:
+    preparing it fails, and it is quarantined."""
+    try:
+        fd = open_folder(workspace)
+    except OSError:
+        return
+    try:
+        if kind('.codex', fd) is not None:
+            raise Refused(f'{workspace} 里有 .codex，不能在这里启动 Lab Codex：请先移走它。')
+    finally:
+        os.close(fd)
 
 
 def _within(path: str, folder: str) -> bool:
@@ -158,38 +170,64 @@ def _common_fields(settings: Settings, config: dict, limits: Limits) -> dict:
 
 
 def _uncommitted(calls: list[dict]) -> str | None:
-    """The id of the last task run if its changes to work/ never became a version (its commit failed, or it was
-    interrupted), else None."""
+    """The id of the last task run if its changes may still be in work/ without having become a version (its commit
+    failed and work/ was not restored, or it was interrupted), else None."""
     for call in reversed(calls):
         if call.get('purpose') == 'task':
-            failed = call.get('commit_failed') is True or call.get('status') == 'interrupted'
+            failed = (call.get('commit_failed') is True and call.get('workspace_restored') is not True
+                      or call.get('status') == 'interrupted')
             return call['id'] if failed and isinstance(call.get('id'), str) else None
     return None
 
 
 def _commit_manual(store: VersionStore, layout: Layout, calls: list[dict]) -> list[str]:
     """Commit what changed in work/ since the last version, once it is made storable; return the notes. Changes left
-    by a Lab run whose own commit failed (or that was interrupted) are named after that run."""
-    with _refusing('work/ 整理不了'):
-        notes = prepare_for_commit(layout.work, layout.library, 'manual')
+    by a Lab run whose own commit failed (or that was interrupted) are named after that run. Raises what preparing or
+    committing raises (WORKSPACE_ERRORS)."""
+    notes = prepare_for_commit(layout.work, layout.library, 'manual')
     previous = _uncommitted(calls)
     if previous is None:
         author, message = MANUAL, '运行前发现的人工改动'
     else:
         author, message = f'owner (manual) with lab {previous}', f'运行前发现的改动，含 Lab 运行 {previous} 没能存成版本的改动'
-    with _refusing('work/ 里有改动，但存不成版本'):
-        store.commit(layout.work, author, message)
+    store.commit(layout.work, author, message)
     return notes
+
+
+def _rescue(layout: Layout, records: Records, store: VersionStore, workspace: Path, version: str, label: str,
+            error: BaseException, context: dict) -> str:
+    """Before a call: quarantine a workspace that could not be prepared or committed, check `version` (a version
+    name or commit) out into the fresh folder, note it, and return the problem line for the call. Refused if the
+    quarantine or the checkout fails too."""
+    reason = f'{type(error).__name__}: {error}'
+    try:
+        moved = quarantine(layout, workspace, label)
+        store.checkout(version, workspace)
+    except WORKSPACE_ERRORS as second:
+        raise Refused(f'{workspace.name}/ 准备不了（{reason}），隔离它也失败了：{type(second).__name__}: {second}') from None
+    where = moved.relative_to(layout.root).as_posix() if moved is not None else None
+    records.note('quarantine', {'workspace': workspace.name, 'moved_to': where, 'reason': reason,
+                                'restored': version, **context})
+    return f'{workspace.name}/ 准备不了（{reason}），已整个隔离到 {where}，并从 {version} 重新检出'
 
 
 def _prepare(run: _Run) -> None:
     """Make the workspace ready: a real .tmp folder (TMPDIR and TMPPREFIX point into it), no stale results, the
     task's inputs."""
-    with _refusing('工作区准备不了'):
-        run.notes += real_folder(run.workspace, '.tmp')
-        run.notes += clear(run.workspace, 'out', run.out_name, report=True)
-        if run.task is not None:
-            run.notes += place_inputs(run.task, run.workspace)
+    run.notes += real_folder(run.workspace, '.tmp')
+    run.notes += clear(run.workspace, 'out', run.out_name, report=True)
+    if run.task is not None:
+        run.notes += place_inputs(run.task, run.workspace)
+
+
+def _prepare_or_rescue(layout: Layout, records: Records, store: VersionStore, run: _Run, version: str, label: str,
+                       context: dict) -> None:
+    try:
+        _prepare(run)
+    except WORKSPACE_ERRORS as error:
+        run.notes.append(_rescue(layout, records, store, run.workspace, version, label, error, context))
+        with _refusing('工作区准备不了'):
+            _prepare(run)
 
 
 def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dict:
@@ -198,11 +236,15 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
     resolve looks up the hosts of URL tool servers (socket.getaddrinfo; tests pass a stand-in)."""
     task = load_task(layout.tasks, task_id)
     records = Records(layout.records)
-    with _noting_refusals(records, {'purpose': 'task', 'task': task.id}):
+    context = {'purpose': 'task', 'task': task.id}
+    with _noting_refusals(records, context):
         limits, calls = _admit(layout, records)
-        _no_codex_entry(layout.work)
         store = _store(layout)
-        notes = _commit_manual(store, layout, calls)
+        _no_codex_entry(layout.work)
+        try:
+            notes = _commit_manual(store, layout, calls)
+        except WORKSPACE_ERRORS as error:
+            notes = [_rescue(layout, records, store, layout.work, store.head(), 'work', error, context)]
         version_before = store.head()
         envelope = load_envelope(layout.owner)
         settings = load_settings(layout.work)
@@ -215,7 +257,7 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
                   'tree': store.tree_of(version_before), 'settings_problems': settings_problems}
         run = _Run(layout.work, False, task, task.id, prompt_for(task), config, limits.lab_seconds, fields, notes,
                    version_before=version_before)
-        _prepare(run)
+        _prepare_or_rescue(layout, records, store, run, version_before, 'work', context)
     return _execute(layout, records, store, run)
 
 
@@ -232,14 +274,18 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
     if probe is not None and (not isinstance(probe, str) or not probe.strip() or len(probe) > PROBE_LIMIT):
         raise ValueError(f'测试文字必须是非空文本，最多 {PROBE_LIMIT} 个字符。')
     records = Records(layout.records)
-    with _noting_refusals(records, {'purpose': 'trial', 'round': round_id, 'task': task_id}):
+    context = {'purpose': 'trial', 'round': round_id, 'task': task_id}
+    with _noting_refusals(records, context):
         store = _store(layout)
         commit_id = store.resolve(commit)                   # ValueError: a bad request, whatever the limits
         limits, _ = _admit(layout, records)
-        with _refusing('trial/ 准备不了'):
+        notes = []
+        try:
             layout.trial.mkdir(exist_ok=True)
             empty_folder(layout.trial)                      # whatever an earlier trial left, never followed
             store.checkout(commit_id, layout.trial)
+        except WORKSPACE_ERRORS as error:
+            notes.append(_rescue(layout, records, store, layout.trial, commit_id, 'trial', error, context))
         _no_codex_entry(layout.trial)
         envelope = load_envelope(layout.owner)
         write_home_config(layout, envelope, load_settings(layout.work), resolve=resolve)
@@ -254,8 +300,8 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
             prompt, out_name = prompt_for(task), task.id
         else:
             prompt, out_name = probe.rstrip() + '\n\n' + results_sentence(PROBE) + '\n', PROBE
-        run = _Run(layout.trial, True, task, out_name, prompt, config, limits.lab_seconds, fields)
-        _prepare(run)
+        run = _Run(layout.trial, True, task, out_name, prompt, config, limits.lab_seconds, fields, notes)
+        _prepare_or_rescue(layout, records, store, run, commit_id, 'trial', context)
     return _execute(layout, records, store, run)
 
 
@@ -296,9 +342,11 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     end = {'status': result.status, 'exit_code': result.exit_code, 'thread_id': result.thread_id,
            'usage': result.usage, 'command': result.command, 'ended': _now(), 'check': None,
            'subagent_threads': [], 'version_after': None}
+    if not run.trial:
+        end['commit_failed'] = True                 # until the Lab's commit succeeds, whatever stops collecting
     problems = list(run.notes)
     try:
-        _collect(layout, store, run, call_id, call_dir, result, end, problems)
+        _collect(layout, records, store, run, call_id, call_dir, result, end, problems)
     except BaseException as error:                  # only an interruption gets here: each step catches Exception
         problems.append(f'收取结果时被打断（{type(error).__name__}），其余步骤没有做')
         _remove_inputs_quietly(run)
@@ -310,8 +358,8 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     return records.finish_call(call_id, {**end, 'problems': problems})
 
 
-def _collect(layout: Layout, store: VersionStore, run: _Run, call_id: str, call_dir: Path, result, end: dict,
-             problems: list[str]) -> None:
+def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, call_id: str, call_dir: Path, result,
+             end: dict, problems: list[str]) -> None:
     """Everything after the Codex call, into end and problems; each failing step becomes a problem line."""
     if result.thread_id is not None:
         with _problem(problems, '没能取出会话记录'):
@@ -332,10 +380,12 @@ def _collect(layout: Layout, store: VersionStore, run: _Run, call_id: str, call_
         with _problem(problems, '试跑后的工作区算不出版本树'):
             end['tree_after'] = store.tree_of_dir(run.workspace)
         return
-    end['commit_failed'] = True
     with _problem(problems, '工作区没能存成新版本'):
         end['version_after'] = store.commit(run.workspace, f'lab {call_id}', f'Lab 运行 {call_id}（任务 {run.task.id}）')
         end['commit_failed'] = False
+    if end['commit_failed']:
+        with _problem(problems, 'work/ 没能隔离并恢复'):
+            _restore_work(layout, records, store, call_id, end, problems)
     diff = ''
     if end['version_after'] is not None:
         with _problem(problems, f'没能算出 {run.version_before} 到 {end["version_after"]} 的差异'):
@@ -343,3 +393,17 @@ def _collect(layout: Layout, store: VersionStore, run: _Run, call_id: str, call_
     with _problem(problems, '没能写 diff.patch'):
         with open(call_dir / 'diff.patch', 'x', encoding='utf-8') as stream:
             stream.write(diff)
+
+
+def _restore_work(layout: Layout, records: Records, store: VersionStore, call_id: str, end: dict,
+                  problems: list[str]) -> None:
+    """After a Lab commit that failed: quarantine work/ and check main's head out into a fresh folder, so the next run
+    starts clean and nothing of this state is ever committed as the owner's."""
+    head = store.head()
+    moved = quarantine(layout, layout.work, f'work-{call_id}')
+    store.checkout(head, layout.work)
+    where = moved.relative_to(layout.root).as_posix() if moved is not None else None
+    records.note('quarantine', {'workspace': 'work', 'moved_to': where, 'reason': 'Lab 的改动存不成版本',
+                                'restored': head, 'call': call_id})
+    end['workspace_restored'] = True
+    problems.append(f'work/ 存不成版本，已整个隔离到 {where}，并从 {head} 重新检出；这次运行的改动没有进版本')

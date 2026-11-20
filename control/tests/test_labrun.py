@@ -195,9 +195,11 @@ class MoreLabRuns(unittest.TestCase):
             with mock.patch('rsi.labrun.run_codex', side_effect=KeyboardInterrupt):
                 with self.assertRaises(KeyboardInterrupt): run_task(root.layout, 'T1')
             root.add_task('T2', check=PASS_CHECK, inputs={'data.txt': 'd'}); root.model.push(say('ok'))
+            (root.layout.work / 'left.txt').write_text('what the interrupted run left')
             with mock.patch('rsi.labrun.run_check', side_effect=KeyboardInterrupt):     # while collecting
                 with self.assertRaises(KeyboardInterrupt): run_task(root.layout, 'T2')
             first, second = root.records.calls()
+            self.assertEqual(root.store.log()[0]['author'], f'owner (manual) with lab {first["id"]}')
             self.assertEqual((first['status'], first['usage']), ('interrupted', None))
             # Codex had ended: the call keeps its status and usage, and says what was not done.
             self.assertEqual((second['status'], second['usage']['input_tokens']), ('finished', 0))
@@ -228,29 +230,81 @@ class MoreLabRuns(unittest.TestCase):
             self.assertTrue(any('library/moved/manual/a' in line for line in call['problems']))
             self.assertFalse(os.path.lexists(work / 'out'))
 
-    def test_a_git_failure_after_the_call_keeps_its_status_and_usage(self):
+    def test_git_failing_before_and_after_the_call_quarantines_and_keeps_status_and_usage(self):
         with Root() as root:
-            root.add_task('T1'); root.model.push(add_file('notes/n.md', 'x'), with_usage(say('ok'), 5, 2))
-            original = VersionStore.commit
+            root.add_task('T1'); (root.layout.work / 'mine.txt').write_text('an owner edit')
+            root.model.push(add_file('notes/n.md', 'x'), with_usage(say('ok'), 5, 2))
+            original, failures = VersionStore.commit, []
 
-            def commit(store, folder, author, message):
-                if author.startswith('lab '):
+            def commit(store, folder, author, message):          # the first two commits time out
+                if len(failures) < 2:
+                    failures.append(author)
                     raise subprocess.TimeoutExpired(['git', 'add'], 600)
                 return original(store, folder, author, message)
 
             with mock.patch.object(VersionStore, 'commit', commit):
                 call = run_task(root.layout, 'T1')
+            self.assertEqual(failures, ['owner (manual)', f'lab {call["id"]}'])
             self.assertEqual((call['status'], call['usage']['input_tokens'], call['usage']['output_tokens']),
                              ('finished', 5, 2))
-            self.assertEqual((call['version_after'], call['commit_failed']), (None, True))
+            self.assertEqual((call['version_after'], call['commit_failed'], call['workspace_restored']),
+                             (None, True, True))
             self.assertTrue(any('TimeoutExpired' in line for line in call['problems']))
+            self.assertTrue(any('quarantine/work-1' in line for line in call['problems']))          # before the call
+            self.assertTrue(any(f'quarantine/work-{call["id"]}-1' in line for line in call['problems']))   # after
             self.assertEqual(root.records.load_call(call['id'])['status'], 'finished')
+            self.assertEqual(root.store.tree_of_dir(root.layout.work), root.store.tree_of('V0001'))
+            self.assertEqual((root.layout.root / 'quarantine' / 'work-1' / 'mine.txt').read_text(), 'an owner edit')
+            self.assertEqual(len([line for line in self.index(root) if line['kind'] == 'quarantine']), 2)
             root.model.push(say('again'))
             second = run_task(root.layout, 'T1')
-            self.assertEqual(second['version_before'], 'V0002')
-            newest = root.store.log()[0]
-            self.assertEqual(newest['author'], f'owner (manual) with lab {call["id"]}')
-            self.assertIn(call['id'], newest['message'])
+            self.assertEqual((second['status'], second['version_before']), ('finished', 'V0001'))
+            self.assertEqual([entry['author'] for entry in root.store.log()], ['owner'])     # no owner version
+
+    def test_a_workspace_replaced_by_a_link_is_quarantined_and_the_run_goes_on(self):
+        with Root() as root:
+            root.add_task('T1'); outside = root.layout.root / 'outside'; outside.mkdir()
+            (outside / 'x').write_text('x')
+            os.rename(root.layout.work, root.layout.root / 'work-old'); os.symlink(outside, root.layout.work)
+            root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
+            self.assertEqual(os.listdir(outside), ['x'])
+            self.assertTrue((root.layout.root / 'quarantine' / 'work-1').is_symlink())
+            self.assertFalse(root.layout.work.is_symlink())
+            self.assertEqual((root.layout.work / 'AGENTS.md').read_text(), 'hello\n')
+            notes = [line for line in self.index(root) if line['kind'] == 'quarantine']
+            self.assertEqual((len(notes), notes[0]['moved_to'], notes[0]['restored']),
+                             (1, 'quarantine/work-1', 'V0001'))
+            self.assertTrue(any('quarantine/work-1' in line for line in call['problems']))
+
+    def test_an_unreadable_workspace_is_quarantined_and_the_run_goes_on(self):
+        with Root() as root:
+            root.add_task('T1'); (root.layout.work / 'mine.txt').write_text('m'); root.layout.work.chmod(0)
+            root.model.push(say('ok'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
+            self.assertEqual((root.layout.root / 'quarantine' / 'work-1' / 'mine.txt').read_text(), 'm')
+            self.assertTrue(any(line['kind'] == 'quarantine' for line in self.index(root)))
+            self.assertTrue(any('quarantine/work-1' in line for line in call['problems']))
+
+    def test_a_trial_folder_replaced_by_a_link_is_quarantined(self):
+        with Root() as root:
+            outside = root.layout.root / 'outside'; outside.mkdir(); (outside / 'x').write_text('x')
+            root.layout.trial.rmdir(); os.symlink(outside, root.layout.trial); root.model.push(say('hi'))
+            call = run_trial(root.layout, commit=root.store.resolve('V0001'), round_id='M0001', probe='说一声你好')
+            self.assertEqual(call['status'], 'finished'); self.assertEqual(os.listdir(outside), ['x'])
+            self.assertTrue((root.layout.root / 'quarantine' / 'trial-1').is_symlink())
+            self.assertTrue(any('quarantine/trial-1' in line for line in call['problems']))
+
+    def test_an_unusable_library_never_lets_a_big_file_reach_git(self):
+        with Root() as root:
+            root.add_task('T1'); (root.layout.work / 'big.bin').write_text('x' * 20); root.layout.library.chmod(0)
+            root.model.push(say('ok'))
+            with mock.patch.object(workspace, 'BIG_FILE', 10):
+                call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
+            self.assertTrue((root.layout.library / 'moved' / 'manual' / 'big.bin').is_file())
 
     def test_unreadable_and_oversize_files_never_block_a_run(self):
         with Root() as root:

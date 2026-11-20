@@ -38,6 +38,26 @@ def scratch_config(root: Path, workspace: Path) -> dict:
             'permissions': {'lab': {'filesystem': filesystem, 'network': {'enabled': False}}}}
 
 
+def force_remove(path: Path) -> None:
+    """Remove a test folder whatever the test left in it: flags, folders with mode 000 (links are not followed)."""
+    def unlock(entry: str) -> None:
+        try:
+            os.chflags(entry, 0, follow_symlinks=False)
+        except (AttributeError, NotImplementedError, OSError):
+            pass
+        if not os.path.islink(entry):
+            try:
+                os.chmod(entry, 0o700)
+            except OSError:
+                pass
+
+    unlock(str(path))
+    for top, folders, files in os.walk(path):
+        for name in folders + files:
+            unlock(os.path.join(top, name))
+    shutil.rmtree(path, ignore_errors=True)
+
+
 class Root:
     """A temporary RSI root, as a context manager: every folder of the layout; owner/lab-envelope.toml (approval
     never, no apps, no plugins); owner/limits.toml with the defaults; a version store whose V0001 is work/ holding
@@ -79,7 +99,7 @@ class Root:
         if self.model is not None:
             self.model.stop()
         self._environment.stop()
-        shutil.rmtree(self.path, ignore_errors=True)
+        force_remove(self.path)
         return False
 
     def add_task(self, task_id: str, check: str | None = None, sections: dict | None = None,

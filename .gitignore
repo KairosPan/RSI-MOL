@@ -10,3 +10,4 @@ versions/
 .rsi.lock
 .superpowers/
 __pycache__/
+quarantine/
