@@ -22,13 +22,16 @@ from urllib.parse import urlsplit
 from rsi.codexrun import codex_program
 from rsi.paths import Layout, Refused
 from rsi.settings import EFFORTS, MODEL, ROLE, SETTINGS, Settings, is_workspace_path, show
-from rsi.tomlout import render_file
+from rsi.tomlout import render_file, toml_value
 
 ENVELOPE = 'lab-envelope.toml'
 ENVELOPE_TABLES = ('features', 'apps', 'plugins', 'rsi')
 TOOL_FOLDERS = ('/opt/homebrew/bin', '/opt/homebrew/Cellar', '/opt/homebrew/opt', '/opt/homebrew/lib',
                 '/opt/homebrew/share', '/opt/homebrew/etc/fonts')
 SYSTEM_PATH = '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
+# Shared temp folders. `:minimal` leaves them writable, so every profile denies them by their real paths (agents
+# would otherwise pass data through them); each run's TMPDIR is inside its own workspace instead.
+TEMP_FOLDERS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp')
 # The PATH of the unsandboxed `codex sandbox` wrapper: nothing an agent can write.
 WRAPPER_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
 # (system, machine) → (npm platform package, target triple), as in the npm package's bin/codex.js.
@@ -38,7 +41,8 @@ NATIVE_TARGETS = {('Darwin', 'arm64'): ('codex-darwin-arm64', 'aarch64-apple-dar
                   ('Linux', 'aarch64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl'),
                   ('Linux', 'arm64'): ('codex-linux-arm64', 'aarch64-unknown-linux-musl')}
 HOW_TO_SET_CODEX = ('请把 $RSI_CODEX 设成 Codex 原生程序的绝对路径（npm 安装的在 '
-                    '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），它不能在 RSI 文件夹里')
+                    '…/@openai/codex/node_modules/@openai/codex-<平台>/vendor/<目标>/bin/codex），'
+                    '它不能在 RSI 文件夹或 /tmp 这类公用临时文件夹里')
 NETWORK_OFF = {'enabled': False}
 NETWORK_ON = {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}}
 
@@ -68,8 +72,10 @@ def load_envelope(owner: Path) -> dict:
         data = tomllib.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
         raise Refused(f'找不到 {path}，Lab 的对外范围没有定义') from None
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as error:
         raise Refused(f'{path} 读不了：{" ".join(str(error).split())}') from None
+    if 'projects' in data:
+        raise Refused(f'{path} 里不能有 projects 表：受信任的项目会让那个文件夹里的 .codex/config.toml 覆盖 Lab 的配置')
     unknown = sorted(set(data) - {'approval_policy', *ENVELOPE_TABLES})
     if unknown:
         raise Refused(f'{path} 里有不认识的键：{"、".join(unknown)}')
@@ -94,14 +100,44 @@ def _within(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder.rstrip('/') + '/')
 
 
+def _inside(path: str, folder: str) -> bool:
+    """Whether path is folder or lies under it, never judged by spelling alone: by file identity (os.path.samestat
+    of the path and each of its ancestors against the folder) where they exist, and also by case-insensitive
+    spelling of their absolute and real forms, so a path in another letter case is caught; it refuses more, not
+    less."""
+    forms = {os.path.abspath(path), os.path.realpath(path)}
+    limits = {os.path.abspath(folder), os.path.realpath(folder)}
+    if any(_within(form.casefold(), limit.casefold()) for form in forms for limit in limits):
+        return True
+    try:
+        target = os.stat(folder)
+    except OSError:
+        return False
+    for form in forms:
+        for ancestor in (form, *map(str, Path(form).parents)):
+            try:
+                if os.path.samestat(os.stat(ancestor), target):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def temp_folders() -> list[str]:
+    """The real paths of the shared temp folders that exist, each once."""
+    out = []
+    for folder in TEMP_FOLDERS:
+        if os.path.exists(folder) and os.path.realpath(folder) not in out:
+            out.append(os.path.realpath(folder))
+    return out
+
+
 def _extra_read(layout: Layout, envelope: dict) -> list[str]:
     """The owner's extra read-only folders; one inside the RSI root or an everyday Codex home is refused."""
     out = []
     for folder in _extra_read_list(envelope, ENVELOPE):
-        forms = {os.path.normpath(folder), os.path.realpath(folder)}
         for forbidden in (str(layout.root), *_homes()):
-            limits = {os.path.normpath(forbidden), os.path.realpath(forbidden)}
-            if any(_within(form, limit) for form in forms for limit in limits):
+            if _inside(folder, forbidden):
                 raise Refused(f'{ENVELOPE} 的 rsi.extra_read 里 {folder!r} 在 {forbidden} 里面，不能放开')
         out.append(os.path.normpath(folder))
     return out
@@ -117,8 +153,8 @@ def _filesystem(layout: Layout, envelope: dict, workspace: Path) -> dict:
              str(layout.library): 'write', str(layout.env): 'write', str(layout.lab_home / 'plugins' / 'cache'): 'read'}
     for folder in _tool_folders() + _extra_read(layout, envelope):
         table.setdefault(folder, 'read')
-    for home in _homes():
-        table[home] = 'deny'
+    for closed in temp_folders() + list(_homes()):
+        table[closed] = 'deny'
     return table
 
 
@@ -166,18 +202,17 @@ def native_codex(layout: Layout) -> str:
 
     $RSI_CODEX must be absolute when set; otherwise `codex` is looked up in the control program's own PATH. An npm
     shim (`#!/usr/bin/env node`, which would look node up in a PATH) is followed to its package's native program.
-    The result must exist, be executable, not be a script, and lie outside the RSI root, which agents can write;
-    anything else is refused rather than guessed.
+    The result must exist, be executable, not be a script, and lie outside the RSI root (which agents can write)
+    and outside the shared temp folders (which anyone can write); anything else is refused rather than guessed.
     """
     program = codex_program()
     if 'RSI_CODEX' in os.environ and not os.path.isabs(program):
         raise Refused(f'$RSI_CODEX 必须是绝对路径，现在是 {program!r}。{HOW_TO_SET_CODEX}')
     found = program if os.path.isabs(program) else shutil.which(program)
-    roots = {os.path.normpath(layout.root), os.path.realpath(layout.root)}
+    reachable = [str(layout.root), *TEMP_FOLDERS, *temp_folders()]       # what an agent or anyone may write
 
     def outside(path: str) -> bool:
-        return not any(_within(form, root) for form in (os.path.abspath(path), os.path.realpath(path))
-                       for root in roots)
+        return not any(_inside(path, folder) for folder in reachable)
 
     if not found or not os.path.isfile(found) or not outside(found):
         raise Refused(f'找不到可用的 Codex 程序（{program!r}）。{HOW_TO_SET_CODEX}')
@@ -190,22 +225,26 @@ def native_codex(layout: Layout) -> str:
     raise Refused(f'{found} 不是 Codex 的原生程序，也找不到它对应的原生程序。{HOW_TO_SET_CODEX}')
 
 
-def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, codex: str) -> dict:
+def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, codex: str, permissions: dict) -> dict:
     """A local tool server started through `codex sandbox` under the run's profile, or its _net variant when the
     server has network. Workspace paths in its command and arguments become absolute paths in this workspace.
     (load_settings has already left out a server whose paths leave the workspace.)
 
     The wrapper itself runs outside the sandbox, so it is the native program with a PATH no agent can write; the
-    Lab's PATH (with env/bin first) is set by /usr/bin/env inside the sandbox."""
+    Lab's PATH (with env/bin first) is set by /usr/bin/env inside the sandbox. The four profiles (and the proxy
+    feature) travel on the wrapper's own command line, so its confinement does not depend on codex-home/config.toml
+    or on the folder it is started in."""
     command = server['command']
     if '/' in command and not os.path.isabs(command):
         command = str(workspace / os.path.normpath(command))
     args = [str(workspace / os.path.normpath(arg)) if is_workspace_path(arg, workspace) else arg
             for arg in server['args']]
+    sandbox = ['sandbox', '-c', 'permissions=' + toml_value(permissions)]
     if server['network']:
-        sandbox = ['sandbox', '-P', profile + '_net', '--enable', 'network_proxy']
+        sandbox += ['-c', 'features=' + toml_value({'network_proxy': True}), '-P', profile + '_net',
+                    '--enable', 'network_proxy']
     else:
-        sandbox = ['sandbox', '-P', profile]
+        sandbox += ['-P', profile]
     return {'command': codex, 'args': [*sandbox, '--', '/usr/bin/env', 'PATH=' + _path(layout), command, *args],
             'env': {'CODEX_HOME': str(layout.lab_home), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
@@ -349,8 +388,9 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     refused = _url_server_problems(envelope, settings, resolve)
     kept = {name: server for name, server in settings.tool_servers.items() if name not in refused}
     codex = native_codex(layout) if any('url' not in server for server in kept.values()) else None
-    servers = {name: dict(server) if 'url' in server else _local_server(layout, workspace, base, server, codex)
-               for name, server in kept.items()}
+    permissions = profiles(layout, envelope)
+    servers = {name: dict(server) if 'url' in server
+               else _local_server(layout, workspace, base, server, codex, permissions) for name, server in kept.items()}
     config.update({
         'features': features,
         'shell_environment_policy': _shell(layout, workspace),
@@ -358,7 +398,7 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
         'apps': _disabled(envelope.get('apps', {}), settings.disabled_connectors, 'connectors', settings.problems),
         'plugins': _disabled(envelope.get('plugins', {}), settings.disabled_plugins, 'plugins', settings.problems),
         'mcp_servers': servers,
-        'permissions': profiles(layout, envelope),
+        'permissions': permissions,
     })
     return config
 
@@ -372,8 +412,8 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
                   str(layout.meta / '.codex'): 'read', str(layout.candidate / '.codex'): 'read'}
     for folder in _tool_folders():
         filesystem.setdefault(folder, 'read')
-    for home in _homes():
-        filesystem[home] = 'deny'
+    for closed in temp_folders() + list(_homes()):
+        filesystem[closed] = 'deny'
     config = {'approval_policy': 'never', 'default_permissions': 'meta'}
     for key in ('model', 'model_reasoning_effort'):
         value = meta_settings.get(key)
@@ -394,7 +434,13 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
 
 def write_home_config(layout: Layout, envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo) -> None:
     """codex-home/config.toml for opening the Lab Codex by hand: the task-run configuration, but interactive,
-    with the role copies of work/ written first."""
-    text = render_file(lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve))
+    with the role copies of work/ written first.
+
+    It never holds a `projects` table: a trusted project would let a `.codex/config.toml` in that folder override
+    this configuration. (Rewriting the file also drops any trust Codex itself recorded during manual use.)"""
+    config = lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve)
+    if 'projects' in config:
+        raise Refused('Lab 的 Codex 配置里不能有 projects 表')
+    text = render_file(config)
     write_role_files(layout, settings, trial=False)
     _replace(layout.lab_home / 'config.toml', text)

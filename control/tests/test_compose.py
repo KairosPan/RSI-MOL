@@ -7,16 +7,17 @@ import subprocess
 import tempfile
 import tomllib
 import unittest
+import uuid
 from pathlib import Path
 from unittest import mock
 
 from rsi.codexrun import codex_program, run_codex
-from rsi.compose import (NATIVE_TARGETS, lab_config, load_envelope, meta_config, profiles, tool_server_problems,
-                          write_home_config, write_role_files)
+from rsi.compose import (NATIVE_TARGETS, lab_config, load_envelope, meta_config, native_codex, profiles,
+                          temp_folders, tool_server_problems, write_home_config, write_role_files)
 from rsi.mockmodel import ScriptedModel, run_js, say
 from rsi.paths import Layout, Refused
 from rsi.settings import load_settings
-from rsi.tomlout import render_file, render_flags
+from rsi.tomlout import render_file, render_flags, toml_value
 from tests.support import needs_codex
 
 LITERATURE = 'name = "literature"\ndescription = "d"\ndeveloper_instructions = "i"\n'
@@ -132,9 +133,11 @@ class ComposeTests(unittest.TestCase):
         c = lab_config(self.layout, self.envelope, self.settings(text), trial=False, resolve=PUBLIC)
         lit = c['mcp_servers']['lit']
         self.assertEqual(lit['command'], str(self.native))
-        self.assertEqual(lit['args'][:6], ['sandbox', '-P', 'lab_net', '--enable', 'network_proxy', '--'])
-        self.assertEqual(lit['args'][6:], ['/usr/bin/env', 'PATH=' + self.lab_path, 'python3',
-                                           str(self.layout.work / 'tools/lit/server.py')])
+        self.assertEqual(lit['args'], ['sandbox', '-c', 'permissions=' + toml_value(c['permissions']),
+                                       '-c', 'features={network_proxy = true}', '-P', 'lab_net',
+                                       '--enable', 'network_proxy', '--', '/usr/bin/env', 'PATH=' + self.lab_path,
+                                       'python3', str(self.layout.work / 'tools/lit/server.py')])
+        self.assertEqual(tomllib.loads(lit['args'][2])['permissions'], c['permissions'])
         self.assertEqual(lit['env'], {'CODEX_HOME': str(self.layout.lab_home), 'TMPDIR': str(self.layout.work / '.tmp'),
                                       'PATH': WRAPPER_PATH})
         self.assertEqual(c['mcp_servers']['far'], {'url': 'https://e/mcp'})
@@ -209,8 +212,9 @@ class ComposeTests(unittest.TestCase):
         c = lab_config(self.layout, self.envelope, s, trial=True)
         trial = self.layout.trial
         self.assertEqual(c['mcp_servers']['lit']['args'],
-                         ['sandbox', '-P', 'trial', '--', '/usr/bin/env', 'PATH=' + self.lab_path,
-                          str(trial / 'tools/lit/run'), '-v', 'x.py', str(trial / 'notes.md')])
+                         ['sandbox', '-c', 'permissions=' + toml_value(c['permissions']), '-P', 'trial', '--',
+                          '/usr/bin/env', 'PATH=' + self.lab_path, str(trial / 'tools/lit/run'), '-v', 'x.py',
+                          str(trial / 'notes.md')])
         self.assertEqual(c['mcp_servers']['lit']['env']['TMPDIR'], str(trial / '.tmp'))
         self.assertEqual((c['mcp_servers']['lit']['default_tools_approval_mode'],
                           c['mcp_servers']['lit']['startup_timeout_sec']), ('approve', 30))
@@ -314,6 +318,80 @@ class ComposeTests(unittest.TestCase):
         self.assertIn('mcp__probe', json.dumps(model.requests[0]))        # listed as a deferred tool namespace
         self.assertIn('method tools/call', log); self.assertIn('pong', ' '.join(model.tool_outputs()))
 
+    def test_temp_folders_are_closed(self):
+        temps = temp_folders()
+        self.assertTrue(set(temps) >= {os.path.realpath(p) for p in ('/tmp', '/var/tmp') if os.path.exists(p)})
+        c = lab_config(self.layout, self.envelope, self.settings(), trial=False)
+        for profile in [*c['permissions'].values(), meta_config(self.layout, self.envelope, {})['permissions']['meta']]:
+            self.assertEqual([profile['filesystem'][folder] for folder in temps], ['deny'] * len(temps))
+
+    def test_codex_under_a_temp_folder_or_in_another_letter_case_is_refused(self):
+        temp = Path(tempfile.mkdtemp(dir=temp_folders()[0])); self.addCleanup(shutil.rmtree, temp, True)
+        os.environ['RSI_CODEX'] = str(executable(temp / 'codex'))
+        with self.assertRaises(Refused):
+            self.wrapper()
+        planted = executable(self.layout.env / 'bin' / 'codex')
+        respelled = str(planted).swapcase()
+        if not os.path.exists(respelled):
+            self.skipTest('this file system tells letter cases apart')
+        os.environ['RSI_CODEX'] = respelled
+        with self.assertRaises(Refused):
+            self.wrapper()
+        with self.assertRaises(Refused):
+            profiles(self.layout, dict(self.envelope, rsi={'extra_read': [str(self.layout.records).swapcase()]}))
+
+    @needs_codex
+    def test_the_real_sandbox_closes_the_temp_folders(self):
+        os.environ.pop('RSI_CODEX')
+        for folder in (self.layout.work / '.tmp', self.layout.meta / '.tmp', self.layout.records, self.layout.lab_home):
+            folder.mkdir(parents=True, exist_ok=True)
+        marker = Path(temp_folders()[0]) / ('rsi-probe-' + uuid.uuid4().hex)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        codex = native_codex(self.layout)
+
+        def run(config, profile, workspace, command):
+            flags = render_flags({'permissions': config['permissions']})
+            return subprocess.run([codex, 'sandbox', *flags, '-P', profile, '--', '/bin/sh', '-c', command],
+                                  cwd=workspace, capture_output=True, text=True, timeout=60,
+                                  env={**os.environ, 'CODEX_HOME': str(self.layout.lab_home),
+                                       'TMPDIR': str(workspace / '.tmp')})
+        lab = lab_config(self.layout, self.envelope, self.settings(), trial=False)
+        meta = meta_config(self.layout, self.envelope, {})
+        for config, profile, workspace in ((lab, 'lab', self.layout.work), (meta, 'meta', self.layout.meta)):
+            self.assertEqual(run(config, profile, workspace, 'echo hi').stdout, 'hi\n')
+            self.assertNotEqual(run(config, profile, workspace, f'echo x > {marker}').returncode, 0)
+            self.assertFalse(marker.exists(), profile)
+            self.assertNotEqual(run(config, profile, workspace, f'ls {marker.parent}').returncode, 0)
+            done = run(config, profile, workspace, 'echo t > "$TMPDIR/t.txt" && echo w > ' + str(workspace / 'w.txt'))
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertTrue((workspace / '.tmp/t.txt').is_file() and (workspace / 'w.txt').is_file())
+            done = run(config, profile, workspace, '/usr/bin/python3 -c "import tempfile; tempfile.TemporaryFile(); '
+                                                   'print(1)"')
+            self.assertEqual((done.returncode, done.stdout), (0, '1\n'), done.stderr[-2000:])
+
+    @needs_codex
+    def test_the_wrapper_confines_a_server_without_the_home_config(self):
+        os.environ.pop('RSI_CODEX')
+        marker = Path(temp_folders()[0]) / ('rsi-probe-' + uuid.uuid4().hex)
+        self.addCleanup(marker.unlink, missing_ok=True)
+        for folder in (self.layout.work / '.tmp', self.layout.records, self.layout.lab_home,
+                       self.layout.work / 'tools' / 'confine'):
+            folder.mkdir(parents=True, exist_ok=True)
+        (self.layout.work / 'tools/confine/run.sh').write_text(
+            'here=$(dirname "$0")\necho "$PATH" > "$here/path.txt"\necho t > "$TMPDIR/t.txt"\n'
+            'echo r > "$here/../../../records/r.txt"\necho m > ' + str(marker) + '\necho done > "$here/done.txt"\n')
+        s = self.settings('[tool_servers.confine]\ncommand = "/bin/sh"\nargs = ["tools/confine/run.sh"]\n')
+        server = lab_config(self.layout, self.envelope, s, trial=False, resolve=no_lookup)['mcp_servers']['confine']
+        self.assertFalse((self.layout.lab_home / 'config.toml').exists())
+        done = subprocess.run([server['command'], *server['args']], cwd=self.layout.work, capture_output=True,
+                              text=True, timeout=60, env={'HOME': os.environ['HOME'], **server['env']})
+        tools = self.layout.work / 'tools/confine'
+        self.assertTrue((tools / 'done.txt').is_file(), done.stderr[-2000:])
+        self.assertEqual((tools / 'path.txt').read_text(), self.lab_path + '\n')
+        self.assertTrue((self.layout.work / '.tmp/t.txt').is_file())
+        self.assertFalse((self.layout.records / 'r.txt').exists()); self.assertFalse(marker.exists())
+        self.assertFalse((self.layout.lab_home / 'config.toml').exists())
+
     def test_meta_settings_are_checked(self):
         for bad in ({'model': 'two words'}, {'model': 3}, {'model_reasoning_effort': 'loud'}):
             with self.assertRaises(Refused, msg=bad):
@@ -355,6 +433,7 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(written, expected)
         self.assertEqual((written['approval_policy'], written['default_permissions']), ('on-request', 'lab_net'))
         self.assertEqual(sorted(p.name for p in self.layout.lab_home.iterdir()), ['config.toml', 'rsi'])
+        self.assertNotIn('projects', written)
         roles = self.layout.lab_home / 'rsi/roles/work'
         self.assertEqual(sorted(p.name for p in roles.iterdir()), ['literature.toml'])
         self.assertEqual(written['agents']['literature']['config_file'],
@@ -370,6 +449,10 @@ class ComposeTests(unittest.TestCase):
                                     'rsi': {'extra_read': ['/opt/x']}})
         (owner / 'lab-envelope.toml').write_text('[rsi.tool_secrets]\nRSI_TOOL_X = "api.example.org"\n')
         self.assertEqual(load_envelope(owner)['rsi'], {'tool_secrets': {'RSI_TOOL_X': 'api.example.org'}})
+        (owner / 'lab-envelope.toml').write_text(f'[projects."{self.layout.work}"]\ntrust_level = "trusted"\n')
+        with self.assertRaises(Refused) as refusal:
+            load_envelope(owner)
+        self.assertIn('projects', str(refusal.exception))
         for text in ('sandbox_mode = "x"\n', 'not toml [[[', 'apps = 1\n', '[rsi]\nextra_read = "/opt/x"\n',
                      '[rsi]\ntool_secrets = "x"\n', '[rsi.tool_secrets]\nRSI_TOOL_X = 1\n'):
             (owner / 'lab-envelope.toml').write_text(text)
