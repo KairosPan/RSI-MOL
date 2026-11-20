@@ -232,8 +232,9 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, c
 
     The wrapper itself runs outside the sandbox, so it is the native program with a PATH no agent can write; the
     Lab's PATH (with env/bin first) is set by /usr/bin/env inside the sandbox. The four profiles (and the proxy
-    feature) travel on the wrapper's own command line, so its confinement does not depend on codex-home/config.toml
-    or on the folder it is started in."""
+    feature) travel on the wrapper's own command line, and its CODEX_HOME is wrapper_home(), which never holds a
+    config: `-c` is merged with a home's config.toml (it would keep any extra entries there), and a trusted
+    project in it would load the workspace's .codex/config.toml."""
     command = server['command']
     if '/' in command and not os.path.isabs(command):
         command = str(workspace / os.path.normpath(command))
@@ -246,7 +247,7 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, c
     else:
         sandbox += ['-P', profile]
     return {'command': codex, 'args': [*sandbox, '--', '/usr/bin/env', 'PATH=' + _path(layout), command, *args],
-            'env': {'CODEX_HOME': str(layout.lab_home), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
+            'env': {'CODEX_HOME': str(wrapper_home(layout)), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
 
 
@@ -276,12 +277,36 @@ def _replace(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
+def wrapper_home(layout: Layout) -> Path:
+    """The Codex home of the tool-server wrappers: inside the Lab home (denied to both agents), kept empty."""
+    return layout.lab_home / 'rsi' / 'wrapper-home'
+
+
+def prepare_wrapper_home(layout: Layout) -> None:
+    """Create wrapper_home() and remove everything in it except a real `tmp/` folder (Codex's own helper folder).
+
+    A config.toml found there is removed, not refused: only the control program can reach this folder, and the run
+    must not depend on what an earlier Codex left behind.
+    """
+    home = wrapper_home(layout)
+    home.mkdir(parents=True, exist_ok=True)
+    for entry in home.iterdir():
+        if entry.name == 'tmp' and entry.is_dir() and not entry.is_symlink():
+            continue
+        if entry.is_dir() and not entry.is_symlink():
+            shutil.rmtree(entry)
+        else:
+            entry.unlink()
+
+
 def write_role_files(layout: Layout, settings: Settings, *, trial: bool) -> None:
     """Write each checked role, with only the allowed keys, to role_folder(); remove every other file there.
+    Also prepare the wrappers' empty Codex home (prepare_wrapper_home).
 
     The content comes from what load_settings checked, never from the workspace file again. Call it before each
     run whose configuration lab_config builds.
     """
+    prepare_wrapper_home(layout)
     folder = role_folder(layout, trial=trial)
     folder.mkdir(parents=True, exist_ok=True)
     wanted = set()

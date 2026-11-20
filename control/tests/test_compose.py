@@ -138,8 +138,8 @@ class ComposeTests(unittest.TestCase):
                                        '--enable', 'network_proxy', '--', '/usr/bin/env', 'PATH=' + self.lab_path,
                                        'python3', str(self.layout.work / 'tools/lit/server.py')])
         self.assertEqual(tomllib.loads(lit['args'][2])['permissions'], c['permissions'])
-        self.assertEqual(lit['env'], {'CODEX_HOME': str(self.layout.lab_home), 'TMPDIR': str(self.layout.work / '.tmp'),
-                                      'PATH': WRAPPER_PATH})
+        self.assertEqual(lit['env'], {'CODEX_HOME': str(self.layout.lab_home / 'rsi/wrapper-home'),
+                                      'TMPDIR': str(self.layout.work / '.tmp'), 'PATH': WRAPPER_PATH})
         self.assertEqual(c['mcp_servers']['far'], {'url': 'https://e/mcp'})
         self.assertEqual(c['default_permissions'], 'lab')           # commands stay offline
 
@@ -381,6 +381,7 @@ class ComposeTests(unittest.TestCase):
             'here=$(dirname "$0")\necho "$PATH" > "$here/path.txt"\necho t > "$TMPDIR/t.txt"\n'
             'echo r > "$here/../../../records/r.txt"\necho m > ' + str(marker) + '\necho done > "$here/done.txt"\n')
         s = self.settings('[tool_servers.confine]\ncommand = "/bin/sh"\nargs = ["tools/confine/run.sh"]\n')
+        write_role_files(self.layout, s, trial=False)            # what a run does first; prepares the wrapper home
         server = lab_config(self.layout, self.envelope, s, trial=False, resolve=no_lookup)['mcp_servers']['confine']
         self.assertFalse((self.layout.lab_home / 'config.toml').exists())
         done = subprocess.run([server['command'], *server['args']], cwd=self.layout.work, capture_output=True,
@@ -391,6 +392,47 @@ class ComposeTests(unittest.TestCase):
         self.assertTrue((self.layout.work / '.tmp/t.txt').is_file())
         self.assertFalse((self.layout.records / 'r.txt').exists()); self.assertFalse(marker.exists())
         self.assertFalse((self.layout.lab_home / 'config.toml').exists())
+
+    def test_the_wrapper_home_is_kept_empty(self):
+        home = self.layout.lab_home / 'rsi/wrapper-home'
+        (home / 'tmp').mkdir(parents=True); (home / 'tmp/helper').write_text('codex')
+        (home / 'config.toml').write_text('[permissions.lab.filesystem]\n"/" = "write"\n')
+        (home / 'other').mkdir(); (home / 'other/x').write_text('x'); (home / 'note.txt').write_text('x')
+        (home / 'link').symlink_to(self.layout.records)
+        write_role_files(self.layout, self.settings(), trial=False)
+        self.assertEqual(sorted(p.name for p in home.iterdir()), ['tmp'])
+        self.assertTrue((home / 'tmp/helper').is_file())
+        (home / 'tmp/helper').unlink(); (home / 'tmp').rmdir(); (home / 'tmp').symlink_to(self.layout.records)
+        write_home_config(self.layout, self.envelope, self.settings(), resolve=no_lookup)
+        self.assertEqual(list(home.iterdir()), [])
+        self.assertTrue(self.layout.records.parent.is_dir())
+
+    @needs_codex
+    def test_the_wrapper_ignores_a_hostile_lab_home_and_a_trusted_workspace(self):
+        os.environ.pop('RSI_CODEX')
+        tools = self.layout.work / 'tools/confine'
+        for folder in (self.layout.work / '.tmp', self.layout.work / '.codex', self.layout.records, tools):
+            folder.mkdir(parents=True, exist_ok=True)
+        (tools / 'run.sh').write_text('echo r > "$(dirname "$0")/../../../records/r.txt"\n'
+                                      'echo done > "$(dirname "$0")/done.txt"\n')
+        widen = f'[permissions.lab.filesystem]\n"{self.layout.records}" = "write"\n'
+        s = self.settings('[tool_servers.confine]\ncommand = "/bin/sh"\nargs = ["tools/confine/run.sh"]\n')
+        write_role_files(self.layout, s, trial=False)          # prepares the wrapper's own, empty home
+        self.layout.lab_home.mkdir(exist_ok=True)
+        (self.layout.lab_home / 'config.toml').write_text(
+            f'default_permissions = "lab"\n[projects."{self.layout.work}"]\ntrust_level = "trusted"\n' + widen)
+        (self.layout.work / '.codex/config.toml').write_text(widen)
+        server = lab_config(self.layout, self.envelope, s, trial=False, resolve=no_lookup)['mcp_servers']['confine']
+
+        def start(codex_home):
+            (tools / 'done.txt').unlink(missing_ok=True); (self.layout.records / 'r.txt').unlink(missing_ok=True)
+            done = subprocess.run([server['command'], *server['args']], cwd=self.layout.work, capture_output=True,
+                                  text=True, timeout=60,
+                                  env={'HOME': os.environ['HOME'], **server['env'], 'CODEX_HOME': codex_home})
+            self.assertTrue((tools / 'done.txt').is_file(), done.stderr[-2000:])
+            return (self.layout.records / 'r.txt').exists()
+        self.assertTrue(start(str(self.layout.lab_home)))       # the hazard: the Lab home's config widens the profile
+        self.assertFalse(start(server['env']['CODEX_HOME']))     # the wrapper's own home does not
 
     def test_meta_settings_are_checked(self):
         for bad in ({'model': 'two words'}, {'model': 3}, {'model_reasoning_effort': 'loud'}):
