@@ -126,6 +126,7 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(c['permissions']['trial_net']['network'],
                          {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}})
         self.assertTrue(c['shell_environment_policy']['set']['TMPDIR'].endswith('/trial/.tmp'))
+        self.assertEqual(c['shell_environment_policy']['set']['TMPPREFIX'], str(self.layout.trial / '.tmp/zsh'))
 
     def test_tool_server_is_wrapped(self):
         text = ('[tool_servers.lit]\ncommand = "python3"\nargs = ["tools/lit/server.py"]\nnetwork = true\n'
@@ -136,6 +137,7 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(lit['args'], ['sandbox', '-c', 'permissions=' + toml_value(c['permissions']),
                                        '-c', 'features={network_proxy = true}', '-P', 'lab_net',
                                        '--enable', 'network_proxy', '--', '/usr/bin/env', 'PATH=' + self.lab_path,
+                                       'TMPPREFIX=' + str(self.layout.work / '.tmp/zsh'),
                                        'python3', str(self.layout.work / 'tools/lit/server.py')])
         self.assertEqual(tomllib.loads(lit['args'][2])['permissions'], c['permissions'])
         self.assertEqual(lit['env'], {'CODEX_HOME': str(self.layout.lab_home / 'rsi/wrapper-home'),
@@ -190,7 +192,8 @@ class ComposeTests(unittest.TestCase):
                                                       str(self.layout.lab_home / 'rsi/roles/work/literature.toml')}})
         path = env + '/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
         self.assertEqual(c['shell_environment_policy'],
-                         {'inherit': 'core', 'set': {'TMPDIR': str(self.layout.work / '.tmp'), 'PATH': path}})
+                         {'inherit': 'core', 'set': {'TMPDIR': str(self.layout.work / '.tmp'), 'PATH': path,
+                                                     'TMPPREFIX': str(self.layout.work / '.tmp/zsh')}})
         self.assertEqual((c['apps'], c['plugins']), (self.envelope['apps'], self.envelope['plugins']))
         self.assertEqual((c['features'], c['mcp_servers']), ({'apps': True, 'plugins': True}, {}))
         fs = c['permissions']['lab']['filesystem']; home = Path.home().resolve()
@@ -213,7 +216,8 @@ class ComposeTests(unittest.TestCase):
         trial = self.layout.trial
         self.assertEqual(c['mcp_servers']['lit']['args'],
                          ['sandbox', '-c', 'permissions=' + toml_value(c['permissions']), '-P', 'trial', '--',
-                          '/usr/bin/env', 'PATH=' + self.lab_path, str(trial / 'tools/lit/run'), '-v', 'x.py',
+                          '/usr/bin/env', 'PATH=' + self.lab_path, 'TMPPREFIX=' + str(trial / '.tmp/zsh'),
+                          str(trial / 'tools/lit/run'), '-v', 'x.py',
                           str(trial / 'notes.md')])
         self.assertEqual(c['mcp_servers']['lit']['env']['TMPDIR'], str(trial / '.tmp'))
         self.assertEqual((c['mcp_servers']['lit']['default_tools_approval_mode'],
@@ -236,7 +240,8 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(t['command'], str(self.native)); self.assertFalse(t['command'].startswith(root + '/'))
         self.assertEqual(t['env']['PATH'], WRAPPER_PATH)
         self.assertFalse([path for path in t['env']['PATH'].split(':') if path.startswith(root)])
-        self.assertEqual(t['args'][t['args'].index('--') + 1:], ['/usr/bin/env', 'PATH=' + self.lab_path, 'c'])
+        prefix = 'TMPPREFIX=' + str(self.layout.work / '.tmp/zsh')
+        self.assertEqual(t['args'][t['args'].index('--') + 1:], ['/usr/bin/env', 'PATH=' + self.lab_path, prefix, 'c'])
         link = self.outside / 'link-to-planted'; link.symlink_to(planted / 'codex')
         for program in (None, str(planted / 'codex'), str(link)):
             if program is None:
@@ -349,12 +354,12 @@ class ComposeTests(unittest.TestCase):
         self.addCleanup(marker.unlink, missing_ok=True)
         codex = native_codex(self.layout)
 
-        def run(config, profile, workspace, command):
+        def run(config, profile, workspace, command, shell='/bin/sh'):
             flags = render_flags({'permissions': config['permissions']})
-            return subprocess.run([codex, 'sandbox', *flags, '-P', profile, '--', '/bin/sh', '-c', command],
+            return subprocess.run([codex, 'sandbox', *flags, '-P', profile, '--', shell, '-c', command],
                                   cwd=workspace, capture_output=True, text=True, timeout=60,
                                   env={**os.environ, 'CODEX_HOME': str(self.layout.lab_home),
-                                       'TMPDIR': str(workspace / '.tmp')})
+                                       **config['shell_environment_policy']['set']})
         lab = lab_config(self.layout, self.envelope, self.settings(), trial=False)
         meta = meta_config(self.layout, self.envelope, {})
         for config, profile, workspace in ((lab, 'lab', self.layout.work), (meta, 'meta', self.layout.meta)):
@@ -368,6 +373,8 @@ class ComposeTests(unittest.TestCase):
             done = run(config, profile, workspace, '/usr/bin/python3 -c "import tempfile; tempfile.TemporaryFile(); '
                                                    'print(1)"')
             self.assertEqual((done.returncode, done.stdout), (0, '1\n'), done.stderr[-2000:])
+            done = run(config, profile, workspace, 'cat <<EOF\nhere\nEOF\ncat <<< string', shell='/bin/zsh')
+            self.assertEqual((done.returncode, done.stdout), (0, 'here\nstring\n'), done.stderr[-2000:])
 
     @needs_codex
     def test_the_wrapper_confines_a_server_without_the_home_config(self):
@@ -379,7 +386,8 @@ class ComposeTests(unittest.TestCase):
             folder.mkdir(parents=True, exist_ok=True)
         (self.layout.work / 'tools/confine/run.sh').write_text(
             'here=$(dirname "$0")\necho "$PATH" > "$here/path.txt"\necho t > "$TMPDIR/t.txt"\n'
-            'echo r > "$here/../../../records/r.txt"\necho m > ' + str(marker) + '\necho done > "$here/done.txt"\n')
+            'echo r > "$here/../../../records/r.txt"\necho m > ' + str(marker) + '\n'
+            '/bin/zsh -c \'cat > "$1/heredoc.txt" <<EOF\nok\nEOF\' zsh "$here"\necho done > "$here/done.txt"\n')
         s = self.settings('[tool_servers.confine]\ncommand = "/bin/sh"\nargs = ["tools/confine/run.sh"]\n')
         write_role_files(self.layout, s, trial=False)            # what a run does first; prepares the wrapper home
         server = lab_config(self.layout, self.envelope, s, trial=False, resolve=no_lookup)['mcp_servers']['confine']
@@ -390,6 +398,7 @@ class ComposeTests(unittest.TestCase):
         self.assertTrue((tools / 'done.txt').is_file(), done.stderr[-2000:])
         self.assertEqual((tools / 'path.txt').read_text(), self.lab_path + '\n')
         self.assertTrue((self.layout.work / '.tmp/t.txt').is_file())
+        self.assertEqual((tools / 'heredoc.txt').read_text(), 'ok\n')
         self.assertFalse((self.layout.records / 'r.txt').exists()); self.assertFalse(marker.exists())
         self.assertFalse((self.layout.lab_home / 'config.toml').exists())
 
@@ -434,6 +443,18 @@ class ComposeTests(unittest.TestCase):
         self.assertTrue(start(str(self.layout.lab_home)))       # the hazard: the Lab home's config widens the profile
         self.assertFalse(start(server['env']['CODEX_HOME']))     # the wrapper's own home does not
 
+    def test_a_linked_lab_home_is_never_emptied(self):
+        target = self.outside / 'elsewhere'; target.mkdir(); (target / 'keep.txt').write_text('k')
+        layouts = []
+        for linked in ('codex-home', 'codex-home/rsi', 'codex-home/rsi/wrapper-home'):
+            root = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, root, True)
+            (root / linked).parent.mkdir(parents=True, exist_ok=True); (root / linked).symlink_to(target)
+            layouts.append(Layout(root))
+            with self.assertRaises(Refused, msg=linked) as refusal:
+                write_role_files(Layout(root), self.settings(), trial=False)
+            self.assertIn('符号链接', str(refusal.exception))
+            self.assertEqual(sorted(p.name for p in target.iterdir()), ['keep.txt'], linked)
+
     def test_meta_settings_are_checked(self):
         for bad in ({'model': 'two words'}, {'model': 3}, {'model_reasoning_effort': 'loud'}):
             with self.assertRaises(Refused, msg=bad):
@@ -461,6 +482,7 @@ class ComposeTests(unittest.TestCase):
         self.assertNotIn(root + '/tasks', fs); self.assertNotIn(root + '/trial', fs); self.assertNotIn('/opt/x', fs)
         self.assertEqual(c['permissions']['meta']['network'], {'enabled': False})
         self.assertEqual(c['shell_environment_policy']['set']['TMPDIR'], str(self.layout.meta / '.tmp'))
+        self.assertEqual(c['shell_environment_policy']['set']['TMPPREFIX'], str(self.layout.meta / '.tmp/zsh'))
         self.assertNotIn('model', c); self.assertNotIn('model_reasoning_effort', c)
         self.assertEqual(meta_config(self.layout, self.envelope, {'model': 'm'})['model'], 'm')
         tomllib.loads(render_file(c))

@@ -172,8 +172,15 @@ def _path(layout: Layout) -> str:
     return f'{layout.env}/bin:{SYSTEM_PATH}'
 
 
+def _tmpprefix(workspace: Path) -> str:
+    """zsh's TMPPREFIX: zsh puts here-documents, here-strings and =(…) under it (default /tmp/zsh, which every
+    profile denies) and ignores TMPDIR."""
+    return str(workspace / '.tmp' / 'zsh')
+
+
 def _shell(layout: Layout, workspace: Path) -> dict:
-    return {'inherit': 'core', 'set': {'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout)}}
+    return {'inherit': 'core', 'set': {'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout),
+                                       'TMPPREFIX': _tmpprefix(workspace)}}
 
 
 def _script(path: str) -> bool:
@@ -246,7 +253,8 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, c
                     '--enable', 'network_proxy']
     else:
         sandbox += ['-P', profile]
-    return {'command': codex, 'args': [*sandbox, '--', '/usr/bin/env', 'PATH=' + _path(layout), command, *args],
+    in_sandbox = ['/usr/bin/env', 'PATH=' + _path(layout), 'TMPPREFIX=' + _tmpprefix(workspace)]
+    return {'command': codex, 'args': [*sandbox, '--', *in_sandbox, command, *args],
             'env': {'CODEX_HOME': str(wrapper_home(layout)), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
 
@@ -286,10 +294,14 @@ def prepare_wrapper_home(layout: Layout) -> None:
     """Create wrapper_home() and remove everything in it except a real `tmp/` folder (Codex's own helper folder).
 
     A config.toml found there is removed, not refused: only the control program can reach this folder, and the run
-    must not depend on what an earlier Codex left behind.
+    must not depend on what an earlier Codex left behind. But if codex-home, codex-home/rsi or the wrapper home
+    itself is a symbolic link, nothing is followed or emptied: Refused.
     """
     home = wrapper_home(layout)
-    home.mkdir(parents=True, exist_ok=True)
+    for folder in (layout.lab_home, home.parent, home):
+        if folder.is_symlink():
+            raise Refused(f'{folder} 是符号链接；控制程序不会跟着它去清空别处，请改成普通文件夹')
+        folder.mkdir(exist_ok=True)
     for entry in home.iterdir():
         if entry.name == 'tmp' and entry.is_dir() and not entry.is_symlink():
             continue
