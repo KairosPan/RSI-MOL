@@ -299,8 +299,8 @@ class Commands(unittest.TestCase):
             status = json.loads(out)
             self.assertEqual((code, status['version'], status['versions'][0]['version'], status['calls']),
                              (0, 'V0001', 'V0001', []))
-            self.assertEqual(([a['id'] for a in status['applications']], status['releases'], status['check']),
-                             (['A0001'], [], None))
+            self.assertEqual(([a['id'] for a in status['applications']], status['releases']), (['A0001'], []))
+            self.assertEqual((status['check'] or {}).get('passed'), True if HAS_CODEX else None)   # Root's check.json
             self.assertEqual(status['usage']['online']['calls'], 0)
             code, out, _ = run('status')
             self.assertEqual(code, 0); self.assertIn('当前版本：V0001', out); self.assertIn('A0001', out)

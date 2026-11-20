@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from rsi import check
 from rsi.codexrun import codex_program, codex_version, run_codex
 from rsi.compose import lab_config, load_envelope, tool_server_problems, write_home_config, write_role_files
 from rsi.limits import Limits, load_limits, refusal
@@ -52,8 +53,9 @@ WORKSPACE_ERRORS = (OSError, subprocess.SubprocessError, RuntimeError, ValueErro
 
 
 def gate(layout: Layout) -> str | None:
-    """Why no agent may start now, or None. A placeholder that always allows; a later task fills it in."""
-    return None
+    """Why no agent may start now, or None: unless the last `rsi check` passed for the Codex version installed now
+    (rsi.check.gate). Every Lab run and every Meta call is admitted through it (admit)."""
+    return check.gate(layout)
 
 
 @dataclass

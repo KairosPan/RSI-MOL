@@ -12,6 +12,7 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 
+from rsi.check import CHECK_FILE, WORDS, run_check
 from rsi.init import init, locked, recover
 from rsi.labrun import run_task
 from rsi.limits import usage_by_class
@@ -29,6 +30,8 @@ APPLICATION_FILE = re.compile(r'A([0-9]{4,})\.json')
 CALL_KEYS = ('id', 'role', 'purpose', 'task', 'status', 'check')
 RELEASE_KEYS = ('version', 'kind', 'parent', 'target', 'round', 'author', 'time', 'evidence', 'benefit')
 APPLICATION_KEYS = ('id', 'round', 'call', 'what', 'why', 'records')
+CHECK_KEYS = ('codex_version', 'passed', 'at')
+YES_NO = {True: '是', False: '否'}
 STATUS_WORDS = {'started': '未结束', 'finished': '完成', 'failed': '失败', 'timed_out': '超时',
                 'interrupted': '中断', 'unreadable': '记录读不出来'}
 OUTCOME_WORDS = {'no_change': '不改', 'released': '发布了新版本', 'limit_reached': '到了上限',
@@ -289,6 +292,16 @@ def _pending(records: Path) -> list[dict]:
     return out
 
 
+def _check_state(records: Path) -> dict | None:
+    """The last `rsi check` as records/check.json tells it; None when there is none, not passed when unreadable."""
+    if not os.path.lexists(records / CHECK_FILE):
+        return None
+    data = _json_file(records / CHECK_FILE)
+    if not isinstance(data, dict):
+        data = {'passed': False}
+    return {key: data.get(key) for key in CHECK_KEYS}
+
+
 def _state(layout: Layout) -> tuple[dict, list[dict]]:
     """What `status --json` prints, and the newest five call records whole (for the text form)."""
     calls = Records(layout.records).calls() if layout.records.is_dir() else []
@@ -298,8 +311,7 @@ def _state(layout: Layout) -> tuple[dict, list[dict]]:
     return {'version': log[0]['version'] if log else None, 'versions': log[:5],
             'calls': [{key: call.get(key) for key in CALL_KEYS} for call in recent],
             'releases': _releases(layout.records, 3), 'applications': _pending(layout.records),
-            'usage': usage_by_class(calls),
-            'check': None}, recent              # check: rsi check (a later task) fills it in
+            'usage': usage_by_class(calls), 'check': _check_state(layout.records)}, recent
 
 
 def status(layout: Layout) -> dict:
@@ -332,7 +344,8 @@ def _status(layout: Layout, as_json: bool) -> int:
     check = state['check']
     lines.append('隔离检查：' + ('还没有运行 rsi check' if check is None else
                                 f'Codex {safe(check.get("codex_version"), ID_CHARS)}，'
-                                f'{"通过" if check.get("passed") is True else "没通过"}'))
+                                f'{"通过" if check.get("passed") is True else "没通过"}'
+                                + (f'（{safe(check["at"], ID_CHARS)}）' if check.get('at') else '')))
     _print(lines)
     return 0
 
@@ -370,8 +383,20 @@ def _init(layout: Layout) -> int:
 
 
 def _check(layout: Layout) -> int:
-    _error('rsi check 还没有实现（计划的第 9 步）。')
-    return 1
+    report = run_check(layout)
+    if report['passed']:
+        lines = [f'全部通过（Codex {safe(report["codex_version"], ID_CHARS)}，共 {len(report["results"])} 项）']
+    else:
+        lines = [f'{safe(r["profile"], ID_CHARS)} {safe(r["name"], ID_CHARS)}：应当{WORDS.get(r["expected"])}，'
+                 f'实际{WORDS.get(r["observed"], safe(r["observed"], ID_CHARS))}（{safe(r["detail"])}）'
+                 for r in report['results'] if not r['ok']]
+        lines += [f'问题：{safe(line)}' for line in report['problems']]
+    lines += [f'说明：{safe(line)}' for line in report['notes']]
+    lines += [f'信息（不算检查项）：{safe(item["profile"], ID_CHARS)} {safe(item["name"], ID_CHARS)} = '
+              f'{YES_NO.get(item["value"], "不明")}（{safe(item["detail"])}）' for item in report['info']]
+    lines.append(f'记录：{_shown(layout, layout.records / CHECK_FILE)}')
+    _print(lines)
+    return 0 if report['passed'] else 1
 
 
 def _task(layout: Layout, task: str, meta: bool) -> int:

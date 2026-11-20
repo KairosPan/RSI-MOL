@@ -1,5 +1,6 @@
 """Helpers shared by the tests: a skip for machines without Codex, a confined config, a temporary RSI root, and the
 text of a Meta decision."""
+import functools
 import json
 import os
 import shutil
@@ -9,6 +10,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from rsi.check import CHECK_FILE, owner_fingerprints
+from rsi.codexrun import codex_program, codex_version
 from rsi.mockmodel import ScriptedModel
 from rsi.paths import Layout
 from rsi.records import Records
@@ -74,13 +77,34 @@ def force_remove(path: Path) -> None:
     shutil.rmtree(path, ignore_errors=True)
 
 
+@functools.cache
+def _installed_codex(program: str) -> str | None:
+    """The version the Codex program reports (codex_version), once per program name; None when it reports none."""
+    try:
+        return codex_version()
+    except (OSError, RuntimeError, subprocess.SubprocessError):
+        return None
+
+
+def write_passing_check(layout: Layout) -> None:
+    """records/check.json as a passed `rsi check` for the installed Codex and the owner files as they are now would
+    leave it (without its cases), so that the gate lets agents start; nothing when Codex reports no version."""
+    version = _installed_codex(codex_program())
+    if version is not None:
+        (layout.records / CHECK_FILE).write_text(json.dumps(
+            {'codex_version': version, 'owner_files': owner_fingerprints(layout), 'passed': True,
+             'at': '2026-01-01T00:00:00+00:00', 'results': [], 'problems': [], 'notes': [], 'info': []}),
+            encoding='utf-8')
+
+
 class Root:
     """A temporary RSI root, as a context manager: every folder of the layout; owner/lab-envelope.toml (approval
     never, no apps, no plugins); owner/limits.toml with the defaults; a version store whose V0001 is work/ holding
     AGENTS.md ('hello'); a started ScriptedModel in .model, with $RSI_TEST_MODEL_ENDPOINT and $RSI_ROOT set until
     the end. The environment is restored and the folder removed on exit.
 
-    passed_check is for the gate of a later task (whether `rsi check` counts as passed); unused for now.
+    passed_check: whether records/check.json holds a passed `rsi check` for the installed Codex (write_passing_check),
+    so that the gate lets agents start; with False there is no check.json and every agent run is refused.
     """
 
     def __init__(self, passed_check: bool = True) -> None:
@@ -103,6 +127,8 @@ class Root:
             (layout.work / 'AGENTS.md').write_text('hello\n', encoding='utf-8')
             self.store.commit(layout.work, 'owner', '初始版本')
             self.records = Records(layout.records)
+            if self.passed_check:
+                write_passing_check(layout)
             self.model = ScriptedModel()
             os.environ['RSI_TEST_MODEL_ENDPOINT'] = self.model.start()
             os.environ['RSI_ROOT'] = str(self.path)

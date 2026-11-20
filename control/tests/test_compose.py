@@ -111,8 +111,8 @@ class ComposeTests(unittest.TestCase):
         c = lab_config(self.layout, self.envelope, self.settings(), trial=False)
         fs = c['permissions']['lab']['filesystem']; root = str(self.layout.root)
         self.assertEqual((c['approval_policy'], c['default_permissions']), ('never', 'lab'))
-        self.assertEqual((fs[':minimal'], fs[root], fs[root + '/work'], fs[root + '/work/.codex']),
-                         ('read', 'deny', 'write', 'read'))
+        self.assertEqual((fs[':minimal'], fs[root], fs[root + '/work']), ('read', 'deny', 'write'))
+        self.assertNotIn(root + '/work/.codex', fs)          # Codex resolves an entry through a link (rsi check)
         self.assertEqual((fs[root + '/library'], fs[root + '/env'], fs['/opt/x']), ('write', 'write', 'read'))
         self.assertEqual(c['permissions']['lab']['network'], {'enabled': False})
         self.assertEqual(sorted(c['permissions']), ['lab', 'lab_net', 'trial', 'trial_net'])
@@ -226,7 +226,7 @@ class ComposeTests(unittest.TestCase):
                          str(self.layout.lab_home / 'rsi/roles/trial/literature.toml'))
         self.assertNotIn('network_proxy', c['features'])
         fs = c['permissions']['trial']['filesystem']
-        self.assertEqual((fs[str(trial)], fs[str(trial / '.codex')]), ('write', 'read'))
+        self.assertEqual(fs[str(trial)], 'write'); self.assertNotIn(str(trial / '.codex'), fs)
         # A trial (a probe Meta wrote) must not change the live Lab's shared environment or library.
         for profile in ('trial', 'trial_net'):
             fs = c['permissions'][profile]['filesystem']
@@ -484,9 +484,9 @@ class ComposeTests(unittest.TestCase):
         c = meta_config(self.layout, self.envelope, {})
         fs = c['permissions']['meta']['filesystem']; root = str(self.layout.root)
         self.assertEqual((c['approval_policy'], c['default_permissions'], c['web_search']), ('never', 'meta', 'live'))
-        self.assertEqual((fs[':minimal'], fs[root + '/library'], fs[root + '/env'], fs[root + '/meta/.codex'],
-                          fs[root + '/candidate/.codex']), ('read', 'read', 'read', 'read', 'read'))
-        self.assertNotIn(root + '/meta/candidate', fs); self.assertNotIn(root + '/meta/candidate/.codex', fs)
+        self.assertEqual((fs[':minimal'], fs[root + '/library'], fs[root + '/env']), ('read', 'read', 'read'))
+        for path in ('/meta/.codex', '/candidate/.codex', '/meta/candidate', '/meta/candidate/.codex'):
+            self.assertNotIn(root + path, fs)
         self.assertNotIn(root + '/tasks', fs); self.assertNotIn(root + '/trial', fs); self.assertNotIn('/opt/x', fs)
         self.assertEqual(c['permissions']['meta']['network'], {'enabled': False})
         self.assertEqual(c['shell_environment_policy']['set']['TMPDIR'], str(self.layout.meta / '.tmp'))

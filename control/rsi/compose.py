@@ -47,6 +47,12 @@ NETWORK_OFF = {'enabled': False}
 NETWORK_ON = {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}}
 
 
+def root_rule() -> str:
+    """The rule every profile gives the whole RSI root before opening what an agent may touch: 'deny'. A function,
+    so that the test of `rsi check` can weaken it and see the check fail."""
+    return 'deny'
+
+
 def _tool_secrets(envelope: dict, source: str = ENVELOPE) -> dict[str, str]:
     """envelope['rsi']['tool_secrets']: environment-variable name → the one host its value may be sent to."""
     secrets = envelope.get('rsi', {}).get('tool_secrets', {})
@@ -149,8 +155,12 @@ def _tool_folders() -> list[str]:
 
 def _filesystem(layout: Layout, envelope: dict, workspace: Path, shared: str) -> dict:
     """One Lab profile's filesystem table: deny the root, then open the workspace (write), and library and env with
-    the access `shared`."""
-    table = {':minimal': 'read', str(layout.root): 'deny', str(workspace): 'write', str(workspace / '.codex'): 'read',
+    the access `shared`.
+
+    There is no entry for <workspace>/.codex: Codex itself keeps an agent from creating .codex (or .agents) in a
+    writable root, and Codex resolves an entry through a link, so `<workspace>/.codex = read` with a .codex link
+    there would open the link's target (`rsi check` case dot_codex_link)."""
+    table = {':minimal': 'read', str(layout.root): root_rule(), str(workspace): 'write',
              str(layout.library): shared, str(layout.env): shared, str(layout.lab_home / 'plugins' / 'cache'): 'read'}
     for folder in _tool_folders() + _extra_read(layout, envelope):
         table.setdefault(folder, 'read')
@@ -450,11 +460,11 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
     model_reasoning_effort are taken from meta_settings. The envelope is the Lab's and does not widen Meta.
 
     No project document is loaded (project_doc_max_bytes = 0): Meta works in meta/, which it writes, so an AGENTS.md
-    there would be standing instructions Meta wrote for itself; its duties are the owner's, sent in the prompt."""
-    filesystem = {':minimal': 'read', str(layout.root): 'deny', str(layout.records): 'read', str(layout.work): 'read',
-                  str(layout.library): 'read', str(layout.env): 'read', str(layout.meta): 'write',
-                  str(layout.candidate): 'write', str(layout.meta / '.codex'): 'read',
-                  str(layout.candidate / '.codex'): 'read'}
+    there would be standing instructions Meta wrote for itself; its duties are the owner's, sent in the prompt.
+    As in the Lab profiles, there is no entry for meta/.codex or candidate/.codex (see _filesystem)."""
+    filesystem = {':minimal': 'read', str(layout.root): root_rule(), str(layout.records): 'read',
+                  str(layout.work): 'read', str(layout.library): 'read', str(layout.env): 'read',
+                  str(layout.meta): 'write', str(layout.candidate): 'write'}
     for folder in _tool_folders():
         filesystem.setdefault(folder, 'read')
     for closed in temp_folders() + list(_homes()):
