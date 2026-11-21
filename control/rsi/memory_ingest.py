@@ -124,7 +124,7 @@ def _acquisition(run, args, rec, original):
     attempts = _attempts(prov)
     success = rec['status'] in ('ok', 'partial') or (data.get('document_id') and data.get('source_artifact') and not code)
     if not success:
-        if code == 'fulltext_format_unavailable':
+        if code in ('fulltext_format_unavailable', 'fulltext_location_unavailable'):
             stage = 'candidate_resolution'
         elif code == 'fulltext_unavailable' and any((attempt.get('http_status') or 0) >= 400 for attempt in attempts):
             stage = 'source_http'
@@ -155,6 +155,20 @@ def _acquisition(run, args, rec, original):
     return [run, rec['invocation_id']], body, {}
 
 
+def _earlier_papers(state, run):
+    """Find the metadata in effect before this run, even if earlier batches were backfilled out of order."""
+    before = int(run[1:])
+    latest = {}
+    for d in state.deliveries:
+        ident = d['id']
+        if not ident.startswith('paper_'):
+            continue
+        delivered = int(d['run'][1:]), d['seq'], d['revision']
+        if delivered[0] < before and (ident not in latest or delivered > latest[ident]):
+            latest[ident] = delivered
+    return {o['id']: o for o in state.objects if o['id'] in latest and o['revision'] == latest[o['id']][2]}
+
+
 class _Registration:
     def __init__(self, layout, state, call):
         self.layout = layout
@@ -164,6 +178,7 @@ class _Registration:
         self.source = service_source(layout, call)
         self.rows = []
         self.latest = {v['id']: v for v in state.objects}
+        self.earlier_papers = _earlier_papers(state, call['id'])
         self.rejections = []
         self.reasons = Counter()
         self.accepted = Counter()
@@ -186,11 +201,18 @@ class _Registration:
     def add(self, key, content, extra, delivery):
         subtype = content['type']
         ident = subtype + '_' + ledger.digest(key)
-        prior = self.latest.get(ident)
+        last_registered = self.latest.get(ident)
+        prior = self.earlier_papers.get(ident) if subtype == 'paper' else last_registered
+        if prior is None and last_registered and last_registered['content'] == content:
+            # A later run already delivered these same bytes. Preserve its immutable revision pin.
+            prior = last_registered
         if prior and subtype == 'passage' and prior['content'] != content:
             raise ValueError('conflicting text or coordinates at the same passage address')
         new = not prior or prior['content'] != content
-        rev = 1 if prior is None else prior['revision'] + int(new)
+        if new:
+            rev = last_registered['revision'] + 1 if last_registered else 1
+        else:
+            rev = prior['revision']
         body = {**delivery, **extra, 'id': ident, 'revision': rev}
         size = len(ledger.encode(body)) + (len(ledger.encode(content)) if new else 0)
         if self.bytes + size > MAX_TOTAL or sum(self.accepted.values()) >= MAX_ITEMS:
@@ -205,6 +227,8 @@ class _Registration:
             self.latest[ident] = obj
             self.rows.append(('object', obj))
             self.created[subtype] += 1
+        if subtype == 'paper':
+            self.earlier_papers[ident] = obj if new else prior
         self.rows.append(('delivery', body))
         self.accepted[subtype] += 1
         return body

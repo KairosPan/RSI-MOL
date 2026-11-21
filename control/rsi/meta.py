@@ -858,7 +858,9 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
     with noting_refusals(records, context), root_descriptor(layout) as root_fd:
         unrecovered(layout, records)
         store = open_store(layout)
-        store.resolve(version)
+        if store.tracks_workspace_memory(version):
+            raise Refused(f'Cannot roll back to {version}: it tracks the reserved work/memory snapshot path. '
+                          'The historical version is still in the version store.')
         envelope = load_envelope(layout.owner)
         problems = []
         take_work(layout, records, store, root_fd, records.calls(), context, problems)

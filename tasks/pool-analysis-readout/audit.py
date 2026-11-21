@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'control'))
 from rsi.memory_history import (ADDRESS, attachment, passage_index, read, require, returned_memory,
                                 returned_objects, timeline, trusted_rows)
-from rsi.memory_receipts import session_paths
+from rsi.memory_receipts import session_lines, session_paths
 from rsi.memory_store import encode, load
 from rsi.paths import Layout
 from rsi.records import CALL_ID
@@ -40,17 +40,16 @@ def run(state, run_id, task, output):
     require(call['memory']['condition'] == 'live', 'Expected live memory')
     rows = trusted_rows(state, call['memory'])
     items = {(thread, item['id']): item for _, _, thread, item, _ in timeline(LAYOUT, call)}
-    participants = []
-    for path, thread, sha in session_paths(call):
-        events = (json.loads(line) for line in attachment(LAYOUT, call, path, 128 << 20).splitlines())
-        provider, models = None, set()
-        for event in events:
-            payload = event.get('payload') or {}
-            if event['type'] == 'session_meta' and payload.get('id') == thread:
-                provider = payload.get('model_provider')
-            if event['type'] == 'turn_context' and payload.get('model'):
-                models.add(payload['model'])
-        participants.append(dict(thread=thread, provider=provider, models=sorted(models), session_sha256=sha))
+    participants = {path: dict(thread=thread, provider=None, models=set(), session_sha256=sha)
+                    for path, thread, sha in session_paths(call)}
+    for path, thread, _, line in session_lines(LAYOUT, call):
+        event = json.loads(line)
+        payload = event.get('payload') or {}
+        if event['type'] == 'session_meta' and payload.get('id') == thread:
+            participants[path]['provider'] = payload.get('model_provider')
+        if event['type'] == 'turn_context' and payload.get('model'):
+            participants[path]['models'].add(payload['model'])
+    participants = [dict(p, models=sorted(p['models'])) for p in participants.values()]
     report = state.reports.get(run_id)
     require(report is not None and run_id not in state.missing_reports, 'Missing independent registration report')
     memo = attachment(LAYOUT, call, output, 2 << 20).decode() if output in call['files'] else ''

@@ -11,11 +11,14 @@ from unittest import mock
 from rsi import memory_ingest as ingest, memory_store as ledger
 from rsi.labrun import run_task
 from rsi.memory_receipts import original_problem, service_source
+from rsi.memory_snapshot import place_snapshot
 from rsi.mockmodel import run_js, say
 from rsi.paths import Layout
 from rsi.records import Records
 from rsi.tomlout import toml_value
 from rsi.versions import VersionStore
+from seed.work.tools.literature.rsi_literature.providers import ProviderClient
+from seed.work.tools.memory.query import Snapshot
 from tests.support import Root, needs_codex
 from tests.test_literature_server import ARTICLE, DRIVER, SEED
 
@@ -44,9 +47,9 @@ class Ledger(unittest.TestCase):
         return {'type': 'event_msg', 'timestamp': f'2026-01-01T01:00:{index:02d}Z',
                 'payload': {'type': 'item_completed', 'thread_id': 'lead', 'item': item}}
 
-    def call(self, events, *, status='finished', purpose='task', memory=None, child=None):
+    def call(self, events, *, status='finished', purpose='task', task='T1', memory=None, child=None):
         run = self.records.new_id('R')
-        fields = {'purpose': purpose, 'task': 'T1', 'version_before': 'V0001', 'thread_id': 'lead',
+        fields = {'purpose': purpose, 'task': task, 'version_before': 'V0001', 'thread_id': 'lead',
                   'subagent_threads': ['child'] if child is not None else []}
         if memory is not None:
             fields['memory'] = memory
@@ -58,6 +61,62 @@ class Ledger(unittest.TestCase):
                 (folder / f'rollout-{tid}.jsonl').write_bytes(b''.join(ledger.encode(v) + b'\n' for v in rows))
         self.records.finish_call(run, {'status': status})
         return run
+
+    def snapshot(self, condition='live', task=None):
+        work = self.layout.root / condition
+        work.mkdir()
+        place_snapshot(self.layout, work, condition, task)
+        return Snapshot(work / 'memory')
+
+    def test_out_of_order_backfill_preserves_pins_and_uses_latest_visible_paper_delivery(self):
+        old = {'paper_id': 'archive:42', 'provider': 'archive', 'doi': '10.1/old', 'title': 'Old title'}
+        corrected = {**old, 'doi': '10.1/corrected', 'title': 'Corrected title'}
+        # The source returned both observations at the same timestamp in separate, serial runs.
+        first = self.call([self.event(1, 'get_paper', {'paper': old})], task='original')
+        second = self.call([self.event(1, 'get_paper', {'paper': corrected})], task='correction')
+        self.assertEqual([r['run'] for r in ingest.backfill(self.layout, [second])], [second])
+        self.assertEqual([r['run'] for r in ingest.backfill(self.layout)], [first])
+
+        ident = 'paper_' + ledger.digest('archive:42')
+        snapshot = self.snapshot()
+        latest, = snapshot.get_evidence(ident, None)
+        self.assertEqual((latest['object']['revision'], latest['object']['content']['title'], latest['freshness']),
+                         (1, corrected['title'], 'current'))
+        self.assertEqual(list(snapshot.lookup(corrected['doi']))[0]['object'], latest['object'])
+        self.assertEqual(list(snapshot.lookup(old['doi'])), [])
+        historical, = snapshot.get_evidence(ident, 2)
+        self.assertEqual(historical['object']['content']['doi'], old['doi'])
+        self.assertEqual(historical['freshness_reasons'], ['newer_visible_revision'])
+        self.assertIsNone(historical['object']['supersedes'])
+
+        trial = self.snapshot('trial', 'correction')
+        visible, = trial.get_evidence(ident, None)
+        self.assertEqual((visible['object']['revision'], visible['freshness']), (2, 'current'))
+        self.assertEqual(list(trial.lookup(old['doi']))[0]['object'], visible['object'])
+        self.assertEqual(trial.get_evidence(ident, 1), [])
+        self.assertEqual(list(trial.lookup(corrected['doi'])), [])
+
+        third = self.call([self.event(1, 'get_paper', {'paper': corrected})])
+        report, = ingest.backfill(self.layout, [third])
+        self.assertEqual(report['objects'], {})
+        self.assertEqual(ledger.load(self.layout).deliveries[-1]['revision'], 1)
+
+    def test_source_with_no_fulltext_locations_is_retrievable_as_an_acquisition_attempt(self):
+        ref = '10.1234/example'
+        paper = {'source': 'MED', 'id': '123', 'doi': ref, 'title': 'A paper'}
+        raw = json.dumps({'hitCount': 1, 'resultList': {'result': [paper]}}).encode()
+        client = ProviderClient(mock.Mock(return_value={'status': 200, 'body': raw, 'headers': {}}), env={})
+        reply = client.fulltext_candidates('europe_pmc', ref)
+        self.call([self.event(1, 'acquire_fulltext', args={'paper_ref': ref}, **reply)])
+
+        report, = ingest.backfill(self.layout)
+        self.assertEqual(report['reasons'], {})
+        attempt, = self.snapshot().lookup(ref)
+        content = attempt['object']['content']
+        self.assertEqual((attempt['type'], content['provider'], content['status'], content['stage']),
+                         ('acquisition', 'europe_pmc', 'unavailable', 'candidate_resolution'))
+        self.assertEqual(content['errors'][0]['code'], 'fulltext_location_unavailable')
+        self.assertEqual(content['download_attempts'], [])
 
     def test_revisions_dedup_and_rejections(self):
         paper = {'paper_id': 'a:x', 'provider': 'a', 'doi': '10.1/a', 'title': 'A'}

@@ -12,6 +12,7 @@ PREVIOUS_TEMPLATE_HASHES = {
     'tools/memory/query.py': {
         '73c14c6591606dd73b8fd825b61e1e589108d5b1336c9eaa53c3cd4a1ca604b1',
         'b19a5c57040dbe020a3028e15fb6844ec0d27bf9b86d20cc39f2f8f8152215f7',
+        '654fcd548e1e0d7554f8a1f15b08c4055488e0b83afbda9858910843c58a172c',
     },
     'tools/memory/server.py': {
         'bb9c460e67eee77937abc22003d587f48d0f1b585970d70c4d5c2043615bf055',

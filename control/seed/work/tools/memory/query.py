@@ -65,6 +65,7 @@ class Snapshot:
         self.by_doc = defaultdict(list)
         self.by_hash = defaultdict(list)
         self.by_identifier = defaultdict(list)
+        self.delivery_identifiers = set()
         self.challengers = defaultdict(list)
         if self.status['condition'] != 'none':
             with (folder / 'evidence.jsonl').open('rb') as stream:
@@ -75,6 +76,9 @@ class Snapshot:
                 row = json.loads(line)
                 obj = row['object']
                 self.versions[obj['id'], obj['revision']] = row
+                # A late backfill can give older paper metadata a larger revision number.
+                if obj['content']['type'] == 'paper' and 'newer_visible_revision' in row.get('freshness_reasons', ()):
+                    continue
                 latest = self.latest.get(obj['id'])
                 if latest is None or latest['object']['revision'] < obj['revision']:
                     self.latest[obj['id']] = row
@@ -96,6 +100,8 @@ class Snapshot:
                     self.by_hash[content['source_sha256']].append(row)
             elif kind == 'passage':
                 self.passages.append(row)
+                self.delivery_identifiers.update(value for d in row['deliveries']
+                                                 for value in (normalized(d.get('document_id')), self.request(d)) if value)
 
     @staticmethod
     def request(content):
@@ -148,28 +154,43 @@ class Snapshot:
                 found[row['object']['id']] = row
         return found
 
-    def candidates(self, query):
+    def candidates(self, query, *, allow_title=True):
         key = normalized(query)
         papers = list(self.by_identifier.get(key, []))
-        if not papers:
+        if allow_title and not papers and key:
             papers = [row for row in self.latest.values() if row['object']['content']['type'] == 'paper'
                       and key in normalized(row['object']['content'].get('title'))]
         refs = {normalized(p['object']['content'].get(field)) for p in papers for field in ID_FIELDS} - {''}
-        refs.add(key)
+        if key:
+            refs.add(key)
         acquisitions = {}
         for row in self.acquisitions:
             obj = row['object']
             content = obj['content']
-            if self.request(content) in refs or normalized(content.get('document_id')) == key:
+            if self.request(content) in refs or (key and normalized(content.get('document_id')) == key):
                 acquisitions[obj['id']] = row
-        return papers, acquisitions
+        return papers, refs, acquisitions
 
-    def passage(self, row, deliveries):
+    def selected_deliveries(self, row, task=None, filters=()):
+        deliveries, sources = [], {}
+        for d in row['deliveries']:
+            if task and d['task'] != task:
+                continue
+            links = self.acquisitions_for(d, row['object']['content'])
+            for refs, acquisitions in filters:
+                if normalized(d.get('document_id')) in refs or self.request(d) in refs:
+                    continue
+                links = {key: link for key, link in links.items() if key in acquisitions}
+                if not links:
+                    break
+            else:
+                deliveries.append(d)
+                sources.update(links)
+        return deliveries, sources
+
+    def passage(self, row, deliveries, sources):
         obj = row['object']
         content = obj['content']
-        sources = {}
-        for d in deliveries:
-            sources.update(self.acquisitions_for(d, content))
         # Filtered requests can expose a narrower set of deliveries than the stored object view.
         return {'id': obj['id'], 'revision': obj['revision'], 'content': content,
                 'deliveries': list(reversed(deliveries)), 'sources': [self.attribution(r) for r in sources.values()],
@@ -205,7 +226,7 @@ class Snapshot:
         item = dict(row)
         kind = row['object']['content']['type']
         if kind == 'passage':
-            payload = self.passage(row, row['deliveries'])
+            payload = self.passage(row, *self.selected_deliveries(row))
             item.update({k: payload[k] for k in ('sources', 'notice', 'passage_verification')})
         elif kind == 'acquisition':
             item['attribution'] = self.attribution(row)
@@ -236,15 +257,16 @@ class Snapshot:
 
     def recall_objects(self, query, kind=None):
         key = normalized(query)
-        words = set(re.findall(r'\w+', key))
+        words = set(re.findall(r'[^\W_]+', key))
         matches = []
         for row in self.latest.values():
             obj = row['object']
             if kind and obj['kind'] != kind:
                 continue
             text = ' '.join(v for v in obj['content'].values() if isinstance(v, str)).casefold()
+            identifiers = set(re.findall(r'[^\W_]+', (obj['id'] + ' ' + obj['origin']['task']).casefold()))
             exact = key == normalized(obj['id'])
-            lexical = sum(word in text for word in words)
+            lexical = sum(word in text or word in identifiers for word in words)
             if exact or lexical:
                 challenge = any(ref['relation'] == 'challenges' for field in ('source_refs', 'object_refs')
                                 for ref in obj.get(field, ()))
@@ -255,59 +277,47 @@ class Snapshot:
             yield from self.get_evidence(identity, None)
 
     def lookup(self, query):
-        papers, acquisitions = self.candidates(query)
+        papers, refs, acquisitions = self.candidates(query)
         for paper in papers:
             yield dict(type='paper', **paper)
         for acq in acquisitions.values():
             yield dict(type='acquisition', **acq, attribution=self.attribution(acq))
-        key = normalized(query)
         for row in self.passages:
             obj = row['object']
-            kept = []
-            for d in reversed(row['deliveries']):
-                links = self.acquisitions_for(d, obj['content'])
-                if (set(links) & acquisitions.keys() or key == normalized(d.get('document_id'))
-                        or key == normalized(d.get('paper_ref'))):
-                    kept.append(d)
+            kept, _ = self.selected_deliveries(row, filters=[(refs, acquisitions)])
             if kept:
                 yield {'type': 'passage', 'id': obj['id'], 'revision': obj['revision'],
                        'locator': obj['content']['locator'], 'source_sha256': obj['content']['source_sha256'],
-                       'deliveries': [{k: d[k] for k in ('run', 'task', 'document_id', 'document_version')} for d in kept],
+                       'deliveries': [{k: d[k] for k in ('run', 'task', 'document_id', 'document_version')}
+                                      for d in reversed(kept)],
                        'passage_verification': 'not_independently_checked', **self.delivery_freshness(row, kept)}
 
     def recall(self, query, paper, source_sha256, task):
         key = normalized(query)
         words = set(re.findall(r'\w+', query.casefold()))
-        exact_refs = {normalized(row['object']['content'].get(field)) for row in self.by_identifier.get(key, [])
-                      for field in ID_FIELDS} - {''}
-        exact_refs.add(key)
-        paper_acqs = set(self.candidates(paper)[1]) if paper else set()
+        papers, refs, acquisitions = self.candidates(query, allow_title=False)
+        source_query = bool(papers or acquisitions or key in self.delivery_identifiers or
+                            re.fullmatch(r'10\.\d+/\S+|doc_[\w-]+|pmc\d+', key) or
+                            query.strip().casefold().startswith(('pmid:', 'pmcid:')))
+        filters = [(refs, acquisitions)] if source_query else []
+        if paper:
+            _, paper_refs, paper_acquisitions = self.candidates(paper)
+            filters.append((paper_refs, paper_acquisitions))
         matches = []
         for row in self.passages:
             obj = row['object']
             content = obj['content']
             if source_sha256 and content['source_sha256'] != source_sha256:
                 continue
-            kept = []
-            exact = key in (normalized(obj['id']), normalized(content['source_sha256']))
-            for d in row['deliveries']:
-                if task and d['task'] != task:
-                    continue
-                links = self.acquisitions_for(d, content)
-                terms = {normalized(d.get(k)) for k in ('document_id', 'paper_ref')}
-                if paper and normalized(paper) not in terms and not (paper_acqs & links.keys()):
-                    continue
-                kept.append(d)
-                if exact_refs.intersection(terms) or any(self.request(a['object']['content']) in exact_refs
-                                                          for a in links.values()):
-                    exact = True
+            kept, sources = self.selected_deliveries(row, task, filters)
             if not kept:
                 continue
+            exact = source_query or key in (normalized(obj['id']), normalized(content['source_sha256']))
             text = (str(content.get('section') or '') + ' ' + content['text']).casefold()
             lexical = sum(word in text for word in words)
             if lexical or exact:
                 rank = (exact, lexical, len({d['task'] for d in kept}), kept[-1]['at'], kept[-1]['seq'], obj['id'])
-                matches.append((rank, row, kept))
+                matches.append((rank, row, kept, sources))
         matches.sort(key=lambda v: v[0], reverse=True)
-        for _, row, kept in matches:
-            yield self.passage(row, kept)
+        for _, row, kept, sources in matches:
+            yield self.passage(row, kept, sources)

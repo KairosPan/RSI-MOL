@@ -12,7 +12,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'control'))
 from rsi import memory_ingest, memory_store, proposal_files
 from rsi.memory_history import ADDRESS, attachment, read, trusted_passages
-from rsi.memory_receipts import SOURCE_LIMIT, session_paths
+from rsi.memory_receipts import SESSION_LIMIT, SOURCE_LIMIT, session_paths
 from rsi.memory_snapshot import place_snapshot
 from rsi.paths import Layout
 from rsi.records import Records
@@ -64,9 +64,11 @@ def simulate(target, original, call, citation, variants):
     paths = session_paths(call)
     lead_rel, = (rel for rel, thread, _ in paths if thread == call['thread_id'])
     lead = folder / lead_rel
+    remaining = SESSION_LIMIT
     for rel, _, _ in paths:
-        raw = attachment(original, call, rel, 128 << 20)
+        raw = attachment(original, call, rel, remaining)
         (folder / rel).write_bytes(raw)
+        remaining -= len(raw)
     ended = datetime.fromisoformat(call['ended'])
     for index, (label, reference) in enumerate(variants.items(), 1):
         args = {'kind': 'judgment', 'id': 'judgment_' + label, 'expected_revision': 0,

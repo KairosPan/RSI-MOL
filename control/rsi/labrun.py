@@ -47,7 +47,7 @@ from rsi.sessions import collect_sessions
 from rsi.settings import Settings, load_settings
 from rsi.skills import materialise
 from rsi.tasks import Task, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
-from rsi.versions import VersionStore
+from rsi.versions import VersionStore, same_entries
 from rsi.workspace import SEALED, has_entry, keep, open_folder, prepare_for_commit, remove, seal
 
 MANUAL = 'manual or leftover'   # author of what is found in work/ before a run: the owner's or a leftover process's
@@ -56,6 +56,7 @@ PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
 PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
 LAB_WORKSPACES = ('work', 'trial')  # where a Lab Codex runs: moved in with the skills in .agents/skills/
+WORK_MEMORY_MANAGED = 'work-memory-managed'  # under records/, set only after work/ receives its first snapshot
 # The start of a problem line when the literature server's own call log of a run could not be copied into its record.
 LOG_UNAVAILABLE = "The literature server's own call log could not be collected"
 # What can go wrong with a sealed or staged folder, or with git on it (a time-out included).
@@ -304,6 +305,8 @@ def _move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name:
                                                   'as a version']
             _dispose(layout, records, root_fd, entry, name, label, reasons, context, problems)
         _rename_in(staged, root_fd, name)
+        if name == 'work' and not (records.root / WORK_MEMORY_MANAGED).exists():
+            (records.root / WORK_MEMORY_MANAGED).touch()
         return snapshot
     except BaseException:
         _discard(staged)
@@ -334,8 +337,25 @@ def _dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: s
     problems.append(f'The sealed {name}/: {"; ".join(reasons)}; it was kept whole at {where}')
 
 
+def _preserve_legacy_memory(layout: Layout, records: Records, tree: Path, label: str, context: dict,
+                            notices: list[str]) -> None:
+    """Before the first managed work snapshot, preserve any old entry the new version rules would exclude."""
+    fd = open_folder(tree)
+    try:
+        entries = same_entries(fd, ('memory',)) | {name for name in os.listdir(fd) if name.lower() == 'memory'}
+        for name in sorted(entries):
+            target = layout.sealed / label / 'legacy-work' / name
+            keep(fd, name, str(tree / name), target)
+            where = target.relative_to(layout.root).as_posix()
+            reason = f'work/{name} predates managed memory snapshots'
+            records.note('sealed', {'workspace': 'work', 'path': where, 'reasons': [reason], **context})
+            notices.append(f'{reason}; it was preserved at {where}')
+    finally:
+        os.close(fd)
+
+
 def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, save, context: dict,
-            problems: list[str]) -> None:
+            problems: list[str], *, preserved: list[str] | None = None) -> None:
     """Handle the sealed tree <root>/<entry>: make it storable (its lines go to problems), and save(tree), a commit
     or a tree id, unless it holds `.codex` or something that must be left out could not be moved out of it: a version
     never holds what the rules leave out. Then _dispose: the tree is kept when save failed or was not done, or when
@@ -354,6 +374,9 @@ def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: st
         if has_entry(tree, '.codex'):
             reasons.append('it holds .codex; the version was not saved')
         elif not blocked:
+            if name == 'work' and not (records.root / WORK_MEMORY_MANAGED).exists():
+                _preserve_legacy_memory(layout, records, tree, label, context,
+                                        problems if preserved is None else preserved)
             save(tree)
     except WORKSPACE_ERRORS as error:
         reasons.append(f'the version was not saved ({type(error).__name__}: {error})')
@@ -370,7 +393,7 @@ def _uncommitted(calls: list[dict]) -> str | None:
 
 
 def _take_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, calls: list[dict],
-               context: dict, notes: list[str]) -> None:
+               context: dict, notes: list[str], *, preserved: list[str] | None = None) -> None:
     """Before a task run: seal what sits in work/ and commit it as `manual or leftover` when it differs from head
     (the program cannot tell the owner's edits from what a leftover process wrote). Refused if work/ cannot be
     sealed; anything else becomes a problem line (and a `sealed` note when the tree is kept)."""
@@ -384,7 +407,7 @@ def _take_work(layout: Layout, records: Records, store: VersionStore, root_fd: i
     if previous is not None:
         message += f'; the last task run {previous} could not be saved as a version'
     _settle(layout, records, root_fd, entry, 'work', label, lambda tree: store.commit(tree, MANUAL, message), context,
-            notes)
+            notes, preserved=preserved)
 
 
 def _restore_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, context: dict) -> str:
@@ -745,8 +768,8 @@ def settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str
 
 
 def take_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, calls: list[dict], context: dict,
-              notes: list[str]) -> None:
-    _take_work(layout, records, store, root_fd, calls, context, notes)
+              notes: list[str], *, preserved: list[str] | None = None) -> None:
+    _take_work(layout, records, store, root_fd, calls, context, notes, preserved=preserved)
 
 
 def restore_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, context: dict) -> str:

@@ -104,6 +104,21 @@ class LabRuns(unittest.TestCase):
             self.assertEqual(call['version_before'], 'V0002')
             self.assertEqual(root.store.log()[0]['author'], 'manual or leftover')     # it cannot tell which
 
+    def test_task_before_install_preserves_legacy_memory_link_without_following_it(self):
+        with Root() as root:
+            root.add_task('T1')
+            notes = root.layout.owner / 'notes'
+            notes.write_text('Only the owner can read this.')
+            (root.layout.work / 'memory').symlink_to(notes)
+            root.model.push(say('done'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
+            kept, = root.layout.sealed.glob('*/legacy-work/memory')
+            self.assertEqual(kept.readlink(), notes)
+            self.assertEqual(notes.read_text(), 'Only the owner can read this.')
+            self.assertTrue(any(str(kept.relative_to(root.path)) in line for line in call['problems']))
+            self.assertTrue((root.layout.work / 'memory/status.json').is_file())
+
     def test_refusals_start_no_call(self):
         with Root() as root:
             root.add_task('T1'); (root.layout.work / '.codex').mkdir()

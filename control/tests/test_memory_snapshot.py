@@ -125,6 +125,45 @@ class MemorySnapshot(unittest.TestCase):
         self.assertEqual(small, {'results': [], 'omitted': 1})
         self.assertEqual(absent['results'], [])
 
+    def test_exact_source_queries_return_only_matching_deliveries_and_attributions(self):
+        # The text also matches words in the DOI, even when its actual delivery is filtered out.
+        self.state.objects[-1]['content']['text'] = 'A quoted finding about alpha (PMID 333).'
+        work, _ = self.place()
+        calls = [('recall_passages', {'query': query}) for query in (
+            'https://doi.org/10.1/alpha', 'PMID:123', 'doc_a', '10.1/beta', 'quoted', SHA, 'paragraph')]
+        calls.extend([('recall_passages', {'query': '10.1/alpha', 'task': 'B'}),
+                      ('recall_passages', {'query': 'doc_a', 'paper': '10.1/beta'}),
+                      ('recall_passages', {'query': '10.1/alpha-absent'}),
+                      ('recall_passages', {'query': 'PMID:333'})])
+        alpha, pmid, document, beta, words, original, passage, *absent = self.values(work, calls)
+        for response, doc, acquisition, conflict in (
+                (alpha, 'doc_a', 'get_a', '10.1/beta'), (pmid, 'doc_a', 'get_a', '10.1/beta'),
+                (document, 'doc_a', 'get_a', '10.1/beta'), (beta, 'doc_b', 'get_b', '10.1/alpha')):
+            result, = response['results']
+            self.assertEqual([d['document_id'] for d in result['deliveries']], [doc])
+            source, = result['sources']
+            self.assertEqual(source['acquisition_id'], acquisition)
+            self.assertEqual(source['conflicting_requests_sharing_file'][0]['dois'], [conflict])
+        for response in (words, original, passage):
+            self.assertEqual([d['document_id'] for d in response['results'][0]['deliveries']], ['doc_b', 'doc_a'])
+        for response in absent:
+            self.assertEqual(response['results'], [])
+
+    def test_doi_scopes_sources_when_acquisitions_share_a_document_address(self):
+        # The native passage return identifies the document but does not say which request produced it.
+        self.state.objects[-2]['content'].update(document_id='doc_a', document_version='va')
+        self.state.deliveries[-1].update(document_id='doc_a', document_version='va')
+        work, _ = self.place()
+        exact, filtered, whole = self.values(work, [
+            ('recall_passages', {'query': '10.1/beta'}),
+            ('recall_passages', {'query': 'quoted', 'paper': '10.1/beta'}),
+            ('recall_passages', {'query': 'doc_a'})])
+        for response in (exact, filtered):
+            sources = response['results'][0]['sources']
+            self.assertEqual([s['acquisition_id'] for s in sources], ['get_b'])
+            self.assertEqual(sources[0]['conflicting_requests_sharing_file'][0]['dois'], ['10.1/alpha'])
+        self.assertEqual({s['acquisition_id'] for s in whole['results'][0]['sources']}, {'get_a', 'get_b'})
+
     def test_none_has_only_status_and_caps_apply_to_whole_projected_revisions(self):
         work, meta = self.place('none')
         self.assertEqual([p.name for p in (work / 'memory').iterdir()], ['status.json'])
@@ -141,6 +180,19 @@ class MemorySnapshot(unittest.TestCase):
         self.assertNotIn('supersedes', current)
         self.assertNotIn('record_sha256', current)
 
+    def test_existing_out_of_order_ledger_drops_wrong_supersedes_from_snapshot(self):
+        # Older controllers recorded the late backfill of alpha as revision 2 superseding revision 1.
+        self.state.deliveries[0]['run'] = 'R9'
+        self.state.objects[0]['content']['doi'] = '10.1/corrected'
+        self.state.objects[1]['content']['doi'] = '10.1/alpha'
+        work, _ = self.place('live')
+        latest, backfill = self.values(work, [('get_evidence', {'id': 'paper'}),
+                                               ('get_evidence', {'id': 'paper', 'revision': 2})])
+        self.assertEqual(latest['results'][0]['object']['content']['doi'], '10.1/corrected')
+        self.assertNotIn('supersedes', backfill['results'][0]['object'])
+        self.assertNotIn('record_sha256', backfill['results'][0]['object'])
+        self.assertEqual(self.state.objects[1]['supersedes'], 1)
+
     def test_legacy_snapshot_bytes_remain_replayable(self):
         expected = {'live': '94898f4680e3d112af271763abb2d68b19a25799f6135eb4bf8bc51ae1fe277b',
                     'trial': 'cdc9a12ecb1c2770cbef34f95fa1feea8366272864c9e888b5c5165de951b87b',
@@ -150,6 +202,10 @@ class MemorySnapshot(unittest.TestCase):
                 self.state.reports['R3'] = {'version_after': self.state.version}
                 trusted_passages(self.state, {'condition': condition, 'task_filter': 'T', 'version': self.state.version,
                                               'fingerprint': fingerprint})
+        # Version 2 annotates freshness by registration order, before late paper backfills were handled.
+        trusted_passages(self.state, {'condition': 'live', 'version': self.state.version, 'projection_version': 2,
+                                      'unavailable_sources': [],
+                                      'fingerprint': 'c8c97276250bf110724310d6ced8071afe2930900c4f8d6e8898b2b8b012df4e'})
 
     def add_judgments(self):
         citation = dict(id='paragraph', revision=1, source_run='R1', document_id='doc_a', document_version='va',
@@ -191,6 +247,20 @@ class MemorySnapshot(unittest.TestCase):
         self.assertEqual(item['questions'][0]['content']['text'], 'Compare paired scores.')
         self.assertEqual(item['evidence'][0]['reference']['document_id'], 'doc_a')
         self.assertIn(item['evidence'][0]['reference']['quote'], item['evidence'][0]['passage']['text'])
+
+    def test_judgment_recall_matches_words_from_id_and_origin_task(self):
+        identity = 'judgment_pool-analysis-protocol_paired-contrasts'
+        task = 'pool-analysis-readout'
+        judgment = object_row(identity, 1, 'R4', task, 'judgment', statement='Use a difference.',
+                              scope='Within each group.', support_status='pending_review')
+        judgment['kind'] = 'judgment'
+        self.state.objects.append(judgment)
+        self.state.deliveries.append(receipt(identity, 1, 8, task, 'R4'))
+        work, _ = self.place()
+        calls = [('recall_judgments', {'query': query}) for query in ('paired', 'pool', 'readout', identity)]
+        calls.append(('recall_objects', {'query': 'paired_contrasts', 'kind': 'judgment'}))
+        for response in self.values(work, calls):
+            self.assertEqual([r['object']['id'] for r in response['results']], [identity])
 
     def test_trial_drops_authored_revisions_hidden_aliases_and_transitive_dependents(self):
         self.add_judgments()
@@ -319,9 +389,13 @@ class MemorySnapshot(unittest.TestCase):
         self.state.deliveries.append(receipt('Q', 2, 18, 'B', 'R18'))
         with patch('rsi.memory_snapshot.original_problem', return_value=None):
             work, _ = self.place('trial', 'T')
-        result, = self.values(work, [('recall_objects', {'query': 'paired'})])
+        result, pinned, by_kind = self.values(work, [('recall_objects', {'query': 'paired'}),
+                                                      ('get_evidence', {'id': 'J'}),
+                                                      ('recall_objects', {'query': 'paired', 'kind': 'judgment'})])
         self.assertEqual([(r['object']['id'], r['freshness']) for r in result['results']],
                          [('J', 'needs_review'), ('Q', 'current')])
+        self.assertEqual(pinned['results'], [result['results'][0]])
+        self.assertEqual(by_kind['results'], pinned['results'])
 
     def test_capacity_omissions_have_no_original_observations_or_backlinks(self):
         self.add_judgments()

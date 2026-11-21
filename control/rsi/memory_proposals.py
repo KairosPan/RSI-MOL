@@ -36,27 +36,29 @@ def _stamp(value):
         return None
 
 
-def _before(read, proposal, *, require_clocks):
-    same_thread = read['thread'] == proposal['thread']
-    if same_thread and read['position'] >= proposal['position']:
+def _before(read, proposal):
+    marker = proposal['start_position']
+    boundary = marker if marker is not None else proposal['position']
+    same_session = read['position'][0] == boundary[0]
+    if same_session and read['position'] >= boundary:
         return False
     if read['time'] is not None and proposal['start'] is not None:
         # Tied millisecond clocks in different sessions do not establish an order.
-        return read['time'] <= proposal['start'] if same_thread else read['time'] < proposal['start']
-    return (not require_clocks and same_thread and
-            (read['time'] is None or proposal['time'] is None or read['time'] <= proposal['time']))
+        return read['time'] <= proposal['start'] if same_session else read['time'] < proposal['start']
+    return same_session and marker is not None
+
+
+def _clock(value):
+    if type(value) is not int or not 0 <= value < 253402300799000:
+        raise ValueError('invalid native event clock')
+    return datetime.fromtimestamp(value / 1000, timezone.utc)
 
 
 def _native_bounds(stamp, item, payload):
     """Prefer occurrence times recorded by Codex over the later session-log write timestamp."""
-    def clock(field):
-        value = payload[field]
-        if type(value) is not int or not 0 <= value < 253402300799000:
-            raise ValueError('invalid native event clock')
-        return datetime.fromtimestamp(value / 1000, timezone.utc)
-    end = clock('completed_at_ms') if 'completed_at_ms' in payload else _stamp(stamp)
+    end = _clock(payload['completed_at_ms']) if 'completed_at_ms' in payload else _stamp(stamp)
     if 'started_at_ms' in payload:
-        start = clock('started_at_ms')
+        start = _clock(payload['started_at_ms'])
     elif end is not None and item.get('duration'):
         duration = item['duration']
         if not isinstance(duration, dict):
@@ -75,15 +77,26 @@ def _native_bounds(stamp, item, payload):
 def _proofs(reg, rows, current):
     """Bind prior memory reads and successfully staged literature deliveries to their native completions."""
     reads, writes = defaultdict(list), defaultdict(list)
+    starts = {}
     passages = passage_index(rows)
     objects = {(o['id'], o['revision']): ledger.encode(o) for row in rows if (o := row['object'])['kind'] in CONTENT_FIELDS}
     count = 0
-    for stamp, pos, thread, item, payload in timeline(reg.layout, reg.call, reg.deadline):
+    for stamp, pos, thread, item, payload in timeline(reg.layout, reg.call, reg.deadline, include_proposal_starts=True):
         tool = item['tool']
+        if payload['type'] == 'item_started':
+            require(len(starts) < CALLS_LIMIT, 'proposal start receipt limit')
+            starts[thread, item['id']] = (pos, payload.get('started_at_ms'))
+            continue
         if item.get('status') != 'completed':
             continue
         try:
             start, end = _native_bounds(stamp, item, payload)
+            start_position, marker_clock = starts.get((thread, item['id']), (None, None))
+            if marker_clock is not None:
+                marker_time = _clock(marker_clock)
+                if end is not None and marker_time > end:
+                    continue
+                start = min(start, marker_time) if start is not None else marker_time
         except (OverflowError, ValueError):
             continue
         native = {'at': stamp or '', 'time': end, 'position': pos, 'thread': thread, 'call_id': item['id']}
@@ -114,7 +127,8 @@ def _proofs(reg, rows, current):
             if not (isinstance(pid, str) and INVOCATION.fullmatch(pid) and value.get('status') == 'pending'):
                 continue
             require(len(writes) < CALLS_LIMIT or pid in writes, 'proposal receipt limit')
-            writes[pid].append({**native, 'start': start, 'args': item.get('arguments')})
+            writes[pid].append({**native, 'start': start, 'start_position': start_position,
+                                'args': item.get('arguments')})
         else:
             for address, match in returned_memory(tool, value, passages):
                 count += 1
@@ -146,7 +160,7 @@ def _reference(ref, reads, proposal, history_error):
     address = tuple(ref[k] for k in ADDRESS)
     located = [r for r in candidates if r['address'] == address and (current or r['source_run'] == ref['source_run'])]
     require(located, 'evidence address or historical delivery does not match')
-    preceding = [r for r in located if _before(r, proposal, require_clocks=current)]
+    preceding = [r for r in located if _before(r, proposal)]
     require(preceding, 'tool returned the evidence after the proposal or without verifiable ordering')
     matches = [r for r in preceding if ref['quote'] in r['text']]
     require(matches, 'quotation does not occur verbatim in the returned evidence')
@@ -166,7 +180,7 @@ def _object_reference(ref, ident, reads, write, history_error):
     require(not history_error, history_error)
     candidates = reads.get(('object', ref['id'], ref['revision']), ())
     require(candidates, 'object revision was not returned by memory in this run')
-    match = next((r for r in candidates if _before(r, write, require_clocks=True)), None)
+    match = next((r for r in candidates if _before(r, write)), None)
     require(match, 'tool returned the object after the proposal or without verifiable ordering')
     return {**ref, 'thread': match['thread'], 'call_id': match['call_id']}
 

@@ -11,6 +11,7 @@ from rsi.paths import Layout
 
 SNAPSHOT_BYTES = 16 * 1024 * 1024
 STATUS_RESERVE = 1024
+PROJECTION_VERSION = 3
 
 
 def _encode(value: dict) -> bytes:
@@ -92,11 +93,13 @@ def _freshness(reasons):
     return {'freshness': level, 'freshness_reasons': sorted(reasons)}
 
 
-def _annotate_freshness(rows, owner_events, unavailable, check_original):
+def _annotate_freshness(rows, owner_events, unavailable, check_original, revision_order):
     """Compute status after selection. Each citation inherits the health of its pinned delivery."""
     newest = {}
     for key in rows:
-        newest[key[0]] = max(key[1], newest.get(key[0], 0))
+        previous = newest.get(key[0])
+        if previous is None or revision_order(key) > revision_order(previous):
+            newest[key[0]] = key
     if check_original:
         originals = {r['object']['content'].get('source_sha256') for r in rows.values()}
         originals.update(d['derived_from']['source_sha256'] for r in rows.values()
@@ -119,7 +122,7 @@ def _annotate_freshness(rows, owner_events, unavailable, check_original):
     for key, row in rows.items():  # dependencies precede their dependents in the ledger
         obj = row['object']
         reasons = source_reasons(obj['content'].get('source_sha256'))
-        if newest[key[0]] > key[1]:
+        if newest[key[0]] != key:
             reasons.add('newer_visible_revision')
         if key in withdrawn:
             reasons.add('withdrawn')
@@ -144,7 +147,8 @@ def _annotate_freshness(rows, owner_events, unavailable, check_original):
             row.update(min(paths, key=lambda s: LEVELS.index(s['freshness'])))
 
 
-def _project(state, condition: str, task: str | None, budget: int, *, unavailable=None, check_original=None):
+def _project(state, condition: str, task: str | None, budget: int, *, unavailable=None, check_original=None,
+             projection_version=PROJECTION_VERSION):
     """Derive each index, origin and capacity choice from this run's visible revisions and deliveries."""
     task_filter = task if condition == 'trial' else None
     excluded = Counter()
@@ -159,6 +163,19 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
                 by_revision[delivery['id'], delivery['revision']].append(delivery)
 
     rows, dependencies, ranks = {}, {}, {}
+
+    def delivery_order(d):
+        # Runs are serialized, while a historical run may be registered after a newer one.
+        if projection_version >= 3:
+            return int(d['run'][1:]), d['at'], d['seq']
+        return d['at'], d['seq']
+
+    def revision_order(key):
+        # Paper revision IDs pin immutable records. Their numeric order is the order of registration.
+        if projection_version >= 3 and rows[key]['object']['content']['type'] == 'paper':
+            return ranks[key]
+        return (key[1],)
+
     # Registration appends referenced revisions before their dependents. A missing dependency
     # propagates through later revisions, including an authored object's pinned question.
     for obj in state.objects if condition != 'none' else ():
@@ -172,8 +189,7 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
             if deliveries:
                 excluded['deliveries'] += len(deliveries)
             continue
-        # A requested historical backfill may have been registered out of run order.
-        deliveries.sort(key=lambda d: (d['at'], d['seq']))
+        deliveries.sort(key=delivery_order)
         origin = {k: deliveries[0][k] for k in ('run', 'task', 'version')}
         view = dict(obj)
         if not authored and view['origin'] != origin:
@@ -182,7 +198,7 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
         row = dict(object=view, deliveries=deliveries)
         rows[key] = row
         dependencies[key] = required
-        ranks[key] = deliveries[-1]['at'], deliveries[-1]['seq'], obj['id']
+        ranks[key] = (*delivery_order(deliveries[-1]), obj['id'])
 
     sizes = {key: len(_encode(row)) for key, row in rows.items()}
     if unavailable is not None:
@@ -193,7 +209,7 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
     selected_keys = _select(ordered, dependencies, sizes, budget)
     if unavailable is not None:
         visible = {key: row for key, row in rows.items() if key in selected_keys}
-        _annotate_freshness(visible, getattr(state, 'owner_events', ()), unavailable, check_original)
+        _annotate_freshness(visible, getattr(state, 'owner_events', ()), unavailable, check_original, revision_order)
     selected = []
     for key in ordered:
         row = rows[key]
@@ -203,7 +219,8 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
         counts['deliveries'] += len(row['deliveries'])
         if key in selected_keys:
             previous = obj.get('supersedes')
-            if previous is not None and (obj['id'], previous) not in selected_keys:
+            prior = (obj['id'], previous)
+            if previous is not None and (prior not in selected_keys or revision_order(prior) > revision_order(key)):
                 del obj['supersedes']
                 obj.pop('record_sha256', None)
             selected.append(row)
@@ -237,5 +254,5 @@ def place_snapshot(layout: Layout, staged_work: Path, condition: str = 'live', t
                 stream.write(data)
                 digest.update(data)
     # The owner replays the original observation even if a file disappears or is restored later.
-    return {**status, 'fingerprint': digest.hexdigest(), 'projection_version': 2, 'max_bytes': max_bytes,
+    return {**status, 'fingerprint': digest.hexdigest(), 'projection_version': PROJECTION_VERSION, 'max_bytes': max_bytes,
             'unavailable_sources': sorted(unavailable)}

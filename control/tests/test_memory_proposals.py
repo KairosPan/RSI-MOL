@@ -34,7 +34,8 @@ class Proposals(unittest.TestCase):
         item['arguments'] = args if args is not None else self.args
         return item
 
-    def record(self, items, files, *, goal='Compare pairs', task='experiment', corrupt_snapshot=False, child=(), clocks=None):
+    def record(self, items, files, *, goal='Compare pairs', task='experiment', corrupt_snapshot=False, child=(),
+               clocks=None, lead_prefix=()):
         run = self.records.new_id('R')
         directory = self.records.call_dir(run)
         staging = self.layout.root / run
@@ -49,9 +50,13 @@ class Proposals(unittest.TestCase):
         sessions = {'lead': items, 'child': child} if child else {'lead': items}
         for thread, events in sessions.items():
             with (directory / 'sessions' / (thread + '.jsonl')).open('wb') as out:
+                if thread == 'lead':
+                    out.writelines(lead_prefix)
                 for index, item in enumerate(events):
                     payload = dict(type='item_completed', thread_id=thread, item=item)
-                    if clocks is None:
+                    if item.get('type') == 'item_started':
+                        payload = dict(item, thread_id=thread)
+                    elif clocks is None:
                         payload.update(started_at_ms=index * 1000, completed_at_ms=index * 1000 + 1)
                     else:
                         payload.update(clocks.get(item['id'], {}))
@@ -211,6 +216,36 @@ class Proposals(unittest.TestCase):
         self.assertEqual(report['objects'], {})
         self.assertEqual(len(report['rejected']), 2)
         self.assertTrue(all('after the proposal' in r['reason'] for r in report['rejected']))
+
+    def test_historical_read_needs_a_proven_start_even_in_one_session(self):
+        write = self.write(1)
+        marker = dict(type='item_started', item={k: write[k] for k in ('id', 'server', 'tool', 'type')})
+        for items in ([self.read, write], [marker, self.read, write]):
+            with self.subTest(items=len(items)):
+                report = self.record(items, {1: self.args}, clocks={})
+                self.assertEqual(report['objects'], {})
+                self.assertIn('without verifiable ordering', report['rejected'][0]['reason'])
+        report = self.record([self.read, marker, write], {1: self.args}, clocks={})
+        self.assertEqual(report['objects'], {'question': 1, 'judgment': 1})
+
+    def test_archived_start_clock_can_prove_historical_read_in_another_session(self):
+        write = self.write(1)
+        marker = dict(type='item_started', item={k: write[k] for k in ('id', 'server', 'tool', 'type')})
+        clocks = {self.read['id']: {'completed_at_ms': 100}, write['id']: {'completed_at_ms': 200}}
+        for start in (99, 100, 101):
+            with self.subTest(start=start):
+                result = self.record([dict(marker, started_at_ms=start), write], {1: self.args},
+                                     clocks=clocks, child=[self.read])
+                self.assertEqual('judgment' in result['objects'], start > 100)
+
+    def test_one_large_session_can_register_both_evidence_and_judgment(self):
+        found, ref = self.literature(self.passage())
+        args = dict(self.args, source_refs=[ref])
+        # 129 MiB of complete lines crosses the old per-file limit within the 256 MiB run budget.
+        line = b'{"padding":"' + b' ' * ((1 << 20) - 15) + b'"}\n'
+        result = self.record([found, self.write(1, args)], {1: args}, lead_prefix=(line for _ in range(129)))
+        self.assertEqual(result['objects'], {'passage': 1, 'question': 1, 'judgment': 1})
+        self.assertEqual(result['rejected'], [])
 
     def test_read_without_starting_snapshot_fingerprint_cannot_support_a_judgment(self):
         report = self.record([self.read, self.write(1)], {1: self.args}, corrupt_snapshot=True)

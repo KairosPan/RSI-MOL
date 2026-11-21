@@ -1,11 +1,8 @@
 """Replay the recorded starting snapshot and typed tool completions against sealed owner attachments."""
 import hashlib
 import json
-import os
-import stat
-from contextlib import ExitStack
 
-from rsi.memory_receipts import SESSION_LIMIT, deadline_check, session_paths
+from rsi.memory_receipts import open_evidence_file, session_lines, session_paths
 from rsi.memory_snapshot import SNAPSHOT_BYTES, STATUS_RESERVE, _encode, _project
 from rsi.memory_store import State, encode
 
@@ -15,23 +12,11 @@ HISTORICAL_DELIVERY = ('run', 'document_id', 'document_version', 'invocation_id'
 
 def read(root, relative, limit):
     """All components below the supplied RSI root are opened relative to verified directory descriptors."""
-    flags = os.O_RDONLY | os.O_NOFOLLOW
-    names = relative.split("/")
-    require(all(name and name not in {".", ".."} for name in names), "Invalid evidence path")
-    with ExitStack() as stack:
-        parent = os.open(root, flags | os.O_DIRECTORY)
-        stack.callback(os.close, parent)
-        for name in names[:-1]:
-            parent = os.open(name, flags | os.O_DIRECTORY, dir_fd=parent)
-            stack.callback(os.close, parent)
-        fd = os.open(names[-1], flags | os.O_NONBLOCK, dir_fd=parent)
-        with os.fdopen(fd, "rb") as stream:
-            meta = os.fstat(fd)
-            require(stat.S_ISREG(meta.st_mode) and meta.st_nlink == 1 and meta.st_size <= limit,
-                    "Unsafe or oversized evidence file: " + relative)
-            data = stream.read(limit + 1)
-            require(len(data) == meta.st_size, "Evidence changed while reading: " + relative)
-            return data
+    with open_evidence_file(root, relative) as (stream, size):
+        require(size <= limit, 'Oversized evidence file: ' + relative)
+        data = stream.read(size + 1)
+        require(len(data) == size, 'Evidence changed while reading: ' + relative)
+        return data
 
 
 def require(value, detail):
@@ -54,10 +39,10 @@ def trusted_rows(state, memory):
     before = State(version=version, objects=objects, deliveries=deliveries,
                    owner_events=[e for e in state.owner_events if e['seq'] <= version])
     projection = memory.get('projection_version', 1)
-    require(type(projection) is int and projection in (1, 2), 'Unknown starting snapshot projection')
-    options = {'unavailable': frozenset(memory['unavailable_sources'])} if projection == 2 else {}
+    require(type(projection) is int and projection in (1, 2, 3), 'Unknown starting snapshot projection')
+    options = {'unavailable': frozenset(memory['unavailable_sources'])} if projection >= 2 else {}
     budget = memory.get('max_bytes', SNAPSHOT_BYTES) - STATUS_RESERVE
-    status, rows = _project(before, condition, memory.get('task_filter'), budget, **options)
+    status, rows = _project(before, condition, memory.get('task_filter'), budget, projection_version=projection, **options)
     digest = hashlib.sha256(b'status.json\0' + _encode(status))
     if condition != 'none':
         digest.update(b'evidence.jsonl\0')
@@ -85,39 +70,38 @@ def attachment(layout, call, name, bound):
     return raw
 
 
-def timeline(layout, call, deadline=None):
-    """Typed MCP completions across the lead and child sessions, counting inherited events once."""
+def timeline(layout, call, deadline=None, *, include_proposal_starts=False):
+    """Typed MCP completions and optionally proposal starts, counting inherited events once."""
     seen = {}
     paths = session_paths(call)
     expected = {call['thread_id'], *call['subagent_threads']}
     require({thread for _, thread, _ in paths} == expected, 'Missing a recorded participant session')
-    remaining = SESSION_LIMIT
-    for rel, thread, _ in paths:
-        raw = attachment(layout, call, rel, min(remaining, 128 << 20))
-        remaining -= len(raw)
-        for position, line in enumerate(raw.splitlines()):
-            if deadline is not None:
-                deadline_check(deadline)
-            try:
-                event = json.loads(line)
-            except (ValueError, RecursionError):
-                continue
-            if not isinstance(event, dict) or not isinstance(event.get('payload'), dict):
-                continue
-            payload = event.get('payload') or {}
-            item = payload.get('item') or {}
-            if (not isinstance(item, dict) or event.get('type') != 'event_msg' or payload.get('type') != 'item_completed' or
-                    payload.get('thread_id') not in (None, thread) or item.get('type') != 'McpToolCall' or
-                    item.get('server') not in ('literature', 'memory')):
-                continue
-            key = item.get('id')
-            require(isinstance(key, str) and key, 'Missing native tool-call ID')
-            fingerprint = hashlib.sha256(encode(item)).digest()
-            if key in seen:
-                require(seen[key] == fingerprint, 'Inconsistent duplicate tool-call ID: ' + key)
-                continue
-            seen[key] = fingerprint
-            yield event.get('timestamp'), position, thread, item, payload
+    for rel, thread, position, line in session_lines(layout, call, deadline):
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get('payload'), dict):
+            continue
+        payload = event.get('payload') or {}
+        item = payload.get('item') or {}
+        if (not isinstance(item, dict) or event.get('type') != 'event_msg' or
+                payload.get('thread_id') not in (None, thread) or item.get('type') != 'McpToolCall' or
+                item.get('server') not in ('literature', 'memory')):
+            continue
+        phase = payload.get('type')
+        if phase != 'item_completed' and not (include_proposal_starts and phase == 'item_started' and
+                                               item['server'] == 'memory' and item.get('tool') == 'propose_memory'):
+            continue
+        call_id = item.get('id')
+        require(isinstance(call_id, str) and call_id, 'Missing native tool-call ID')
+        key = (phase, call_id)
+        fingerprint = hashlib.sha256(encode(item)).digest()
+        if key in seen:
+            require(seen[key] == fingerprint, 'Inconsistent duplicate tool-call ID: ' + call_id)
+            continue
+        seen[key] = fingerprint
+        yield event.get('timestamp'), (rel, position), thread, item, payload
 
 
 def returned_memory(tool, result, trusted):

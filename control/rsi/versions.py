@@ -119,6 +119,11 @@ class VersionStore:
         """The tree id of a version or commit."""
         return self._out('rev-parse', '--verify', f'{self.resolve(name)}^{{tree}}')
 
+    def tracks_workspace_memory(self, name: str) -> bool:
+        """Older versions could store a top-level memory entry of any type or case."""
+        names = self._git('ls-tree', '--name-only', '-z', self.resolve(name)).stdout.split(b'\0')
+        return any(entry.lower() == b'memory' for entry in names)
+
     def tree_of_dir(self, folder: Path) -> str:
         """The tree id of the folder's content as it is now; commits nothing."""
         return self._stage(folder)

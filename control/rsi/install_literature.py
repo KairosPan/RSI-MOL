@@ -235,7 +235,7 @@ def install_feature(layout: Layout, seed: Path, lines: list[str] | None, *, name
         unrecovered(layout, records)
         store, envelope = open_store(layout), load_envelope(layout.owner)
         notes = []
-        take_work(layout, records, store, root_fd, records.calls(), context, notes)
+        take_work(layout, records, store, root_fd, records.calls(), context, notes, preserved=lines)
         baseline = None
         try:
             baseline = store.head()                     # work/ is sealed by now: any failure puts it back

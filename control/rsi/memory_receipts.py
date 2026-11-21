@@ -7,7 +7,7 @@ import stat
 import subprocess
 import time
 import tomllib
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -150,6 +150,59 @@ def session_paths(call):
     return sorted(paths, key=lambda entry: (order[entry[1]], entry[0]))
 
 
+@contextmanager
+def open_evidence_file(root, relative):
+    """Open a single-link recording relative to the owner root without following links."""
+    names = relative.split('/')
+    if any(name in ('', '.', '..') for name in names):
+        raise ValueError('Invalid evidence path')
+    with ExitStack() as stack:
+        parent = open_folder(root)
+        stack.callback(os.close, parent)
+        for name in names[:-1]:
+            parent = open_folder(name, parent)
+            stack.callback(os.close, parent)
+        fd = os.open(names[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(fd, 'rb') as stream:
+            meta = os.fstat(fd)
+            if not stat.S_ISREG(meta.st_mode) or meta.st_nlink != 1:
+                raise ValueError('Unsafe evidence file: ' + relative)
+            yield stream, meta.st_size
+
+
+def session_lines(layout, call, deadline=None, reject=None):
+    """Yield bounded JSONL lines. Exhaust the iterator to authenticate every included session."""
+    remaining = SESSION_LIMIT
+    for rel, thread, expected in session_paths(call):
+        path = f'records/runs/{call["id"]}/{rel}'
+        with open_evidence_file(layout.root, path) as (stream, size):
+            if size > remaining:
+                if reject is None:
+                    raise ValueError('Session byte limit: ' + path)
+                reject('session byte limit', thread=thread)
+                continue
+            remaining -= size
+            consumed = position = 0
+            oversized = False
+            checksum = hashlib.sha256()
+            while raw := stream.readline(2 * CALL_BYTES + 1):
+                if deadline is not None:
+                    deadline_check(deadline)
+                consumed += len(raw)
+                if consumed > size:
+                    raise ValueError('Evidence changed while reading: ' + path)
+                checksum.update(raw)
+                if not oversized and len(raw) <= 2 * CALL_BYTES:
+                    yield rel, thread, position, raw
+                elif not oversized and reject is not None:
+                    reject('oversized session event', thread=thread)
+                oversized = not raw.endswith(b'\n')
+                if not oversized:
+                    position += 1
+            if consumed != size or checksum.hexdigest() != expected:
+                raise ValueError(f'Archived session checksum mismatch for {call["id"]}/{rel}')
+
+
 def _parts(event, thread):
     payload = event.get('payload')
     if event.get('type') != 'event_msg' or not isinstance(payload, dict) or payload.get('type') != 'item_completed':
@@ -185,68 +238,48 @@ def _receipt(item):
 def native_calls(layout, call, reject, deadline, pending_proposals=None):
     """Verify archived attachment hashes, then return each original call once in chronological order."""
     calls, fingerprints, conflicts = {}, {}, set()
-    consumed = 0
-    folder = layout.records / 'runs' / call['id']
-    for rel, thread, expected in session_paths(call):
-        role = 'lead' if thread == call.get('thread_id') else 'subagent'
-        src = folder / rel
-        if src.stat().st_size + consumed > SESSION_LIMIT:
-            reject('session byte limit', thread=thread)
-            continue
-        hasher = hashlib.sha256()
-        with src.open('rb') as lines:
-            while raw := lines.readline(CALL_BYTES * 2 + 1):
-                deadline_check(deadline)
-                hasher.update(raw)
-                consumed += len(raw)
-                if len(raw) > CALL_BYTES * 2:
-                    while raw and not raw.endswith(b'\n'):
-                        deadline_check(deadline)
-                        raw = lines.readline(CALL_BYTES)
-                        consumed += len(raw)
-                        hasher.update(raw)
-                    reject('oversized session event', thread=thread)
-                    continue
-                try:
-                    ev = json.loads(raw)
-                    if not isinstance(ev, dict):
-                        continue
-                    meta = ev.get('payload') if ev.get('type') == 'session_meta' else None
-                    if isinstance(meta, dict) and meta.get('id') == thread and isinstance(meta.get('source'), dict):
-                        spawn = meta['source'].get('subagent', {}).get('thread_spawn', {})
-                        role = spawn.get('agent_role') or role
-                    item = _parts(ev, thread)
-                    if not item:
-                        continue
-                    if item.get('server') == 'memory' and item.get('tool') == 'propose_memory':
-                        if pending_proposals is not None and item.get('status') == 'completed':
-                            reply = item.get('result') or {}
-                            parts = reply.get('content') or []
-                            if not reply.get('isError') and len(parts) == 1 and parts[0].get('type') == 'text':
-                                value = json.loads(parts[0]['text'])
-                                pid = value.get('proposal_id')
-                                if (value.get('status') == 'pending' and isinstance(pid, str) and INVOCATION.fullmatch(pid)
-                                        and len(pending_proposals) < CALLS_LIMIT):
-                                    pending_proposals.add(pid)
-                        continue
-                    if item.get('server') != 'literature' or item.get('tool') not in TOOLS:
-                        continue
-                    rec = _receipt(item)
-                    key = rec['invocation_id']
-                    fp = digest([item['tool'], item['arguments'], rec])
-                    if key in fingerprints:
-                        if fp != fingerprints[key] and key not in conflicts:
-                            reject('conflicting invocation_id', invocation_id=key)
-                            conflicts.add(key)
-                        continue
-                    if len(calls) >= CALLS_LIMIT:
-                        reject('invocation limit', thread=thread)
-                        continue
-                    fingerprints[key] = fp
-                    calls[key] = (ev.get('timestamp', ''), thread, role, item['tool'], item['arguments'], rec,
-                                  item.get('id'))
-                except (ValueError, RecursionError, AttributeError, TypeError, KeyError) as exc:
-                    reject(str(exc)[:180] if type(exc) is ValueError else 'invalid session event', thread=thread)
-        if hasher.hexdigest() != expected:
-            raise ValueError(f'Archived session checksum mismatch for {call["id"]}/{rel}')
+    roles = {}
+    for rel, thread, _, raw in session_lines(layout, call, deadline, reject):
+        role = roles.get(rel, 'lead' if thread == call.get('thread_id') else 'subagent')
+        try:
+            ev = json.loads(raw)
+            if not isinstance(ev, dict):
+                continue
+            meta = ev.get('payload') if ev.get('type') == 'session_meta' else None
+            if isinstance(meta, dict) and meta.get('id') == thread and isinstance(meta.get('source'), dict):
+                spawn = meta['source'].get('subagent', {}).get('thread_spawn', {})
+                role = spawn.get('agent_role') or role
+                roles[rel] = role
+            item = _parts(ev, thread)
+            if not item:
+                continue
+            if item.get('server') == 'memory' and item.get('tool') == 'propose_memory':
+                if pending_proposals is not None and item.get('status') == 'completed':
+                    reply = item.get('result') or {}
+                    parts = reply.get('content') or []
+                    if not reply.get('isError') and len(parts) == 1 and parts[0].get('type') == 'text':
+                        value = json.loads(parts[0]['text'])
+                        pid = value.get('proposal_id')
+                        if (value.get('status') == 'pending' and isinstance(pid, str) and INVOCATION.fullmatch(pid)
+                                and len(pending_proposals) < CALLS_LIMIT):
+                            pending_proposals.add(pid)
+                continue
+            if item.get('server') != 'literature' or item.get('tool') not in TOOLS:
+                continue
+            rec = _receipt(item)
+            key = rec['invocation_id']
+            fp = digest([item['tool'], item['arguments'], rec])
+            if key in fingerprints:
+                if fp != fingerprints[key] and key not in conflicts:
+                    reject('conflicting invocation_id', invocation_id=key)
+                    conflicts.add(key)
+                continue
+            if len(calls) >= CALLS_LIMIT:
+                reject('invocation limit', thread=thread)
+                continue
+            fingerprints[key] = fp
+            calls[key] = (ev.get('timestamp', ''), thread, role, item['tool'], item['arguments'], rec,
+                          item.get('id'))
+        except (ValueError, RecursionError, AttributeError, TypeError, KeyError) as exc:
+            reject(str(exc)[:180] if type(exc) is ValueError else 'invalid session event', thread=thread)
     return sorted((c for key, c in calls.items() if key not in conflicts), key=lambda c: (c[0], c[5]['invocation_id']))
