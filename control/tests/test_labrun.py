@@ -104,6 +104,21 @@ class LabRuns(unittest.TestCase):
             self.assertEqual(call['version_before'], 'V0002')
             self.assertEqual(root.store.log()[0]['author'], 'manual or leftover')     # it cannot tell which
 
+    def test_task_before_install_preserves_legacy_memory_link_without_following_it(self):
+        with Root() as root:
+            root.add_task('T1')
+            notes = root.layout.owner / 'notes'
+            notes.write_text('Only the owner can read this.')
+            (root.layout.work / 'memory').symlink_to(notes)
+            root.model.push(say('done'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
+            kept, = root.layout.sealed.glob('*/legacy-work/memory')
+            self.assertEqual(kept.readlink(), notes)
+            self.assertEqual(notes.read_text(), 'Only the owner can read this.')
+            self.assertTrue(any(str(kept.relative_to(root.path)) in line for line in call['problems']))
+            self.assertTrue((root.layout.work / 'memory/status.json').is_file())
+
     def test_refusals_start_no_call(self):
         with Root() as root:
             root.add_task('T1'); (root.layout.work / '.codex').mkdir()
@@ -447,7 +462,8 @@ class SealFirst(unittest.TestCase):
             self.assertEqual((root.layout.root / before['path'] / 'mine.txt').read_text(), 'an owner edit')
             self.assertEqual((after['call'], after['path']), (call['id'], f'sealed/{call["id"]}/work'))
             self.assertTrue((root.layout.root / after['path'] / 'notes' / 'n.md').is_file())
-            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'out'])   # main's head
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'memory', 'out'])
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'live')
             root.model.push(say('again'))
             second = run_task(root.layout, 'T1')
             self.assertEqual((second['status'], second['version_before']), ('finished', 'V0001'))
@@ -490,7 +506,7 @@ class SealFirst(unittest.TestCase):
                 with self.assertRaisesRegex(Refused, 'git checkout failed'): run_task(root.layout, 'T1')
             self.assertEqual((root.store.head(), (root.layout.work / 'mine.txt').read_text()),
                              ('V0002', 'an owner edit'))
-            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'mine.txt', 'out'])
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'memory', 'mine.txt', 'out'])
             self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
 
     def test_an_oversize_file_with_a_long_chinese_name_never_reaches_a_version(self):

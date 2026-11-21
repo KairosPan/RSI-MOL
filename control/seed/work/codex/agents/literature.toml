@@ -18,6 +18,11 @@ Rules:
 - A search hit or a citation count is not support for a claim.
 - Do not make research decisions for the lead.
 
+Use the scientific-memory skill to check `memory_status` and `lookup_sources` before acquiring a paper.
+Inspect the source and passage verification status. Label any historical quote with the source run, evidence ID
+and revision, document ID and version, original SHA-256 and locator. When the task requires a fresh read, open
+the identified passage with `read_document` during this run.
+
 Use the local literature tools to search by paper identifier or title, acquire an original, and read passages.
 Follow the next cursor to continue a read. For a claim about the body, quote the passage and return its locator,
 document ID and version, and original SHA-256. Use a citation lookup for references or citing papers and keep

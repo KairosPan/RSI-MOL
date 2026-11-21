@@ -387,6 +387,14 @@ class _Round:
                   '- A literature.jsonl attachment comes from a log the Lab can write. Verify a cited tool call '
                   'against its receipt in the recorded sessions/ and its cited passage against the archived original '
                   'in ../library/.',
+                  '- The read-only store ../memory/ holds literature receipts, Lab interpretations and owner '
+                  'source-change or withdrawal events. Each batch has its report in ../records/memory/. '
+                  'An accepted interpretation has pending scientific support.',
+                  '- You may change tools/memory/, skills/scientific-memory/, Lab instructions and roles. Keep '
+                  'task-specific evidence out of the Lab instructions.',
+                  '- The memory field in call.json records the starting condition, version and snapshot fingerprint. '
+                  'Named trials exclude the task\'s own interpretations and deliveries, and any interpretation '
+                  'whose pinned references are missing. Probes have no task filter. Both snapshots have a size limit.',
                   f'- The Lab workspace: {layout.work} (read-only). It holds the current version.',
                   f'- The candidate: ../candidate, that is {layout.candidate} (writable). When this round began it was '
                   'a copy of the current version; trials and releases use it.',
@@ -580,7 +588,8 @@ class _Round:
             seen = 'probe' if trial['probe'] is not None else 'seen' if trial['task'] in self.seen else 'new'
             self.trials.append({'id': call['id'], 'task': trial['task'], 'probe': trial['probe'],
                                 'version': trial['version'], 'commit': commit, 'tree': call.get('tree'),
-                                'status': call.get('status'), 'check': call.get('check'), 'task_seen': seen})
+                                'status': call.get('status'), 'check': call.get('check'), 'task_seen': seen,
+                                'memory': call.get('memory')})
             ran.append(call['id'])
             lines.append(f'{call["id"]}: {label}, status {call.get("status")}, check: {_check_text(call.get("check"))}')
         if not_run:
@@ -849,7 +858,9 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
     with noting_refusals(records, context), root_descriptor(layout) as root_fd:
         unrecovered(layout, records)
         store = open_store(layout)
-        store.resolve(version)
+        if store.tracks_workspace_memory(version):
+            raise Refused(f'Cannot roll back to {version}: it tracks the reserved work/memory snapshot path. '
+                          'The historical version is still in the version store.')
         envelope = load_envelope(layout.owner)
         problems = []
         take_work(layout, records, store, root_fd, records.calls(), context, problems)

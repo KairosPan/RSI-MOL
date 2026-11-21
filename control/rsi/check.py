@@ -64,6 +64,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from rsi import proposal_files
 from rsi.codexrun import PROXY_VARIABLES, codex_environment, codex_version, run_codex
 from rsi.compose import (SYSTEM_PATH, TOOL_FOLDERS, lab_config, load_envelope, meta_config, native_codex, profiles,
                          temp_folders, write_home_config, write_role_files)
@@ -95,6 +96,7 @@ COMMANDS = {
     'write_workspace': (A, A, A), 'create_dot_codex': (B, B, B), 'create_dot_agents': (B, B, B),
     'write_work': (None, B, B), 'read_work': (None, B, A), 'write_trial': (B, None, B), 'write_meta': (B, B, None),
     'write_candidate': (B, B, A), 'read_candidate': (B, B, A), 'read_records': (B, B, A), 'write_records': (B, B, B),
+    'read_memory_store': (B, B, A), 'write_memory_store': (B, B, B),
     'read_tasks': (B, B, B), 'read_owner': (B, B, B), 'write_control': (B, B, B), 'read_control': (B, B, B),
     'read_versions': (B, B, B), 'read_lab_home': (B, B, B), 'read_meta_home': (B, B, B),
     'read_meta': (B, B, None), 'read_trial': (B, None, B),
@@ -127,7 +129,8 @@ RULES = ('prefix_rule(pattern = ["touch"], decision = "allow")\n'
 # composes for a scratch workspace has it, so what is measured is what the Lab runs with, a local tool server with
 # network beside commands without it.
 SHIPPED_SERVER = ('[tool_servers.literature]\ncommand = "python3"\nargs = ["-B", "tools/literature/server.py"]\n'
-                  'network = true\n')
+                  'network = true\n\n[tool_servers.memory]\ncommand = "python3"\nargs = ["-B", "tools/memory/server.py"]\n')
+MEMORY_STATUS = 'RSI-CHECK-MEMORY-STATUS '
 # An address no host answers (TEST-NET-1, RFC 5737): a direct connection out that the sandbox let through would end
 # in a time-out (`unknown`, a failed case), never at a real host.
 OUTSIDE_ADDRESS = ('192.0.2.1', 443)
@@ -506,13 +509,13 @@ def _build(root: Path) -> Layout:
     root.mkdir()
     for folder in (layout.owner, layout.tasks / 'T1', layout.work / '.tmp', layout.work / 'out', layout.trial / '.tmp',
                    layout.trial / 'out', layout.candidate, layout.meta / '.tmp', layout.notes, layout.records,
-                   layout.library, layout.env / 'bin', layout.versions, layout.lab_home, layout.meta_home,
+                   layout.library, layout.memory, layout.env / 'bin', layout.versions, layout.lab_home, layout.meta_home,
                    layout.control):
         folder.mkdir(parents=True, exist_ok=True)
     for path in (layout.owner / 'limits.toml', layout.tasks / 'T1' / 'task.md', layout.tasks / 'T1' / 'check.py',
                  layout.work / 'AGENTS.md',
                  layout.versions / 'HEAD', *(folder / READ for folder in (
-                     layout.records, layout.library, layout.env, layout.candidate, layout.lab_home, layout.meta_home,
+                     layout.records, layout.library, layout.memory, layout.env, layout.candidate, layout.lab_home, layout.meta_home,
                      layout.control, layout.meta, layout.trial))):
         path.write_text(PLANTED, encoding='utf-8')
     return layout
@@ -686,6 +689,7 @@ def _command_cases(layout: Layout, profile: str, ports: dict, pdftotext: str | N
              writes('write_trial', layout.trial), writes('write_meta', layout.meta),
              writes('write_candidate', layout.candidate), reads('read_candidate', layout.candidate / READ),
              reads('read_records', layout.records / READ), writes('write_records', layout.records),
+             reads('read_memory_store', layout.memory / READ), writes('write_memory_store', layout.memory),
              reads('read_tasks', layout.tasks / 'T1' / 'task.md'), reads('read_owner', layout.owner / 'limits.toml'),
              writes('write_control', layout.control), reads('read_control', layout.control / READ),
              reads('read_versions', layout.versions / 'HEAD'),
@@ -902,6 +906,11 @@ def _edit_script(edits: list[tuple[str, str]], commands: list[tuple[str, str]] =
         lines.append(f'try {{ const r = await tools.{tool}({{}}); '
                      f'text((r.content || []).map(part => String(part.text || "")).join("\\n") + "\\n"); }} '
                      f'catch (error) {{ text("tool server probe refused: " + {shown.format("error")} + "\\n"); }}')
+        # A real call of the shipped memory reader, discovered by Codex under the same Lab configuration.
+        lines.append('try { const r = await tools.mcp__memory__memory_status({}); '
+                     'if (!r.isError) text(' + json.dumps(MEMORY_STATUS) +
+                     ' + JSON.stringify(JSON.parse(r.content[0].text)) + "\\n"); } '
+                     'catch (error) { text("memory status failed: " + String(error) + "\\n"); }')
     lines.append(f'text({json.dumps(DONE)} + "\\n");')
     return '\n'.join(lines) + '\n'
 
@@ -936,6 +945,8 @@ def _edit_layer(context: _Context, scratch: Path, which: str) -> list[dict]:
     names = [(name, expected[column]) for table in (EDITS, SHELLS, NETWORK) for name, expected in table.items()
              if expected[column] is not None]
     names += [(name, expected) for name, (profile, expected) in LOADING.items() if profile == which]
+    if not meta:
+        names.append(('memory_status_call', A))
     model = ScriptedModel()
     try:
         return _edit_run(context, scratch, which, model, model.start())
@@ -1040,6 +1051,11 @@ def _edit_exec(context: _Context, layout: Layout, which: str, model: ScriptedMod
     if meta:
         config, home = meta_config(layout, envelope, {}), layout.meta_home
     else:
+        shutil.copytree(PROGRAM.parent / 'seed/work/tools/memory', workspace / 'tools/memory',
+                        ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        (workspace / 'memory').mkdir()
+        status = {'condition': 'none', 'version': 0, 'counts': {}, 'excluded': {}, 'omitted': {}, 'task_filter': None}
+        (workspace / 'memory/status.json').write_text(json.dumps(status), encoding='utf-8')
         settings = load_settings(layout.work)                        # as before a task run
         write_home_config(layout, envelope, settings, resolve=_no_lookup, codex=context.codex)
         write_role_files(layout, settings, trial=False)
@@ -1071,6 +1087,19 @@ def _edit_exec(context: _Context, layout: Layout, which: str, model: ScriptedMod
     why = (f'Codex {"ran the script" if complete else "did not finish the script"} (status {result.status}, '
            f'exit code {result.exit_code})')
     results = []
+    if not meta:
+        delivered = []
+        for line in outputs.splitlines():
+            if line.startswith(MEMORY_STATUS):
+                try:
+                    delivered.append(json.loads(line[len(MEMORY_STATUS):]))
+                except ValueError:
+                    pass
+        ok = any(isinstance(row, dict) and row.get('condition') == 'none' and row.get('version') == 0
+                 for row in delivered)
+        results.append(_result('memory_status_call', which, A, A if ok else UNKNOWN,
+                               'Codex called memory_status and received the staged condition and version.' if ok else
+                               f'No matching memory_status result. {why}: {_tail(stderr)}'))
     for table, cases in ((EDITS, edits), (SHELLS, commands)):
         for name, _, changed in cases:
             said = next((line for line in outputs.splitlines() if line.startswith(name + ' ')), 'no output')
@@ -1155,18 +1184,21 @@ def _literature_checks(context: _Context, scratch: Path, trial: bool) -> list[di
     nor an owner file, has the proxy variables, and reaches no local service directly or through its proxies."""
     profile = 'trial_net' if trial else 'lab_net'
     expected = {'workspace': A, 'library': B if trial else A, 'other_workspace': B, 'env': B, 'records': B,
-                'tasks': B, 'control': B, 'owner': B, 'read_task_check': B, 'read_owner': B, 'proxy_variables': A,
+                'tasks': B, 'control': B, 'owner': B, 'memory_store': B, 'read_memory_store': B,
+                'read_task_check': B, 'read_owner': B, 'proxy_variables': A,
                 'local_tcp': B}
     try:
         layout = _build(scratch / f'literature-{profile}')
         workspace, other = (layout.trial, layout.work) if trial else (layout.work, layout.trial)
         folders = {'workspace': workspace, 'library': layout.library, 'other_workspace': other, 'env': layout.env,
-                   'records': layout.records, 'tasks': layout.tasks, 'control': layout.control, 'owner': layout.owner}
+                   'records': layout.records, 'tasks': layout.tasks, 'control': layout.control, 'owner': layout.owner,
+                   'memory_store': layout.memory}
         cases = []
         for name, folder in folders.items():
             target = folder / 'literature-check.txt'
             cases.append(_Case(name, [['write', str(target), False]], written=[target]))
         cases += [_Case('read_task_check', [['read', str(layout.tasks / 'T1' / 'check.py')]]),
+                  _Case('read_memory_store', [['read', str(layout.memory / READ)]]),
                   _Case('read_owner', [['read', str(layout.owner / 'limits.toml')]]),
                   _Case('proxy_variables', [['proxy_variables']])]
         listener = _Listener(socket.AF_INET, ('127.0.0.1', 0), context.token.encode())
@@ -1191,6 +1223,47 @@ def _literature_checks(context: _Context, scratch: Path, trial: bool) -> list[di
     except Exception as error:
         detail = f'The literature tool check could not be completed: {type(error).__name__}: {error}'
         return [_result('literature_' + name, profile, outcome, UNKNOWN, detail) for name, outcome in expected.items()]
+
+
+def _memory_checks(context: _Context, scratch: Path, trial: bool, *, proposals: bool = False) -> list[dict]:
+    """Probe the filesystem and network permissions in the memory reader's own composed launch command."""
+    profile = 'trial' if trial else 'lab'
+    expected = {'read_snapshot': A, 'write_snapshot': B, 'read_store': B, 'write_store': B,
+                'proxy_variables': B, 'connect_out': B}
+    mode = 'live' if proposals else 'readonly'
+    expected['write_proposals'] = A if proposals and not trial else B
+    prefix = 'memory_live_' if proposals else 'memory_'
+    try:
+        layout = _build(scratch / f'memory-{profile}-{mode}')
+        workspace = layout.trial if trial else layout.work
+        snapshot = workspace / 'memory'
+        snapshot.mkdir()
+        (snapshot / READ).write_text(PLANTED, encoding='utf-8')
+        proposal_files.prepare(workspace)
+        cases = [_Case('read_snapshot', [['read', str(snapshot / READ)]]),
+                 _Case('read_store', [['read', str(layout.memory / READ)]]),
+                 _Case('proxy_variables', [['proxy_variables']]),
+                 _Case('connect_out', [['connect', *OUTSIDE_ADDRESS]])]
+        for name, folder in [('write_store', layout.memory), ('write_snapshot', snapshot),
+                             ('write_proposals', workspace / '.tmp' / proposal_files.DIRECTORY)]:
+            target = folder / 'memory-check.txt'
+            cases.append(_Case(name, [['write', str(target), False]], written=[target]))
+        spec = {'net': False, 'token': context.token, 'cases': [{'name': c.name, 'steps': c.steps} for c in cases]}
+        script = workspace / 'tools/memory/server.py'
+        script.parent.mkdir(parents=True)
+        script.write_text(f'import sys\nsys.argv.append({json.dumps(spec)!r})\n' + PROBE, encoding='utf-8')
+        _ship_settings(workspace)
+        settings = load_settings(workspace)
+        write_role_files(layout, settings, trial=trial)
+        config = lab_config(layout, context.envelope, settings, trial=trial, codex=context.codex, resolve=_no_lookup,
+                            proposals=proposals)
+        server = config['mcp_servers']['memory']
+        found, why = _probe_results(*_run([server['command'], *server['args']], cwd=workspace,
+                                          env={'HOME': str(Path.home()), **server['env']}, timeout=PROBE_SECONDS))
+        return [_result(prefix + c.name, profile, expected[c.name], *_judge(c, found, why, {})) for c in cases]
+    except Exception as error:
+        detail = f'The memory tool check could not be completed: {type(error).__name__}: {error}'
+        return [_result(prefix + name, profile, result, UNKNOWN, detail) for name, result in expected.items()]
 
 
 # The static checks on the real root.
@@ -1261,6 +1334,8 @@ def _cases(layout: Layout, envelope: dict, problems: list[str], notes: list[str]
         results += _tool_layer(context, scratch)
         for trial in (False, True):
             results += _literature_checks(context, scratch, trial)
+            results += _memory_checks(context, scratch, trial)
+        results += _memory_checks(context, scratch, False, proposals=True)
         return results
     finally:
         if sockets is not None:

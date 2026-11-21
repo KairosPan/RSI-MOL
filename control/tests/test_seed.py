@@ -31,6 +31,7 @@ LIT_FILES = ['tools/literature/' + name for name in
 UPSTREAM_MODULES = ('__init__', 'catalog', 'documents', 'parsers', 'poppler', 'projects', 'providers', 'remote',
                     'sdk_tools', 'services', 'worker')
 LIT_FILES += ['tools/literature/rsi_literature/' + name + '.py' for name in UPSTREAM_MODULES]
+MEMORY_FILES = ['tools/memory/server.py', 'tools/memory/query.py', 'skills/scientific-memory/SKILL.md']
 OWNER_FILES = ['limits.toml', 'meta/AGENTS.md', 'meta/settings.toml']
 # What the English Lab seed calls the human owner and the Lab lead, and the files that name each (the instructions
 # and the role file speak of the lead; only the settings file speaks of the owner).
@@ -130,7 +131,7 @@ class Seed(unittest.TestCase):
     def test_seed_workspace_has_no_problems(self):
         self.assertEqual(workspace_problems(SEED / 'work'), [])
         self.assertEqual(sorted(load_settings(SEED / 'work').roles), ['literature'])
-        self.assertEqual(files(SEED / 'work'), sorted(WORK_FILES + LIT_FILES))
+        self.assertEqual(files(SEED / 'work'), sorted(WORK_FILES + LIT_FILES + MEMORY_FILES))
 
     def test_grid_check(self):
         check, task = TASKS / 'grid' / 'check.py', load_task(TASKS, 'grid')
@@ -163,10 +164,11 @@ class Seed(unittest.TestCase):
         self.assertEqual(list(task.sections), list(SECTIONS)); self.assertTrue(all(task.sections.values()))
         self.assertEqual((task.check, task.inputs), (TASKS / 'grid' / 'check.py', None))
 
-    def test_the_settings_file_enables_literature_and_its_examples_are_the_free_keys(self):
+    def test_the_settings_file_enables_literature_and_memory_and_its_examples_are_the_free_keys(self):
         text = (SEED / 'work' / SETTINGS).read_text(encoding='utf-8')
-        self.assertEqual(tomllib.loads(text), {'tool_servers': {'literature': {
-            'command': 'python3', 'args': ['-B', 'tools/literature/server.py'], 'network': True}}})
+        self.assertEqual(tomllib.loads(text), {'tool_servers': {
+            'literature': {'command': 'python3', 'args': ['-B', 'tools/literature/server.py'], 'network': True},
+            'memory': {'command': 'python3', 'args': ['-B', 'tools/memory/server.py']}}})
         self.assertEqual(load_settings(SEED / 'work').problems, [])
         examples = [match.group(1) for line in text.splitlines() if (match := EXAMPLE.fullmatch(line))]
         loose = [line for line in text.splitlines() if re.match(r'#\s*(\[|[a-z_]+\s*=)', line)
@@ -279,9 +281,11 @@ class Seed(unittest.TestCase):
         checkout = tmp / 'V0001'
         checkout.mkdir()
         store.checkout('V0001', checkout)
-        self.assertEqual(files(checkout), sorted(WORK_FILES + LIT_FILES))
-        self.assertEqual(files(layout.work), sorted(WORK_FILES + LIT_FILES))
-        for name in WORK_FILES + LIT_FILES:
+        expected = WORK_FILES + LIT_FILES + MEMORY_FILES
+        self.assertEqual(files(checkout), sorted(expected))
+        self.assertEqual(files(layout.work), sorted(expected + ['.agents/skills/scientific-memory/SKILL.md',
+                                                               'memory/status.json', 'memory/evidence.jsonl']))
+        for name in expected:
             self.assertEqual((checkout / name).read_bytes(), (SEED / 'work' / name).read_bytes(), name)
         for name in OWNER_FILES:
             self.assertEqual((layout.owner / name).read_bytes(), (SEED / 'owner' / name).read_bytes(), name)

@@ -1,0 +1,426 @@
+"""Trial projections, bounded results and source attribution through the seeded offline MCP server."""
+
+import hashlib
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from rsi.memory_history import trusted_passages
+from rsi.memory_snapshot import _encode, _project, place_snapshot
+from rsi.memory_store import State
+from rsi.paths import Layout
+
+SEED = Path(__file__).resolve().parents[1] / 'seed' / 'work'
+SHA = '1' * 64
+
+
+def object_row(identity, revision, run, task, kind, **content):
+    return {'id': identity, 'revision': revision, 'origin': {'run': run, 'task': task, 'version': 'V1'},
+            'kind': 'evidence', 'content': {'type': kind, **content}, 'supersedes': revision - 1 or None,
+            'record_sha256': 'original-record-digest'}
+
+
+def receipt(identity, revision, seq, task, run, **fields):
+    return {'id': identity, 'revision': revision, 'at': str(seq).zfill(4), 'seq': seq, 'task': task,
+            'run': run, 'thread': 'thread', 'version': 'V1', 'service': {'entry': 'seed'},
+            'invocation_id': 'call-' + str(seq), **fields}
+
+
+def samples():
+    paper = {'paper_id': 'provider:42', 'pmid': '123', 'pmcid': 'PMC123', 'title': 'Memory paper'}
+    doc_a = {'document_id': 'doc_a', 'document_version': 'va', 'source_sha256': SHA}
+    doc_b = {'document_id': 'doc_b', 'document_version': 'vb', 'source_sha256': SHA}
+    return State(version=20, objects=[
+        object_row('paper', 1, 'R1', 'A', 'paper', doi='10.1/alpha', **paper),
+        object_row('paper', 2, 'R2', 'T', 'paper', doi='10.1/secret', **paper),
+        object_row('get_a', 1, 'R1', 'A', 'acquisition', paper_ref='provider:42', **doc_a),
+        object_row('get_b', 1, 'R3', 'B', 'acquisition', paper_ref='10.1/beta', **doc_b),
+        object_row('paragraph', 1, 'R2', 'T', 'passage', text='A quoted finding.', section='Findings',
+                   source_sha256=SHA, locator='block:004', parser_version='v1'),
+    ], deliveries=[
+        receipt('paper', 1, 1, 'A', 'R1'), receipt('paper', 2, 2, 'T', 'R2'),
+        receipt('get_a', 1, 3, 'A', 'R1'), receipt('get_b', 1, 4, 'B', 'R3'),
+        receipt('paragraph', 1, 5, 'T', 'R2', document_id='secret_alias', document_version='vs'),
+        receipt('paragraph', 1, 6, 'A', 'R1', **doc_a), receipt('paragraph', 1, 7, 'B', 'R3', **doc_b),
+    ])
+
+
+class MemorySnapshot(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = Path(tmp.name)
+        self.layout = Layout(self.parent / 'root')
+        self.state = samples()
+        p = patch('rsi.memory_snapshot.memory_store.load', return_value=self.state)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def place(self, condition='trial', task='T', max_bytes=16 << 20, name='work'):
+        work = self.parent / name
+        shutil.copytree(SEED / 'tools' / 'memory', work / 'tools' / 'memory')
+        info = place_snapshot(self.layout, work, condition, task, max_bytes=max_bytes)
+        return work, info
+
+    def mcp(self, work, calls):
+        requests = [{'id': 1, 'method': 'initialize', 'params': {'protocolVersion': '2025-06-18'}},
+                    {'method': 'notifications/initialized'}, {'id': 2, 'method': 'tools/list'}]
+        requests.extend({'id': n, 'method': 'tools/call', 'params': {'name': name, 'arguments': args}}
+                        for n, (name, args) in enumerate(calls, 3))
+        lines = [json.dumps({'jsonrpc': '2.0', **r}) for r in requests]
+        done = subprocess.run([sys.executable, '-B', str(work / 'tools/memory/server.py')],
+                              input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True, timeout=10)
+        self.assertEqual(done.stderr, '')
+        replies = [json.loads(line)['result'] for line in done.stdout.splitlines()]
+        self.assertEqual(replies[0]['protocolVersion'], '2025-06-18')
+        self.assertEqual({t['name'] for t in replies[1]['tools']},
+                         {'memory_status', 'get_evidence', 'recall_passages', 'lookup_sources', 'recall_judgments',
+                          'recall_objects'})
+        return replies[2:]
+
+    def values(self, work, calls):
+        replies = self.mcp(work, calls)
+        self.assertFalse(any(r['isError'] for r in replies), replies)
+        return [json.loads(r['content'][0]['text']) for r in replies]
+
+    def test_trial_projects_every_field_and_hashes_what_it_wrote(self):
+        work, meta = self.place()
+        folder = work / 'memory'
+        blob = (folder / 'evidence.jsonl').read_bytes()
+        for private in (b'secret_alias', b'R2', b'10.1/secret'):
+            self.assertNotIn(private, blob)
+        expected_hash = hashlib.sha256(b'status.json\0' + (folder / 'status.json').read_bytes() +
+                                       b'evidence.jsonl\0' + blob).hexdigest()
+        self.assertEqual(meta['fingerprint'], expected_hash)
+        status, paper, paragraph, hidden = self.values(work, [
+            ('memory_status', {}), ('get_evidence', {'id': 'paper'}), ('get_evidence', {'id': 'paragraph'}),
+            ('get_evidence', {'id': 'paper', 'revision': 2})])
+        self.assertEqual(status['excluded'], {'paper': 1, 'deliveries': 2})
+        self.assertEqual(paper['results'][0]['object']['revision'], 1)
+        self.assertEqual(paragraph['results'][0]['object']['origin']['task'], 'A')
+        self.assertNotIn('record_sha256', paragraph['results'][0]['object'])
+        self.assertEqual(hidden, {'results': [], 'omitted': 0})
+        _, same = self.place(name='other')
+        self.assertEqual(same, meta)
+
+    def test_paper_filter_conflicting_dois_and_retrieval_budget(self):
+        work, _ = self.place()
+        found, recall, small, absent = self.values(work, [
+            ('lookup_sources', {'query': 'HTTPS://doi.org/10.1/ALPHA'}),
+            ('recall_passages', {'query': 'quoted', 'paper': 'PMID:123'}),
+            ('recall_passages', {'query': 'quoted', 'max_bytes': 64}),
+            ('recall_passages', {'query': 'quoted', 'task': 'T'})])
+        acq = [r for r in found['results'] if r['type'] == 'acquisition']
+        self.assertEqual([r['object']['id'] for r in acq], ['get_a'])
+        source = acq[0]['attribution']
+        self.assertEqual(source['verification'], 'unverified')
+        self.assertEqual(source['conflicting_requests_sharing_file'][0]['dois'], ['10.1/beta'])
+        self.assertEqual([d['document_id'] for d in recall['results'][0]['deliveries']], ['doc_a'])
+        self.assertEqual(recall['results'][0]['passage_verification'], 'not_independently_checked')
+        self.assertEqual(small, {'results': [], 'omitted': 1})
+        self.assertEqual(absent['results'], [])
+
+    def test_exact_source_queries_return_only_matching_deliveries_and_attributions(self):
+        # The text also matches words in the DOI, even when its actual delivery is filtered out.
+        self.state.objects[-1]['content']['text'] = 'A quoted finding about alpha (PMID 333).'
+        work, _ = self.place()
+        calls = [('recall_passages', {'query': query}) for query in (
+            'https://doi.org/10.1/alpha', 'PMID:123', 'doc_a', '10.1/beta', 'quoted', SHA, 'paragraph')]
+        calls.extend([('recall_passages', {'query': '10.1/alpha', 'task': 'B'}),
+                      ('recall_passages', {'query': 'doc_a', 'paper': '10.1/beta'}),
+                      ('recall_passages', {'query': '10.1/alpha-absent'}),
+                      ('recall_passages', {'query': 'PMID:333'})])
+        alpha, pmid, document, beta, words, original, passage, *absent = self.values(work, calls)
+        for response, doc, acquisition, conflict in (
+                (alpha, 'doc_a', 'get_a', '10.1/beta'), (pmid, 'doc_a', 'get_a', '10.1/beta'),
+                (document, 'doc_a', 'get_a', '10.1/beta'), (beta, 'doc_b', 'get_b', '10.1/alpha')):
+            result, = response['results']
+            self.assertEqual([d['document_id'] for d in result['deliveries']], [doc])
+            source, = result['sources']
+            self.assertEqual(source['acquisition_id'], acquisition)
+            self.assertEqual(source['conflicting_requests_sharing_file'][0]['dois'], [conflict])
+        for response in (words, original, passage):
+            self.assertEqual([d['document_id'] for d in response['results'][0]['deliveries']], ['doc_b', 'doc_a'])
+        for response in absent:
+            self.assertEqual(response['results'], [])
+
+    def test_doi_scopes_sources_when_acquisitions_share_a_document_address(self):
+        # The native passage return identifies the document but does not say which request produced it.
+        self.state.objects[-2]['content'].update(document_id='doc_a', document_version='va')
+        self.state.deliveries[-1].update(document_id='doc_a', document_version='va')
+        work, _ = self.place()
+        exact, filtered, whole = self.values(work, [
+            ('recall_passages', {'query': '10.1/beta'}),
+            ('recall_passages', {'query': 'quoted', 'paper': '10.1/beta'}),
+            ('recall_passages', {'query': 'doc_a'})])
+        for response in (exact, filtered):
+            sources = response['results'][0]['sources']
+            self.assertEqual([s['acquisition_id'] for s in sources], ['get_b'])
+            self.assertEqual(sources[0]['conflicting_requests_sharing_file'][0]['dois'], ['10.1/alpha'])
+        self.assertEqual({s['acquisition_id'] for s in whole['results'][0]['sources']}, {'get_a', 'get_b'})
+
+    def test_none_has_only_status_and_caps_apply_to_whole_projected_revisions(self):
+        work, meta = self.place('none')
+        self.assertEqual([p.name for p in (work / 'memory').iterdir()], ['status.json'])
+        self.assertEqual(meta['condition'], 'none')
+        self.assertEqual(self.values(work, [('lookup_sources', {'query': 'provider:42'})])[0]['results'], [])
+        limited, info = self.place('live', max_bytes=1024, name='capped')
+        self.assertEqual(info['omitted']['deliveries'], len(self.state.deliveries))
+        self.assertEqual((limited / 'memory' / 'evidence.jsonl').read_bytes(), b'')
+
+    def test_latest_visible_revision_can_have_a_hidden_predecessor(self):
+        work, _ = self.place('trial', 'A')
+        current = self.values(work, [('get_evidence', {'id': 'paper'})])[0]['results'][0]['object']
+        self.assertEqual(current['revision'], 2)
+        self.assertNotIn('supersedes', current)
+        self.assertNotIn('record_sha256', current)
+
+    def test_existing_out_of_order_ledger_drops_wrong_supersedes_from_snapshot(self):
+        # Older controllers recorded the late backfill of alpha as revision 2 superseding revision 1.
+        self.state.deliveries[0]['run'] = 'R9'
+        self.state.objects[0]['content']['doi'] = '10.1/corrected'
+        self.state.objects[1]['content']['doi'] = '10.1/alpha'
+        work, _ = self.place('live')
+        latest, backfill = self.values(work, [('get_evidence', {'id': 'paper'}),
+                                               ('get_evidence', {'id': 'paper', 'revision': 2})])
+        self.assertEqual(latest['results'][0]['object']['content']['doi'], '10.1/corrected')
+        self.assertNotIn('supersedes', backfill['results'][0]['object'])
+        self.assertNotIn('record_sha256', backfill['results'][0]['object'])
+        self.assertEqual(self.state.objects[1]['supersedes'], 1)
+
+    def test_legacy_snapshot_bytes_remain_replayable(self):
+        expected = {'live': '94898f4680e3d112af271763abb2d68b19a25799f6135eb4bf8bc51ae1fe277b',
+                    'trial': 'cdc9a12ecb1c2770cbef34f95fa1feea8366272864c9e888b5c5165de951b87b',
+                    'none': '24c428218cdac1b1d2fc6a587565155e4d241e5a5fc041c947d66264580f8642'}
+        for condition, fingerprint in expected.items():
+            with self.subTest(condition=condition):
+                self.state.reports['R3'] = {'version_after': self.state.version}
+                trusted_passages(self.state, {'condition': condition, 'task_filter': 'T', 'version': self.state.version,
+                                              'fingerprint': fingerprint})
+        # Version 2 annotates freshness by registration order, before late paper backfills were handled.
+        trusted_passages(self.state, {'condition': 'live', 'version': self.state.version, 'projection_version': 2,
+                                      'unavailable_sources': [],
+                                      'fingerprint': 'c8c97276250bf110724310d6ced8071afe2930900c4f8d6e8898b2b8b012df4e'})
+
+    def add_judgments(self):
+        citation = dict(id='paragraph', revision=1, source_run='R1', document_id='doc_a', document_version='va',
+                        source_sha256=SHA, locator='block:004', quote='quoted finding', relation='supports',
+                        historical_invocation='call-6')
+
+        def authored(identity, kind, task, *, objects=(), sources=(), **content):
+            seq = len(self.state.deliveries) + 1
+            run = 'R' + str(seq)
+            obj = object_row(identity, 1, run, task, kind, **content)
+            obj.update(kind=kind, object_refs=list(objects), source_refs=list(sources),
+                       question_ids=['Q'] if kind == 'judgment' else [])
+            self.state.objects.append(obj)
+            self.state.deliveries.append(receipt(identity, 1, seq, task, run))
+
+        authored('Q', 'question', 'B', text='Compare paired scores.')
+        question = dict(id='Q', revision=1, relation='background')
+        content = dict(statement='Use paired differences.', scope='Two observations per pool.',
+                       support_status='pending_review')
+        authored('J', 'judgment', 'B', objects=[question], sources=[citation], **content)
+        hidden = dict(citation, source_run='R2', document_id='secret_alias',
+                      document_version='vs', historical_invocation='call-5')
+        authored('alias-owner', 'judgment', 'B', objects=[question], sources=[hidden], **content)
+        authored('derived', 'judgment', 'C', sources=[citation], **content,
+                 objects=[question, dict(id='alias-owner', revision=1, relation='background')])
+        authored('from-T', 'judgment', 'T', objects=[question], sources=[citation], **content)
+        # An independent delivery cannot give a judgment a different author.
+        self.state.deliveries.append(receipt('from-T', 1, 16, 'A', 'R16'))
+
+    def test_get_and_recall_return_pinned_passage_question_and_pending_judgment(self):
+        self.add_judgments()
+        work, _ = self.place('live')
+        lookup, recall = self.values(work, [('get_evidence', {'id': 'J', 'revision': 1}),
+                                             ('recall_judgments', {'query': 'paired differences'})])
+        item, = lookup['results']
+        self.assertIn(item, recall['results'])
+        self.assertEqual(item['object']['content']['scope'], 'Two observations per pool.')
+        self.assertEqual(item['object']['content']['support_status'], 'pending_review')
+        self.assertEqual(item['questions'][0]['content']['text'], 'Compare paired scores.')
+        self.assertEqual(item['evidence'][0]['reference']['document_id'], 'doc_a')
+        self.assertIn(item['evidence'][0]['reference']['quote'], item['evidence'][0]['passage']['text'])
+
+    def test_judgment_recall_matches_words_from_id_and_origin_task(self):
+        identity = 'judgment_pool-analysis-protocol_paired-contrasts'
+        task = 'pool-analysis-readout'
+        judgment = object_row(identity, 1, 'R4', task, 'judgment', statement='Use a difference.',
+                              scope='Within each group.', support_status='pending_review')
+        judgment['kind'] = 'judgment'
+        self.state.objects.append(judgment)
+        self.state.deliveries.append(receipt(identity, 1, 8, task, 'R4'))
+        work, _ = self.place()
+        calls = [('recall_judgments', {'query': query}) for query in ('paired', 'pool', 'readout', identity)]
+        calls.append(('recall_objects', {'query': 'paired_contrasts', 'kind': 'judgment'}))
+        for response in self.values(work, calls):
+            self.assertEqual([r['object']['id'] for r in response['results']], [identity])
+
+    def test_trial_drops_authored_revisions_hidden_aliases_and_transitive_dependents(self):
+        self.add_judgments()
+        work, _ = self.place('trial', 'T')
+        raw = (work / 'memory' / 'evidence.jsonl').read_bytes()
+        for private in (b'alias-owner', b'from-T', b'derived', b'secret_alias', b'call-5'):
+            self.assertNotIn(private, raw)
+        found, = self.values(work, [('recall_judgments', {'query': 'paired'})])
+        self.assertEqual([item['object']['id'] for item in found['results']], ['J'])
+        other, _ = self.place('trial', 'B', name='trial-B')
+        self.assertEqual(self.values(other, [('recall_judgments', {'query': 'paired'})])[0]['results'], [])
+
+    def test_budget_includes_judgment_together_with_all_referenced_revisions(self):
+        self.add_judgments()
+        _, all_rows = _project(self.state, 'trial', 'T', 1 << 20)
+        needed = {'J', 'Q', 'paragraph'}
+        size = sum(len(_encode(row)) for row in all_rows if row['object']['id'] in needed)
+        for budget, expect_judgment in ((size, True), (size - 1, False)):
+            status, rows = _project(self.state, 'trial', 'T', budget)
+            keys = {r['object']['id'] for r in rows}
+            self.assertEqual('J' in keys, expect_judgment)
+            if expect_judgment:
+                self.assertEqual(keys, needed)
+            else:
+                self.assertEqual(status['omitted']['judgment'], 1)
+            self.assertLessEqual(sum(len(_encode(row)) for row in rows), budget)
+
+    def test_current_read_stays_bound_to_the_author_run_and_its_invocation(self):
+        self.add_judgments()
+        judgment = next(obj for obj in self.state.objects if obj['id'] == 'J')
+        ref, = judgment['source_refs']
+        ref.pop('historical_invocation')
+        run = judgment['origin']['run']
+        ref.update(delivery_source='literature', source_run=run, invocation_id='current-read')
+        # An older delivery already exposes the same text, revision and document address.
+        def visible():
+            _, rows = _project(self.state, 'live', None, 1 << 20)
+            return any(r['object']['id'] == 'J' for r in rows)
+        self.assertFalse(visible())
+        self.state.deliveries.append(receipt('paragraph', 1, 20, 'B', run, document_id='doc_a',
+                                            document_version='va', invocation_id='current-read'))
+        self.assertTrue(visible())
+        ref.update(source_run='R1', invocation_id='call-6')
+        self.assertFalse(visible())
+
+    def test_hidden_revisions_and_owners_cannot_affect_visible_dependencies(self):
+        self.add_judgments()
+        question = next(obj for obj in self.state.objects if obj['id'] == 'Q')
+        self.state.objects.append(dict(question, revision=2, supersedes=1, origin=dict(question['origin'], task='T')))
+        self.state.deliveries.append(receipt('Q', 2, 18, 'T', 'R18'))
+        self.state.owner_events = [{'type': 'withdrawn', 'id': 'Q', 'revision': 2, 'seq': 19}]
+        # All originals available. A visible later question revises the pin even though the pin's own bytes are intact.
+        def views(condition):
+            _, rows = _project(self.state, condition, 'T', 1 << 20, unavailable=set())
+            return {(r['object']['id'], r['object']['revision']): r for r in rows}
+        live = views('live')
+        self.assertEqual(live['Q', 2]['freshness'], 'unavailable')
+        self.assertEqual(live['J', 1]['freshness_reasons'], ['dependency_needs_review'])
+        trial = views('trial')
+        for key in [('Q', 1), ('paragraph', 1), ('J', 1)]:
+            self.assertEqual(trial[key]['freshness'], 'current')
+        self.assertNotIn(('Q', 2), trial)
+        self.state.owner_events.append({'type': 'withdrawn', 'id': 'Q', 'revision': 1, 'seq': 20})
+        self.assertEqual(views('trial')['J', 1]['freshness'], 'unavailable')
+
+    def test_source_changes_and_unavailable_parent_propagate_and_replay_after_restoration(self):
+        self.add_judgments()
+        parent = hashlib.sha256(b'original PDF').hexdigest()
+        self.state.deliveries[5]['derived_from'] = {'source_sha256': parent, 'document_id': 'parent',
+                                                   'document_version': 'v1'}
+        self.state.owner_events = [{'type': 'source_changed', 'source_sha256': SHA, 'seq': 19}]
+        _, rows = _project(self.state, 'live', None, 1 << 20, unavailable=set())
+        freshness = {r['object']['id']: r['freshness'] for r in rows}
+        self.assertEqual({freshness[k] for k in ('paragraph', 'J', 'derived')}, {'needs_review'})
+        self.assertEqual(freshness['Q'], 'current')
+
+        target = next(obj for obj in self.state.objects if obj['id'] == 'J')
+        alternate = dict(target, id='alternate', source_refs=[
+            dict(target['source_refs'][0], document_id='doc_b', document_version='vb', source_run='R3',
+                 historical_invocation='call-7')])
+        self.state.objects.append(alternate)
+        self.state.deliveries.append(receipt('alternate', 1, 18, 'B', 'R18'))
+        with patch('rsi.memory_snapshot.original_problem', side_effect=lambda _, sha: sha == parent):
+            work, memory = self.place('trial', 'T')
+        item, other, subset = self.values(work, [('get_evidence', {'id': 'J'}),
+                                                 ('get_evidence', {'id': 'alternate'}),
+                                                 ('recall_passages', {'query': 'quoted', 'task': 'A'})])
+        self.assertEqual(item['results'][0]['evidence'][0]['freshness'], 'unavailable')
+        self.assertEqual(item['results'][0]['freshness'], 'unavailable')
+        self.assertEqual(other['results'][0]['freshness'], 'needs_review')
+        self.assertEqual(other['results'][0]['evidence'][0]['freshness'], 'needs_review')
+        self.assertEqual(subset['results'][0]['freshness'], 'unavailable')
+        self.assertEqual(memory['unavailable_sources'], [parent])
+        self.state.reports['R3'] = {'version_after': self.state.version}
+        with patch('rsi.memory_snapshot.original_problem', side_effect=AssertionError('replay checked live file')):
+            trusted_passages(self.state, memory)
+
+    def test_general_retrieval_prioritizes_challenges_and_excludes_hidden_backlinks(self):
+        self.add_judgments()
+        target = next(obj for obj in self.state.objects if obj['id'] == 'J')
+        decision = dict(target, id='D', kind='decision', object_refs=[{'id': 'J', 'revision': 1,
+                                                                        'relation': 'challenges'}], question_ids=[],
+                        content={'type': 'decision', 'decision': 'Use paired contrasts', 'scope': ''})
+        self.state.objects.append(decision)
+        self.state.deliveries.append(receipt('D', 1, 17, 'B', 'R17'))
+        hidden = dict(decision, id='secret-challenge', origin=dict(decision['origin'], task='T'))
+        self.state.objects.append(hidden)
+        self.state.deliveries.append(receipt('secret-challenge', 1, 18, 'T', 'R18'))
+        work, _ = self.place('trial', 'T')
+        found, sliced, linked = self.values(work, [('recall_objects', {'query': 'paired'}),
+                                                   ('recall_objects', {'query': 'paired', 'kind': 'decision'}),
+                                                   ('get_evidence', {'id': 'J', 'revision': 1})])
+        self.assertEqual(found['results'][0]['object']['id'], 'D')
+        item, = sliced['results']
+        self.assertEqual(item['object']['content']['scope'], '')
+        pin, = item['related_objects']
+        self.assertEqual(pin['reference'], {'id': 'J', 'revision': 1, 'relation': 'challenges'})
+        self.assertEqual(pin['object'], linked['results'][0]['object'])
+        self.assertEqual([o['id'] for o in linked['results'][0]['counterevidence']], ['D'])
+
+    def test_review_precedes_more_recent_healthy_matches(self):
+        self.add_judgments()
+        question = next(obj for obj in self.state.objects if obj['id'] == 'Q')
+        self.state.objects.append(dict(question, revision=2, supersedes=1, content={'type': 'question',
+                                                                                   'text': 'New paired question'}))
+        self.state.deliveries.append(receipt('Q', 2, 18, 'B', 'R18'))
+        with patch('rsi.memory_snapshot.original_problem', return_value=None):
+            work, _ = self.place('trial', 'T')
+        result, pinned, by_kind = self.values(work, [('recall_objects', {'query': 'paired'}),
+                                                      ('get_evidence', {'id': 'J'}),
+                                                      ('recall_objects', {'query': 'paired', 'kind': 'judgment'})])
+        self.assertEqual([(r['object']['id'], r['freshness']) for r in result['results']],
+                         [('J', 'needs_review'), ('Q', 'current')])
+        self.assertEqual(pinned['results'], [result['results'][0]])
+        self.assertEqual(by_kind['results'], pinned['results'])
+
+    def test_capacity_omissions_have_no_original_observations_or_backlinks(self):
+        self.add_judgments()
+        hidden = 'f' * 64
+        hidden_doc = {'document_id': 'hidden', 'document_version': 'v', 'source_sha256': hidden}
+        self.state.objects.append(object_row('large', 1, 'R4', 'B', 'passage', text='x' * 7000,
+                                             locator='block:1', parser_version='1', source_sha256=hidden))
+        self.state.deliveries.append(receipt('large', 1, 17, 'B', 'R4', **hidden_doc))
+        target = next(obj for obj in self.state.objects if obj['id'] == 'J')
+        self.state.objects.append(dict(target, id='oversized-backlink', object_refs=[
+            {'id': 'J', 'revision': 1, 'relation': 'challenges'}], question_ids=[],
+            content=dict(target['content'], statement='z' * 7000)))
+        self.state.deliveries.append(receipt('oversized-backlink', 1, 18, 'B', 'R5'))
+        with patch('rsi.memory_snapshot.original_problem', return_value='missing') as check:
+            work, memory = self.place('trial', 'T', max_bytes=7000)
+        self.assertNotIn(hidden, str(check.call_args_list))
+        self.assertNotIn(hidden, str(memory))
+        blob = (work / 'memory' / 'evidence.jsonl').read_bytes()
+        self.assertNotIn(hidden.encode(), blob)
+        self.assertNotIn(b'oversized-backlink', blob)
+        result, = self.values(work, [('get_evidence', {'id': 'J'})])
+        self.assertNotIn('counterevidence', result['results'][0])
+        self.state.reports['R3'] = {'version_after': self.state.version}
+        trusted_passages(self.state, memory)
+
+
+if __name__ == '__main__':
+    unittest.main()

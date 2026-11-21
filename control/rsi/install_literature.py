@@ -34,39 +34,39 @@ class ConfigNotUpdated(Exception):
     """work/ holds the saved version, but refreshing the Lab's configuration failed."""
 
 
-def _no_links(staged: Path, relative: Path) -> Path:
+def _no_links(staged: Path, relative: Path, label: str = "Literature") -> Path:
     """staged/relative, after refusing a link in any of its components. The checkout is private and static."""
     path = staged
     for part in relative.parts:
         path = path / part
         if path.is_symlink():
-            raise Refused(f'Literature install found a link at {path.relative_to(staged)}')
+            raise Refused(f'{label} install found a link at {path.relative_to(staged)}')
     return path
 
 
-def _target(staged: Path, relative: Path) -> Path:
+def _target(staged: Path, relative: Path, label: str = "Literature") -> Path:
     """A file of the checkout to read or write: no link in its path, and a file if it exists."""
-    path = _no_links(staged, relative)
+    path = _no_links(staged, relative, label)
     path.parent.mkdir(exist_ok=True, parents=True)
     if path.exists() and not path.is_file():
-        raise Refused(f'Literature install expected a file at {relative}')
+        raise Refused(f'{label} install expected a file at {relative}')
     return path
 
 
-def _toml(path: Path, name: str) -> tuple[str, dict]:
+def _toml(path: Path, name: str, label: str = "Literature") -> tuple[str, dict]:
     """The text of a TOML file of the version and what it holds; Refused, naming the file, when it is not TOML."""
     try:
         text = path.read_text(encoding='utf-8')
         return text, tomllib.loads(text)
     except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
         raise Refused(f'{name} in the current version is not valid TOML ({" ".join(str(error).split())}), so '
-                      'Literature was not installed. Fix the file, then run rsi install-literature again.') from None
+                      f'{label} was not installed. Fix the file, then run rsi install-{label.lower()} again.') from None
 
 
-def _extend_role(text: str, role: dict, addition: str) -> str:
+def _extend_role(text: str, role: dict, addition: str, label: str = "Literature") -> str:
     old = role.get('developer_instructions')
     if not isinstance(old, str):
-        raise Refused(f'{ROLE} needs developer_instructions before installing Literature')
+        raise Refused(f'{ROLE} needs developer_instructions before installing {label}')
     if addition in old:
         return text
     expected = {**role, 'developer_instructions': old.rstrip() + '\n\n' + addition + '\n'}
@@ -89,7 +89,7 @@ def _extend_role(text: str, role: dict, addition: str) -> str:
                 except tomllib.TOMLDecodeError:
                     continue
             break
-    raise Refused(f'Could not merge the Literature instructions in {ROLE}')
+    raise Refused(f'Could not merge the {label} instructions in {ROLE}')
 
 
 def _install_package(staged: Path, seed: Path) -> list[str]:
@@ -136,48 +136,58 @@ def _install_package(staged: Path, seed: Path) -> list[str]:
     return lines
 
 
+def merge_service(staged: Path, seed: Path, name: str) -> None:
+    """Merge exactly the named service from the seed's settings, keeping the checkout's other TOML intact."""
+    label = name.capitalize()
+    path = _target(staged, Path(SETTINGS), label)
+    service = tomllib.loads((seed / SETTINGS).read_text(encoding='utf-8'))['tool_servers'][name]
+    text, current = _toml(path, SETTINGS, label) if path.exists() else ('', {})
+    servers = current.get('tool_servers', {})
+    if not isinstance(servers, dict):
+        raise Refused(f'{label} install requires tool_servers to be a TOML table')
+    if name in servers:
+        if servers[name] != service:
+            raise Refused(f'{label} install conflict: a different tool_servers.{name} is already configured')
+        return
+    block = '\n'.join([f'[tool_servers.{name}]', *(f'{key} = {toml_value(value)}' for key, value in service.items())])
+    merged = text.rstrip() + '\n\n' + block + '\n'
+    expected = {**current, 'tool_servers': {**servers, name: service}}
+    try:
+        valid = tomllib.loads(merged) == expected
+    except tomllib.TOMLDecodeError:
+        valid = False
+    if not valid:
+        # A TOML inline table is closed. Extend it in place and verify the parsed edit before applying it.
+        for match in re.finditer(r"""(?m)^[ \t]*["']?tool_servers["']?\s*=\s*\{""", text):
+            value = name + ' = ' + toml_value(service) + (', ' if servers else '')
+            merged = text[:match.end()] + value + text[match.end():]
+            try:
+                if tomllib.loads(merged) == expected:
+                    break
+            except tomllib.TOMLDecodeError:
+                continue
+        else:
+            raise Refused(f'Could not merge {label} into the existing tool_servers table')
+    path.write_text(merged, encoding='utf-8')
+
+
 def _install_files(staged: Path, seed: Path) -> list[str]:
     """Install the seed's Literature into the checkout; the lines of _install_package."""
     lines = _install_package(staged, seed)
-
-    path = _target(staged, Path(SETTINGS))
-    seed_settings = (seed / SETTINGS).read_text(encoding='utf-8')
-    header = '[tool_servers.literature]'
-    block = seed_settings[seed_settings.index('\n' + header):].strip()
-    service = tomllib.loads(block)['tool_servers']['literature']
-    text, current = _toml(path, SETTINGS) if path.exists() else ('', {})
-    servers = current.get('tool_servers', {})
-    if not isinstance(servers, dict):
-        raise Refused('Literature install requires tool_servers to be a TOML table')
-    if 'literature' in servers:
-        if servers['literature'] != service:
-            raise Refused('Literature install conflict: a different tool_servers.literature is already configured')
-    else:
-        merged = text.rstrip() + '\n\n' + block + '\n'
-        try:
-            tomllib.loads(merged)
-        except tomllib.TOMLDecodeError:
-            # A TOML inline table is closed. Extend it in place and verify the parsed edit before applying it.
-            expected = {**current, 'tool_servers': {**servers, 'literature': service}}
-            for match in re.finditer(r"""(?m)^[ \t]*["']?tool_servers["']?\s*=\s*\{""", text):
-                value = 'literature = ' + toml_value(service) + (', ' if servers else '')
-                merged = text[:match.end()] + value + text[match.end():]
-                try:
-                    if tomllib.loads(merged) == expected:
-                        break
-                except tomllib.TOMLDecodeError:
-                    continue
-            else:
-                raise Refused('Could not merge Literature into the existing tool_servers table') from None
-        path.write_text(merged, encoding='utf-8')
-
+    merge_service(staged, seed, 'literature')
     path = _target(staged, Path(ROLE))
     seed_role = (seed / ROLE).read_text(encoding='utf-8')
     if not path.exists():
+        # A Stage L-only installation can precede the memory reader.
+        if 'memory' not in tomllib.loads((staged / SETTINGS).read_text(encoding='utf-8'))['tool_servers']:
+            for paragraph in tomllib.loads(seed_role)['developer_instructions'].strip().split('\n\n'):
+                if paragraph.startswith('Use the scientific-memory skill'):
+                    seed_role = seed_role.replace('\n\n' + paragraph, '', 1)
         path.write_text(seed_role, encoding='utf-8')
     else:
         text, role = _toml(path, ROLE)
-        addition = tomllib.loads(seed_role)['developer_instructions'].rstrip().rsplit('\n\n', 1)[1]
+        addition = next(p for p in tomllib.loads(seed_role)['developer_instructions'].strip().split('\n\n')
+                        if p.startswith('Use the local literature tools'))
         path.write_text(_extend_role(text, role, addition), encoding='utf-8')
     return lines
 
@@ -196,9 +206,9 @@ def _restage(layout: Layout, records: Records, store, envelope: dict, root_fd: i
     return lines, 'not_in_work'
 
 
-def _note(records: Records, data: dict, lines: list[str]) -> None:
-    with problem(lines, f'The install could not be noted in records/ ({NOTE})'):
-        records.note(NOTE, data)
+def _note(records: Records, name: str, data: dict, lines: list[str]) -> None:
+    with problem(lines, f'The install could not be noted in records/ ({name})'):
+        records.note(name, data)
 
 
 def install_literature(layout: Layout, seed: Path, lines: list[str] | None = None) -> tuple[str, str]:
@@ -210,14 +220,22 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
     is noted in records/index.jsonl as a `literature_install` line. Installed and unchanged versions record the
     suffix `_but_not_in_work` or `_but_config_not_updated` when the corresponding step fails. A refusal also
     records the usual `refusal` note, including problems met restoring work/ and its configuration."""
+    return install_feature(layout, seed, lines, name='literature', install_files=_install_files,
+                           message='Install the Literature tool server')
+
+
+def install_feature(layout: Layout, seed: Path, lines: list[str] | None, *, name: str, install_files,
+                    message: str) -> tuple[str, str]:
+    """Under the command lock, preserve manual changes, commit the feature as one version and restore work/."""
+    label, command, note = name.capitalize(), 'install-' + name, name + '_install'
     lines = [] if lines is None else lines
     records = Records(layout.records)
-    context = {'command': 'install-literature'}
+    context = {'command': command}
     with noting_refusals(records, context), root_descriptor(layout) as root_fd:
         unrecovered(layout, records)
         store, envelope = open_store(layout), load_envelope(layout.owner)
         notes = []
-        take_work(layout, records, store, root_fd, records.calls(), context, notes)
+        take_work(layout, records, store, root_fd, records.calls(), context, notes, preserved=lines)
         baseline = None
         try:
             baseline = store.head()                     # work/ is sealed by now: any failure puts it back
@@ -225,17 +243,17 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
                 raise Refused('The pre-install workspace needed attention: ' + ' '.join(notes))
             staged, _ = stage(layout, store, baseline)
             try:
-                changed = _install_files(staged, seed)
+                changed = install_files(staged, seed)
                 settings = load_settings(staged)
                 if settings.problems:
-                    raise Refused('Literature install found invalid workspace settings: ' + ' '.join(settings.problems))
-                version = store.commit(staged, 'owner', 'Install the Literature tool server') or baseline
+                    raise Refused(f'{label} install found invalid workspace settings: ' + ' '.join(settings.problems))
+                version = store.commit(staged, 'owner', message) or baseline
             finally:
                 discard(staged)
         except BaseException as error:
             restaged, _ = _restage(layout, records, store, envelope, root_fd, context)
             outcome = 'refused' if isinstance(error, Refused) else 'failed'
-            _note(records, {'outcome': outcome, 'baseline': baseline, 'version': None, 'lines': restaged,
+            _note(records, note, {'outcome': outcome, 'baseline': baseline, 'version': None, 'lines': restaged,
                             **context}, restaged)
             lines += restaged
             if isinstance(error, Refused) and restaged:
@@ -246,14 +264,14 @@ def install_literature(layout: Layout, seed: Path, lines: list[str] | None = Non
         outcome = 'installed' if version != baseline else 'unchanged'
         if failure:
             outcome += '_but_' + failure
-        _note(records, {'outcome': outcome, 'baseline': baseline, 'version': version, 'lines': changed + restaged,
+        _note(records, note, {'outcome': outcome, 'baseline': baseline, 'version': version, 'lines': changed + restaged,
                         **context}, lines)
         if failure:
-            saved = (f'Literature was installed in {version} (roll back with: rsi rollback {baseline})'
-                     if version != baseline else f'Literature was already installed in {version}')
+            saved = (f'{label} was installed in {version} (roll back with: rsi rollback {baseline})'
+                     if version != baseline else f'{label} was already installed in {version}')
             if failure == 'config_not_updated':
                 raise ConfigNotUpdated(f'{saved}. work/ holds {version}. Fix the configuration error below and run '
-                                       'rsi install-literature again to refresh codex-home/config.toml.')
+                                       f'rsi {command} again to refresh codex-home/config.toml.')
             raise NotInWork(f'{saved}, but work/ could not be replaced by that version, so there is no usable work/ '
                             f'now: {"; ".join(restaged)}. Run rsi recover to put the newest version into work/.')
     return baseline, version

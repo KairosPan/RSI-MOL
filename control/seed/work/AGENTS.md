@@ -21,3 +21,8 @@ completion criteria.
   `codex/agents/`, and the skills under `skills/`. A skill is `skills/<name>/SKILL.md`. Before each run the control
   program copies `skills/` to `.agents/skills/`, where Codex loads skills; edit `skills/`, never the copy (you
   cannot write `.agents/`). Changes take effect from the next task.
+
+Use the scientific-memory skill at task start. Call `memory_status` and search with the task question.
+Check `lookup_sources` before delegating literature research. For historical citations, give the source run,
+evidence ID and revision, document ID and version, original SHA-256, locator and exact quote.
+Distinguish memory deliveries, passages read in this run and passages returned by both tools.

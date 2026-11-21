@@ -390,6 +390,20 @@ class Recover(unittest.TestCase):
 
 
 class Commands(unittest.TestCase):
+    def test_design_lists_the_cold_start_and_owner_commands_in_their_tables(self):
+        design = (LAUNCHER.parent / 'docs/design-memory.md').read_text()
+        conditions = design.split('### 5.5 ', 1)[1].split('### 5.6 ', 1)[0]
+        rows = [line.strip('|').split('|') for line in conditions.splitlines() if line.startswith('|')]
+        self.assertTrue(rows and all(len(row) == 4 for row in rows))
+        none, = [row for row in rows if '`none`' in row[0]]
+        args = none[1].strip().strip('`').split()
+        self.assertEqual(args[0], 'rsi')
+        self.assertEqual(cli._parse(args[1:]), ('task', {'task': args[2], 'memory': 'none', 'meta': True}))
+        commands = design.split('### 5.7 ', 1)[1].split('### ', 1)[0]
+        for action in ('source-changed', 'withdraw'):
+            entry, = [line for line in commands.splitlines() if line.startswith(f'| `rsi memory {action} ')]
+            self.assertEqual(len(entry.strip('|').split('|')), 2)
+
     def test_lock(self):
         with Root() as root, locked(root.layout):
             with self.assertRaises(Refused):
