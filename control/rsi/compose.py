@@ -165,7 +165,8 @@ def native_codex(layout: Layout) -> str:
     return programs.native_codex(layout.root)
 
 
-def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, codex: str, permissions: dict) -> dict:
+def _local_server(layout: Layout, workspace: Path, profile: str, name: str, server: dict, codex: str,
+                  permissions: dict) -> dict:
     """A local tool server started through `codex sandbox` under the run's profile, or its _net variant when the
     server has network. Workspace paths in its command and arguments become absolute paths in this workspace.
     (load_settings has already left out a server whose paths leave the workspace.)
@@ -180,6 +181,12 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, c
         command = str(workspace / os.path.normpath(command))
     args = [str(workspace / os.path.normpath(arg)) if is_workspace_path(arg, workspace) else arg
             for arg in server['args']]
+    if name == 'literature':
+        # Poppler and Python only read env/. Keep this change private to the wrapper; the Lab can still install
+        # packages. Trial's shared library is already read-only.
+        permissions = copy.deepcopy(permissions)
+        for rules in permissions.values():
+            rules['filesystem'][str(layout.env)] = 'read'
     sandbox = ['sandbox', '-c', 'permissions=' + toml_value(permissions)]
     if server['network']:
         sandbox += ['-c', 'features=' + toml_value({'network_proxy': True}), '-P', profile + '_net',
@@ -187,6 +194,9 @@ def _local_server(layout: Layout, workspace: Path, profile: str, server: dict, c
     else:
         sandbox += ['-P', profile]
     in_sandbox = ['/usr/bin/env', 'PATH=' + _path(layout), 'TMPPREFIX=' + _tmpprefix(workspace)]
+    if name == 'literature':
+        # macOS's CA bundle is readable under :minimal. Homebrew OpenSSL's default certificate folder is not.
+        in_sandbox.append('SSL_CERT_FILE=/etc/ssl/cert.pem')
     return {'command': codex, 'args': [*sandbox, '--', *in_sandbox, command, *args],
             'env': {'CODEX_HOME': str(wrapper_home(layout)), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
@@ -354,7 +364,9 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     if settings.web_search is not None:
         config['web_search'] = settings.web_search
     features = copy.deepcopy(envelope.get('features', {}))
-    if settings.network or any(server.get('network') for server in settings.tool_servers.values()):
+    if settings.network:
+        # Only for the Lab's commands. A local tool server with network gets its proxy from its own wrapper
+        # (_local_server), whatever this says: measured with Codex 0.170.0, and by `rsi check`.
         features['network_proxy'] = True
     agents = {'max_depth': settings.max_depth, 'max_concurrent_threads_per_session': settings.max_threads}
     for name, role in settings.roles.items():
@@ -366,7 +378,8 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
         codex = codex or native_codex(layout)
     permissions = profiles(layout, envelope)
     servers = {name: dict(server) if 'url' in server
-               else _local_server(layout, workspace, base, server, codex, permissions) for name, server in kept.items()}
+               else _local_server(layout, workspace, base, name, server, codex, permissions)
+               for name, server in kept.items()}
     config.update({
         'features': features,
         'shell_environment_policy': _shell(layout, workspace),
@@ -542,15 +555,16 @@ def _write_config(path: Path, text: str) -> None:
     _sync_folder(path.parent)
 
 
-def write_home_config(layout: Layout, envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo) -> None:
+def write_home_config(layout: Layout, envelope: dict, settings: Settings, *, resolve=socket.getaddrinfo,
+                      codex: str | None = None) -> None:
     """codex-home/config.toml for opening the Lab Codex by hand: the task-run configuration, but interactive,
-    with the role copies of work/ written first.
+    with the role copies of work/ written first. codex: as for lab_config.
 
     It never holds a `projects` table: a trusted project would let a `.codex/config.toml` in that folder override
     this configuration. (Rewriting the file also drops any trust Codex itself recorded during manual use.) A
     config.toml of the owner's (see keep_owner_config) is copied and verified first; Refused, and nothing replaced,
     when that cannot be done."""
-    config = lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve)
+    config = lab_config(layout, envelope, settings, trial=False, interactive=True, resolve=resolve, codex=codex)
     if 'projects' in config:
         raise Refused("The Lab's Codex configuration must not have a projects table")
     text = render_file(config)

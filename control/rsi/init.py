@@ -17,9 +17,12 @@ handling what was in it. trial/ and candidate/ are made by the runs that use the
 
 recover marks every call still `started` as `interrupted` (a call is never started again), first stopping the process
 group recorded in the call's process.json when it is provably that call's (SIGTERM, then SIGKILL after STOP_GRACE
-seconds); it moves what only an interrupted run leaves (entries of staging/ and sealed entries in the root) under
-sealed/, never deleting or reading them, and puts main's head back into a missing work/. Until it has run, rsi task,
-meta and rollback refuse to start (rsi.labrun.unrecovered).
+seconds). For a call that had the literature server, it first copies that server's own call log into the record
+(rsi.labrun.interrupted_literature): it reads, through descriptors, only `.tmp/literature/calls/` of the call's own
+sealed entry, or of the live work/ or trial/ when that is still the call's (by its identity), which it seals for the
+read and renames back. Then it moves what only an interrupted run leaves (entries of staging/ and sealed entries in
+the root) under sealed/, never deleting them or reading anything else in them, and puts main's head back into a
+missing work/. Until it has run, rsi task, meta and rollback refuse to start (rsi.labrun.unrecovered).
 """
 import fcntl
 import json
@@ -37,8 +40,8 @@ from pathlib import Path
 from rsi.codexrun import codex_environment, codex_program
 from rsi.compose import (ENVELOPE, HOME_CONFIG, TOOL_FOLDERS, backup_names, keep_owner_config, load_envelope,
                          read_regular, write_home_config)
-from rsi.labrun import (MANUAL, PROCESS_FILE, WORKSPACE_ERRORS, discard, move_in, now, process_start, refusing,
-                        restore_work, root_descriptor, settle, stage, stamp)
+from rsi.labrun import (MANUAL, PROCESS_FILE, WORKSPACE_ERRORS, discard, interrupted_literature, move_in, now,
+                        process_start, refusing, restore_work, root_descriptor, settle, stage, stamp)
 from rsi.paths import Layout, Refused
 from rsi.records import STARTED, Records
 from rsi.settings import Settings
@@ -213,7 +216,7 @@ def _first_version(layout: Layout, store: VersionStore, seed: Path, report: dict
     layout.staging.mkdir(exist_ok=True)
     folder = layout.staging / stamp()
     try:
-        shutil.copytree(seed / 'work', folder, symlinks=True)
+        shutil.copytree(seed / 'work', folder, symlinks=True, ignore=shutil.ignore_patterns('__pycache__'))
         report['first_version'] = store.commit(folder, 'init', 'First version (made by rsi init from the seed files)')
     finally:
         discard(folder)
@@ -224,7 +227,7 @@ def _add_seed_files(source: Path, tree: Path) -> list[str]:
     follows a link (every folder is opened with O_NOFOLLOW relative to its parent). Lines for what was not added."""
     lines = []
     for path in sorted(source.rglob('*')):
-        if path.is_symlink() or not path.is_file():
+        if '__pycache__' in path.relative_to(source).parts or path.is_symlink() or not path.is_file():
             continue
         relative, fds = path.relative_to(source), []
         try:
@@ -518,7 +521,10 @@ def recover(layout: Layout, moved: list[str] | None = None) -> list[str]:
             continue
         signalled, killed = _stop_group(records, call['id'])
         try:
-            records.finish_call(call['id'], {'status': 'interrupted', 'ended': now(), 'usage': None})
+            end = {'status': 'interrupted', 'ended': now(), 'usage': None}
+            if 'literature_workspace' in call:
+                end['problems'] = interrupted_literature(layout, records, call)
+            records.finish_call(call['id'], end)
         except (KeyError, ValueError):
             continue
         records.note('recovered', {'call': call['id'], 'signalled': signalled, 'killed': killed})

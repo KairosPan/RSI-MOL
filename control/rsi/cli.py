@@ -1,4 +1,4 @@
-"""Command line of the control program: init, check, task, meta, status, rollback, recover.
+"""Command line of the control program: init, check, install-literature, task, meta, status, rollback, recover.
 
 Every command but `status` holds the lock (rsi.init.locked), so two never run at once. Exit codes: 0 done, 2 usage,
 3 refused (a Refused, or a request that fails the checks made before anything runs: an unknown task, a bad or
@@ -18,6 +18,7 @@ from rsi.check import CHECK_FILE, check_state, run_check
 from rsi.init import init, locked, recover
 from rsi.labrun import noting_refusals, run_task, unrecovered
 from rsi.limits import usage_by_class
+from rsi.install_literature import ConfigNotUpdated, NotInWork, install_literature
 from rsi.meta import RELEASE_FILE, rollback, run_round
 from rsi.paths import Layout, Refused, find_layout
 from rsi.programs import clean_path, inside
@@ -54,6 +55,7 @@ USAGE = """Usage: rsi <command>
   init                 make the folders and the version store, write the two Codex configurations, and check
                        whether the two Codex homes are signed in
   check                test the isolation requirements one by one; no model is called
+  install-literature   merge the Literature service into the current Lab workspace and print its rollback version
   task <id>            run a task, then a Meta round; with --no-meta, only the task
   meta                 run a Meta round on the task runs that no round has looked at (none: no round)
   status [--json]      the current version, recent runs and releases, pending applications, costs by class
@@ -84,7 +86,7 @@ def _parse(args: list[str]) -> tuple[str, dict]:
     if not args:
         raise Usage('')
     command, rest = args[0], args[1:]
-    if command in ('init', 'check', 'meta', 'recover') and not rest:
+    if command in ('init', 'check', 'meta', 'recover', 'install-literature') and not rest:
         return command, {}
     if command == 'status' and rest in ([], ['--json']):
         return command, {'json': bool(rest)}
@@ -511,4 +513,22 @@ def _recover(layout: Layout) -> int:
     return 0
 
 
-COMMANDS = {'init': _init, 'check': _check, 'task': _task, 'meta': _meta, 'rollback': _rollback, 'recover': _recover}
+def _install_literature(layout: Layout) -> int:
+    lines = []
+    try:
+        baseline, version = install_literature(layout, SEED / 'work', lines)
+    except (NotInWork, ConfigNotUpdated) as error:
+        _error(error)
+        _print([f'  {safe(line)}' for line in lines], sys.stderr)
+        return 1
+    if baseline == version:
+        out = [f'Literature already installed in {safe(version, ID_CHARS)}.']
+    else:
+        out = [f'Literature installed in {safe(version, ID_CHARS)}. Roll back with: rsi rollback '
+               f'{safe(baseline, ID_CHARS)}']
+    _print(out + [f'  {safe(line)}' for line in lines])
+    return 0
+
+
+COMMANDS = {'init': _init, 'check': _check, 'task': _task, 'meta': _meta, 'rollback': _rollback, 'recover': _recover,
+            'install-literature': _install_literature}

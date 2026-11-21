@@ -16,22 +16,30 @@ socket path must stay under about 100 bytes); they are closed and removed at the
 the owner's rights, so it creates and removes nothing elsewhere, never follows a link when cleaning up, and gives
 every Codex process a time limit (a probe that runs out of time is a failed case).
 
-The three layers:
+Every Lab configuration it composes for a scratch workspace has the seed's local tool server with network
+(SHIPPED_SERVER), so what is measured is the configuration the Lab runs with.
+
+The layers:
 - commands: `codex sandbox <composed permissions and features> -P <profile> [--enable network_proxy] -- python3 -c
   PROBE`, one batch per profile that prints one JSON line per case, plus one run with a `.codex` link planted in the
   workspace. A case is `blocked` when every attempt failed with EPERM or EACCES (or a proxy refused it), `allowed`
   when one went through, and `unknown` otherwise; what is on disk, and what the listeners accepted, override the
   probe's own word when they show that something went through. Among them: no agent can create `.codex` or `.agents`
-  (what Codex loads) in a writable root, in any letter case, by mkdir, rename or link.
+  (what Codex loads) in a writable root, in any letter case, by mkdir, rename or link; and under the profiles without
+  network (OFFLINE), a command has no proxy variable and cannot connect out.
 - the edit tool and the shell: one real `codex exec` of the Lab and one of the Meta configuration against a scripted
   endpoint (no model is called), whose script asks tools.apply_patch for each edit case and then runs each shell case
   through tools.exec_command (the path the agents' commands take), with saved command rules planted in the scratch
-  Codex home that must have no effect; judged by what is on disk. The Meta run also
+  Codex home that must have no effect; judged by what is on disk. Then the network cases (NETWORK): the probe as a
+  command (no proxy variable, no connection out or to a local service), and, in the Lab run, inside the seed's
+  networked tool server as Codex starts it (it has its proxy, and still reaches no local service). The Meta run also
   shows whether Codex loads an AGENTS.md planted in meta/ (the Lab run, as a control of that method, whether it loads
   one from work/).
 - info, which passes or fails nothing: whether Meta's Codex would load a skill someone else put in meta/.agents/, and
   whether the Lab can create work/.agents or write in one that exists.
-- tool servers: a local stdio tool server composed from settings and started exactly as compose wraps it.
+- tool servers: a local stdio tool server composed from settings and started exactly as compose wraps it; and the
+  literature cases: the probe started through the seed's literature server's own wrapper under lab_net and trial_net
+  (what it may write, that it reads no task check script or owner file, its proxy, no local service).
 Static checks on the real root read nothing an agent can write: the root's path, that the root holds nothing Codex
 loads from a project root (AGENTS.md, AGENTS.override.md, .agents, .codex), codex-home/config.toml, and whether the
 envelope composes for the real root.
@@ -115,6 +123,24 @@ SHELLS = {
 }
 RULES = ('prefix_rule(pattern = ["touch"], decision = "allow")\n'
          'prefix_rule(pattern = ["mkdir"], decision = "forbidden")\n')
+# The tool server the seed ships (seed/work/codex/settings.toml has this table): every Lab configuration the check
+# composes for a scratch workspace has it, so what is measured is what the Lab runs with, a local tool server with
+# network beside commands without it.
+SHIPPED_SERVER = ('[tool_servers.literature]\ncommand = "python3"\nargs = ["-B", "tools/literature/server.py"]\n'
+                  'network = true\n')
+# An address no host answers (TEST-NET-1, RFC 5737): a direct connection out that the sandbox let through would end
+# in a time-out (`unknown`, a failed case), never at a real host.
+OUTSIDE_ADDRESS = ('192.0.2.1', 443)
+# Command cases of the profiles without network (lab, trial, meta), after the COMMANDS cases: no proxy variable in a
+# command's environment, and no direct connection out. name -> expected.
+OFFLINE = {'proxy_variables': B, 'connect_out': B}
+# Network cases of the edit layer (the real `codex exec`), from the probe's lines in the script's output: name ->
+# expected for (the Lab configuration, the Meta configuration). The shell_ cases run the probe as a command through
+# exec_command; the tool_server_ cases run it inside the seed's networked tool server, started by Codex through its
+# wrapper (the Lab configuration only).
+NETWORK = {'shell_proxy_variables': (B, B), 'shell_connect_out': (B, B), 'shell_local_tcp': (B, B),
+           'tool_server_proxy': (A, None), 'tool_server_local_tcp': (B, None)}
+LOOPBACK_STEPS = ('tcp', 'http_proxy', 'connect_proxy', 'socks_proxy')
 # What Codex loads as instructions: name -> (profile, expected). `blocked`: not loaded; the Lab's is the control.
 LOADING = {'meta_agents_md_not_loaded': ('meta', B), 'lab_agents_md_loaded': ('lab', A)}
 # What an agent must not create in a writable root, since Codex loads it (the create_dot_* cases): the name and its
@@ -206,6 +232,19 @@ def tcp(port):
         pass
 
 
+def connect(host, port):
+    with socket.create_connection((host, port), timeout=5):
+        pass
+
+
+def proxy_variables():
+    found = [name for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
+             if os.environ.get(name)]
+    if not found:
+        raise Blocked('no proxy variable is set')
+    return 'set: ' + ', '.join(found)
+
+
 def unix(path):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
         conn.settimeout(5)
@@ -269,14 +308,15 @@ def poppler(program, pdf, target):
 
 
 STEPS = {'write': write, 'read': read, 'listing': listing, 'mkdir': mkdir, 'rename': rename, 'symlink': symlink,
-         'rmdir': rmdir, 'tcp': tcp, 'unix': unix, 'http_proxy': http_proxy, 'connect_proxy': connect_proxy,
-         'socks_proxy': socks_proxy, 'zsh': zsh, 'poppler': poppler}
+         'rmdir': rmdir, 'tcp': tcp, 'connect': connect, 'unix': unix, 'http_proxy': http_proxy,
+         'connect_proxy': connect_proxy, 'socks_proxy': socks_proxy, 'zsh': zsh, 'poppler': poppler,
+         'proxy_variables': proxy_variables}
 
 for case in SPEC['cases']:
     seen, details = [], []
     for step, *args in case['steps']:
         try:
-            STEPS[step](*args)
+            said = STEPS[step](*args)
         except Skipped:
             continue
         except Blocked as error:
@@ -287,12 +327,47 @@ for case in SPEC['cases']:
         except Exception as error:
             outcome, why = 'unknown', f'{type(error).__name__}: {error}'
         else:
-            outcome, why = 'allowed', ''
+            outcome, why = 'allowed', said or ''
         seen.append(outcome)
         details.append(f'{step} {outcome}' + (f' ({why})' if why else ''))
     observed = 'allowed' if 'allowed' in seen else 'unknown' if 'unknown' in seen or not seen else 'blocked'
     print('RSI-CHECK ' + json.dumps({'name': case['name'], 'observed': observed, 'detail': '; '.join(details)}),
           flush=True)
+'''
+# The edit layer's tool server: a stdio MCP server (it is written after `SPEC = ...` and `PROBE = ...`) whose one tool,
+# `probe`, runs PROBE on SPEC inside the server and answers with the probe's lines.
+TOOL_PROBE = r'''
+import contextlib, io, json, sys
+
+
+def probe():
+    sys.argv[1:] = [SPEC]
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        exec(compile(PROBE, 'probe', 'exec'), {'__name__': 'probe'})
+    return out.getvalue()
+
+
+for line in sys.stdin:
+    try:
+        message = json.loads(line)
+    except ValueError:
+        continue
+    if not isinstance(message, dict) or 'id' not in message:
+        continue
+    method, params = message.get('method'), message.get('params') or {}
+    if method == 'initialize':
+        result = {'protocolVersion': params.get('protocolVersion', '2025-06-18'), 'capabilities': {'tools': {}},
+                  'serverInfo': {'name': 'rsi-check', 'version': '1'}}
+    elif method == 'tools/list':
+        result = {'tools': [{'name': 'probe', 'description': 'rsi check',
+                             'inputSchema': {'type': 'object', 'properties': {}}}]}
+    elif method == 'tools/call':
+        result = {'content': [{'type': 'text', 'text': probe()}]}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}) + '\n')
+    sys.stdout.flush()
 '''
 
 
@@ -322,6 +397,13 @@ def _result(name: str, profile: str, expected: str, observed: str, detail: str =
 def _family(profile: str) -> int:
     """The column of COMMANDS for a profile."""
     return 2 if profile == 'meta' else 1 if profile.startswith('trial') else 0
+
+
+def _expected(name: str, profile: str) -> str | None:
+    """What a command case of COMMANDS or OFFLINE must observe under profile; None when it is not a case there."""
+    if name in OFFLINE:
+        return None if profile.endswith('_net') else OFFLINE[name]
+    return COMMANDS[name][_family(profile)]
 
 
 def _workspace(layout: Layout, profile: str) -> Path:
@@ -492,7 +574,10 @@ class _Listener:
             self._take(conn)
 
     def close(self) -> int:
-        """Stop, count what is still waiting to be accepted, close; how many connections came in all."""
+        """Stop, count what is still waiting to be accepted, close; how many connections came in all. Again after
+        that: the same count."""
+        if self.socket.fileno() == -1:
+            return self.accepted
         self._stop.set()
         self._thread.join(timeout=5)
         self.socket.setblocking(False)
@@ -621,6 +706,7 @@ def _command_cases(layout: Layout, profile: str, ports: dict, pdftotext: str | N
         (workspace / 'rsi-check.pdf').write_bytes(_pdf('rsi-check'))
         cases.append(_Case('run_poppler', [['poppler', pdftotext, str(workspace / 'rsi-check.pdf'),
                                             str(workspace / 'rsi-check-pdf.txt')]]))
+    cases += [_Case('proxy_variables', [['proxy_variables']]), _Case('connect_out', [['connect', *OUTSIDE_ADDRESS]])]
     steps = []
     for folder in own:
         moved, link = folder.with_name(folder.name + '-moved'), folder.with_name(folder.name + '-link')
@@ -629,7 +715,7 @@ def _command_cases(layout: Layout, profile: str, ports: dict, pdftotext: str | N
     cases.append(_Case('replace_own_root', steps,
                        written=[folder.with_name(folder.name + suffix) for folder in own
                                 for suffix in ('-moved', '-link')], kept=own))
-    return [case for case in cases if COMMANDS[case.name][_family(profile)] is not None]
+    return [case for case in cases if _expected(case.name, profile) is not None]
 
 
 @dataclass
@@ -656,12 +742,15 @@ def _sandbox(context: _Context, config: dict, profile: str, home: Path, cwd: Pat
     spec = {'token': context.token, 'net': net,
             'cases': [{'name': case.name, 'steps': case.steps} for case in cases]}
     command = [context.codex, 'sandbox', *render_flags({'permissions': config['permissions'], 'features': features}),
-               '-P', profile, *(['--enable', 'network_proxy'] if net else []), '--',
-               context.python, '-I', '-B', '-c', PROBE, json.dumps(spec)]
+               '-P', profile, *(['--enable', 'network_proxy'] if features.get('network_proxy') is True else []),
+               '--', context.python, '-I', '-B', '-c', PROBE, json.dumps(spec)]
     env = {key: value for key, value in codex_environment(home, secrets=False, root=context.root).items()
            if key not in PROXY_VARIABLES}
     env.update(config['shell_environment_policy']['set'])
-    code, out, err = _run(command, cwd=cwd, env=env, timeout=PROBE_SECONDS)
+    return _probe_results(*_run(command, cwd=cwd, env=env, timeout=PROBE_SECONDS))
+
+
+def _probe_results(code: int | None, out: str, err: str) -> tuple[dict, str]:
     found = {}
     for line in out.splitlines():
         if not line.startswith(LINE):
@@ -695,12 +784,13 @@ def _judge(case: _Case, found: dict, why: str, accepted: dict) -> tuple[str, str
 def _command_layer(context: _Context, scratch: Path, profile: str) -> list[dict]:
     """Every command case of one profile, in its own scratch root: the batch, then the run with a planted `.codex`
     link."""
-    family = _family(profile)
-    names = [name for name, expected in COMMANDS.items() if expected[family] is not None]
+    names = [name for name in (*COMMANDS, *OFFLINE) if _expected(name, profile) is not None]
     results = []
     try:
         layout = _build(scratch / profile)
         workspace = _workspace(layout, profile)
+        if profile != 'meta':
+            _ship_settings(workspace)
         config = (meta_config(layout, context.envelope, {}) if profile == 'meta'
                   else lab_config(layout, context.envelope, load_settings(workspace),
                                   trial=profile.startswith('trial'), resolve=_no_lookup, codex=context.codex))
@@ -718,7 +808,7 @@ def _command_layer(context: _Context, scratch: Path, profile: str) -> list[dict]
             accepted = {'tcp': tcp.close(), 'unix': unix.close()}
         for case in cases:
             observed, detail = _judge(case, found, why, accepted)
-            results.append(_result(case.name, profile, COMMANDS[case.name][family], observed, detail))
+            results.append(_result(case.name, profile, _expected(case.name, profile), observed, detail))
             if case.name in OUTSIDE:                    # the check removes nothing outside its own folders
                 left = [str(path) for path in case.written if os.path.lexists(path)]
                 if left:
@@ -731,9 +821,16 @@ def _command_layer(context: _Context, scratch: Path, profile: str) -> list[dict]
             context.info.append(_existing_agents(context, layout, config, home, workspace))
     except Exception as error:
         done = {result['name'] for result in results}
-        results += [_result(name, profile, COMMANDS[name][family], UNKNOWN, f'the check could not be completed: '
+        results += [_result(name, profile, _expected(name, profile), UNKNOWN, f'the check could not be completed: '
                             f'{type(error).__name__}: {error}') for name in names if name not in done]
     return results
+
+
+def _ship_settings(workspace: Path) -> None:
+    """The Lab settings a scratch workspace gets before its configuration is composed: SHIPPED_SERVER (looked up when
+    called, so the test of `rsi check` can weaken it)."""
+    (workspace / 'codex').mkdir(exist_ok=True)
+    (workspace / 'codex' / 'settings.toml').write_text(SHIPPED_SERVER, encoding='utf-8')
 
 
 def _dot_codex_link(context: _Context, layout: Layout, profile: str, config: dict, home: Path,
@@ -782,9 +879,11 @@ def _patch(body: str) -> str:
     return '*** Begin Patch\n' + body + '*** End Patch\n'
 
 
-def _edit_script(edits: list[tuple[str, str]], commands: list[tuple[str, str]] = ()) -> str:
+def _edit_script(edits: list[tuple[str, str]], commands: list[tuple[str, str]] = (), probes: list[str] = (),
+                 tool: str | None = None) -> str:
     """JavaScript for Codex's `exec` tool: each patch through tools.apply_patch, then each shell command through
-    tools.exec_command (no login shell), one output line each, then DONE."""
+    tools.exec_command (no login shell), one output line each; then each probe command (its whole output, the
+    probe's lines) and the tool `tool` (its whole text), when given; then DONE."""
     lines, shown = [], 'String({}).slice(0, 300).replace(/\\s+/g, " ")'
     for name, patch in edits:
         applied, refused = json.dumps(name + ' applied\n'), json.dumps(name + ' refused: ')
@@ -795,6 +894,14 @@ def _edit_script(edits: list[tuple[str, str]], commands: list[tuple[str, str]] =
         lines.append(f'try {{ const r = await tools.exec_command({json.dumps({"cmd": command, "login": False})}); '
                      f'text({ran} + r.exit_code + ": " + {shown.format("r.output")} + "\\n"); }} catch (error) '
                      f'{{ text({refused} + {shown.format("error")} + "\\n"); }}')
+    for probe in probes:
+        lines.append(f'try {{ const r = await tools.exec_command({json.dumps({"cmd": probe, "login": False})}); '
+                     f'text(String(r.output) + "\\n"); }} catch (error) '
+                     f'{{ text("shell probe refused: " + {shown.format("error")} + "\\n"); }}')
+    if tool is not None:
+        lines.append(f'try {{ const r = await tools.{tool}({{}}); '
+                     f'text((r.content || []).map(part => String(part.text || "")).join("\\n") + "\\n"); }} '
+                     f'catch (error) {{ text("tool server probe refused: " + {shown.format("error")} + "\\n"); }}')
     lines.append(f'text({json.dumps(DONE)} + "\\n");')
     return '\n'.join(lines) + '\n'
 
@@ -826,7 +933,7 @@ def _edit_layer(context: _Context, scratch: Path, which: str) -> list[dict]:
     model."""
     meta = which == 'meta'
     column = 1 if meta else 0
-    names = [(name, expected[column]) for table in (EDITS, SHELLS) for name, expected in table.items()
+    names = [(name, expected[column]) for table in (EDITS, SHELLS, NETWORK) for name, expected in table.items()
              if expected[column] is not None]
     names += [(name, expected) for name, (profile, expected) in LOADING.items() if profile == which]
     model = ScriptedModel()
@@ -880,6 +987,52 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
              ('delete_existing_record', f'*** Delete File: {gone}\n', lambda: not os.path.lexists(gone))]
     edits = [edit for edit in edits if EDITS[edit[0]][column] is not None]
     commands = [case for case in _commands(layout, workspace) if SHELLS[case[0]][column] is not None]
+    listeners = {name: _Listener(socket.AF_INET, ('127.0.0.1', 0), context.token.encode())
+                 for name in (('shell',) if meta else ('shell', 'server'))}
+    try:
+        return _edit_exec(context, layout, which, model, url, workspace, edits, commands, listeners, (agents, skills))
+    finally:
+        for listener in listeners.values():
+            listener.close()
+
+
+def _network_cases(context: _Context, workspace: Path, meta: bool,
+                   listeners: dict) -> tuple[list[_Case], list[str], str | None]:
+    """The NETWORK cases of an edit run: the probe commands that run the shell_ cases, one each (Codex fails a whole
+    command whose connection its proxy refused, output and all), and, for the Lab, the name of the tool that runs the
+    tool_server_ cases inside the seed's networked tool server, written into the workspace with SHIPPED_SERVER as
+    its settings."""
+    def loopback(name: str, listener: str) -> _Case:
+        return _Case(name, [[step, listeners[listener].address[1]] for step in LOOPBACK_STEPS], listener=listener)
+
+    shell = [_Case('shell_proxy_variables', [['proxy_variables']]),
+             _Case('shell_connect_out', [['connect', *OUTSIDE_ADDRESS]]), loopback('shell_local_tcp', 'shell')]
+    script = workspace / 'rsi-check-probe.py'
+    script.write_text(PROBE, encoding='utf-8')
+    commands = []
+    for case in shell:
+        spec = {'token': context.token, 'net': False, 'cases': [{'name': case.name, 'steps': case.steps}]}
+        commands.append(' '.join(shlex.quote(part) for part in (context.python, '-I', '-B', str(script),
+                                                                json.dumps(spec))))
+    if meta:
+        return shell, commands, None
+    server = [_Case('tool_server_proxy', [['proxy_variables']]), loopback('tool_server_local_tcp', 'server')]
+    spec = {'token': context.token, 'net': True, 'cases': [{'name': c.name, 'steps': c.steps} for c in server]}
+    folder = workspace / 'tools' / 'literature'
+    folder.mkdir(parents=True)
+    (folder / 'server.py').write_text(f'SPEC = {json.dumps(spec)!r}\nPROBE = {PROBE!r}\n{TOOL_PROBE}', encoding='utf-8')
+    _ship_settings(workspace)
+    return shell + server, commands, 'mcp__literature__probe'
+
+
+def _edit_exec(context: _Context, layout: Layout, which: str, model: ScriptedModel, url: str, workspace: Path,
+               edits: list, commands: list, listeners: dict, markers: tuple[str, str]) -> list[dict]:
+    """The rest of _edit_run, with the listeners of the network cases open: the run, then every case judged.
+    markers: what the planted AGENTS.md files and the planted skill (Meta) say."""
+    meta = which == 'meta'
+    agents, skills = markers
+    column = 1 if meta else 0
+    network, probes, tool = _network_cases(context, workspace, meta, listeners)
     # Connectors and plugins have nothing to do with file confinement, and with the owner's set on, an unauthenticated
     # scratch home may fail or hang (every edit case `unknown`): this layer runs with both off.
     envelope = {**context.envelope, 'features': {**context.envelope.get('features', {}), 'apps': False,
@@ -888,7 +1041,7 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
         config, home = meta_config(layout, envelope, {}), layout.meta_home
     else:
         settings = load_settings(layout.work)                        # as before a task run
-        write_home_config(layout, envelope, settings, resolve=_no_lookup)
+        write_home_config(layout, envelope, settings, resolve=_no_lookup, codex=context.codex)
         write_role_files(layout, settings, trial=False)
         config = lab_config(layout, envelope, settings, trial=False, resolve=_no_lookup, codex=context.codex)
         home = layout.lab_home
@@ -905,7 +1058,8 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
     (home / 'rules' / 'default.rules').write_text(RULES, encoding='utf-8')
     first = len(model.requests)
     model.push(run_js(_edit_script([(name, _patch(body)) for name, body, _ in edits],
-                                   [(name, command) for name, command, _ in commands])), say('rsi check'))
+                                   [(name, command) for name, command, _ in commands], probes, tool)),
+               say('rsi check'))
     with _scripted(url):
         result = run_codex(home=home, cwd=workspace, prompt='rsi check: try each change of the script, one by one.',
                            config=config,
@@ -923,6 +1077,12 @@ def _edit_run(context: _Context, scratch: Path, which: str, model: ScriptedModel
             observed = ALLOWED if changed() else BLOCKED if complete else UNKNOWN
             detail = said if complete else f'{said}; {why}: {_tail(stderr)}'
             results.append(_result(name, which, table[name][column], observed, detail))
+    found = _probe_results(0, outputs, '')[0]
+    refused = '; '.join(line for line in outputs.splitlines() if ' probe refused: ' in line)
+    accepted = {name: listener.close() for name, listener in listeners.items()}
+    for case in network:
+        observed, detail = _judge(case, found, '; '.join(filter(None, (why, refused, _tail(stderr)))), accepted)
+        results.append(_result(case.name, which, NETWORK[case.name][column], observed, detail))
     body = json.dumps(requests, ensure_ascii=False)
 
     def reached(marker: str) -> tuple[str, str]:
@@ -987,6 +1147,50 @@ def _tool_run(context: _Context, scratch: Path) -> list[dict]:
         results.append(_result('tool_server_wrapper', profile, TOOLS['tool_server_wrapper'],
                                ALLOWED if wrote else BLOCKED if ran else UNKNOWN, detail))
     return results
+
+
+def _literature_checks(context: _Context, scratch: Path, trial: bool) -> list[dict]:
+    """Run the same probe through the literature server's composed launch command (SHIPPED_SERVER, the seed's), which
+    has its own proxy: it writes only its workspace (and library/ in a task run), reads neither a task's check script
+    nor an owner file, has the proxy variables, and reaches no local service directly or through its proxies."""
+    profile = 'trial_net' if trial else 'lab_net'
+    expected = {'workspace': A, 'library': B if trial else A, 'other_workspace': B, 'env': B, 'records': B,
+                'tasks': B, 'control': B, 'owner': B, 'read_task_check': B, 'read_owner': B, 'proxy_variables': A,
+                'local_tcp': B}
+    try:
+        layout = _build(scratch / f'literature-{profile}')
+        workspace, other = (layout.trial, layout.work) if trial else (layout.work, layout.trial)
+        folders = {'workspace': workspace, 'library': layout.library, 'other_workspace': other, 'env': layout.env,
+                   'records': layout.records, 'tasks': layout.tasks, 'control': layout.control, 'owner': layout.owner}
+        cases = []
+        for name, folder in folders.items():
+            target = folder / 'literature-check.txt'
+            cases.append(_Case(name, [['write', str(target), False]], written=[target]))
+        cases += [_Case('read_task_check', [['read', str(layout.tasks / 'T1' / 'check.py')]]),
+                  _Case('read_owner', [['read', str(layout.owner / 'limits.toml')]]),
+                  _Case('proxy_variables', [['proxy_variables']])]
+        listener = _Listener(socket.AF_INET, ('127.0.0.1', 0), context.token.encode())
+        try:
+            cases.append(_Case('local_tcp', [[op, listener.address[1]] for op in LOOPBACK_STEPS], listener='tcp'))
+            spec = {'net': True, 'token': context.token, 'cases': [{'name': c.name, 'steps': c.steps} for c in cases]}
+            script = workspace / 'tools/literature/server.py'
+            script.parent.mkdir(parents=True)
+            script.write_text(f'import sys\nsys.argv.append({json.dumps(spec)!r})\n' + PROBE, encoding='utf-8')
+            _ship_settings(workspace)
+            settings = load_settings(workspace)
+            write_role_files(layout, settings, trial=trial)
+            config = lab_config(layout, context.envelope, settings, trial=trial, codex=context.codex,
+                                resolve=_no_lookup)
+            server = config['mcp_servers']['literature']
+            found, why = _probe_results(*_run([server['command'], *server['args']], cwd=workspace,
+                env={'HOME': str(Path.home()), **server['env']}, timeout=PROBE_SECONDS))
+        finally:
+            accepted = {'tcp': listener.close()}
+        return [_result('literature_' + case.name, profile, expected[case.name],
+                        *_judge(case, found, why, accepted)) for case in cases]
+    except Exception as error:
+        detail = f'The literature tool check could not be completed: {type(error).__name__}: {error}'
+        return [_result('literature_' + name, profile, outcome, UNKNOWN, detail) for name, outcome in expected.items()]
 
 
 # The static checks on the real root.
@@ -1055,6 +1259,8 @@ def _cases(layout: Layout, envelope: dict, problems: list[str], notes: list[str]
         for which in ('lab', 'meta'):
             results += _edit_layer(context, scratch, which)
         results += _tool_layer(context, scratch)
+        for trial in (False, True):
+            results += _literature_checks(context, scratch, trial)
         return results
     finally:
         if sockets is not None:
@@ -1127,7 +1333,8 @@ def program_fingerprints() -> dict[str, str]:
 
 def run_check(layout: Layout) -> dict:
     """Run every case under the installed Codex and write records/check.json:
-    {'codex_version', 'owner_files' (owner_fingerprints when the check started), 'program' (program_fingerprints),
+    {'codex_version', 'codex_program' (the real path of the native program measured, native_codex; None when there is
+    none), 'owner_files' (owner_fingerprints when the check started), 'program' (program_fingerprints),
     'passed', 'at',
     'results': [{'name', 'profile', 'expected', 'observed', 'ok', 'detail'}],
     'problems': [English lines: what keeps the check from passing besides a case], 'notes': [English lines],
@@ -1140,6 +1347,10 @@ def run_check(layout: Layout) -> dict:
     except OSError as error:
         program = {}
         problems.append(f'The code of the control program cannot be read ({error.strerror or error})')
+    try:
+        codex = native_codex(layout)
+    except Refused:
+        codex = None                            # _cases says why, and runs no case
     try:
         version = codex_version(layout.root)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
@@ -1154,8 +1365,8 @@ def run_check(layout: Layout) -> dict:
     if version is not None and envelope is not None:
         results = _cases(layout, envelope, problems, notes, info)
     passed = bool(results) and not problems and all(result['ok'] for result in results)
-    report = {'codex_version': version, 'owner_files': owner_files, 'program': program, 'passed': passed, 'at': at,
-              'results': results, 'problems': problems, 'notes': notes, 'info': info}
+    report = {'codex_version': version, 'codex_program': codex, 'owner_files': owner_files, 'program': program,
+              'passed': passed, 'at': at, 'results': results, 'problems': problems, 'notes': notes, 'info': info}
     _save(layout, report)
     return report
 
@@ -1185,9 +1396,10 @@ def _changed(then, now: dict) -> list[str]:
 
 
 def gate(layout: Layout) -> str | None:
-    """None when records/check.json says a check passed for the Codex version installed now, for the owner files as
-    they are now (owner_fingerprints) and for the control program's code as it is now (program_fingerprints);
-    otherwise why no agent may start (English, naming `rsi check`). The file is never followed if it is a link."""
+    """None when records/check.json says a check passed for the Codex version installed now and the Codex program
+    that would be started now (native_codex), for the owner files as they are now (owner_fingerprints) and for the
+    control program's code as it is now (program_fingerprints); otherwise why no agent may start (English, naming
+    `rsi check`). The file is never followed if it is a link."""
     data, reason = _load(layout)
     if data is None:
         return reason
@@ -1214,6 +1426,19 @@ def gate(layout: Layout) -> str | None:
     if data.get('codex_version') != installed:
         return (f'The last rsi check that passed was made on Codex {show(data.get("codex_version"))}, and '
                 f'{show(installed)} is installed now. Run rsi check again.')
+    # The program is found on PATH (or named by $RSI_CODEX): another PATH can pick another install, even of the
+    # same version, and the check holds only for the program it measured.
+    try:
+        program = native_codex(layout)
+    except Refused as error:
+        return f'{error} So it cannot be confirmed that the result of rsi check holds for it.'
+    if not isinstance(data.get('codex_program'), str):
+        return ('The last rsi check was made before rsi recorded which Codex program a check measured, so it cannot be '
+                'confirmed that its result holds for the one that would be started now. Run rsi check again.')
+    if data.get('codex_program') != program:
+        return (f'The last rsi check that passed measured the Codex program {show(data.get("codex_program"))}, and '
+                f'{show(program)} would be started now (PATH or $RSI_CODEX picks another one). Run rsi check again, '
+                'or run rsi with the PATH and $RSI_CODEX it had then.')
     return None
 
 

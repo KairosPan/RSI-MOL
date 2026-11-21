@@ -5,9 +5,12 @@ never reads, walks, changes or runs git on either folder in place. It builds the
 (no agent profile grants it), seals whatever sits at work/ (trial/) by renaming that entry inside the RSI root
 (rsi.workspace.seal), renames the staged folder in, and starts the call. A folder staged for work/ or trial/ first gets
 its skills/ copied to .agents/skills/, where Codex loads them (rsi.skills). After the call it seals the workspace again
-and does everything else on the sealed, static tree: collecting out/<id>/, the check, making it storable and the
-commit. A sealed tree is then removed; when something could not be versioned (or it cannot be removed) it is kept
-under sealed/<label>/ with a `sealed` note and a problem line of the call.
+and does everything else on the sealed, static tree: collecting the literature server's own call log into the record
+as literature.jsonl (when the run had that server; rsi.literature_logs), collecting out/<id>/, the check, making it
+storable and the commit. A sealed tree is then removed; when something could not be versioned (or it cannot be
+removed) it is kept under sealed/<label>/ with a `sealed` note and a problem line of the call. A call interrupted
+before that collects the log the same way (interrupted_literature), from its sealed tree or from its own live tree,
+sealed for the read and renamed back.
 
 run_task: the task, that no earlier interrupted rsi is left to recover from (unrecovered), the gate, the owner's
 daily limits, a version store that can take a new version, the envelope and Codex itself are checked first. Then
@@ -33,7 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from rsi import check
+from rsi import check, literature_logs
 from rsi.codexrun import codex_version, run_codex
 from rsi.compose import lab_config, load_envelope, tool_server_problems, write_home_config, write_role_files
 from rsi.limits import Limits, load_limits, refusal
@@ -52,6 +55,8 @@ PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
 PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
 LAB_WORKSPACES = ('work', 'trial')  # where a Lab Codex runs: moved in with the skills in .agents/skills/
+# The start of a problem line when the literature server's own call log of a run could not be copied into its record.
+LOG_UNAVAILABLE = "The literature server's own call log could not be collected"
 # What can go wrong with a sealed or staged folder, or with git on it (a time-out included).
 WORKSPACE_ERRORS = (OSError, subprocess.SubprocessError, RuntimeError, ValueError)
 
@@ -479,6 +484,38 @@ def _end_interrupted(records: Records, call_id: str) -> None:
         pass
 
 
+def interrupted_literature(layout: Layout, records: Records, call: dict) -> list[str]:
+    """For an interrupted call: collect the literature server's own call log (rsi.literature_logs) only from this
+    call's sealed tree or its still-identifiable live tree, which is sealed for the read and renamed back afterwards,
+    so the usual manual-or-leftover versioning keeps what is in it. A temporary file an interrupted collection left in
+    the record folder is removed first. Problem lines; never raises an Exception."""
+    expected = call.get('literature_workspace')
+    if expected is None:
+        return []
+    call_dir, name = records.call_dir(call['id']), call.get('workspace')
+    problems = []
+    with _problem(problems, LOG_UNAVAILABLE):
+        literature_logs.discard_pending(call_dir)
+    if os.path.lexists(call_dir / literature_logs.LOG):
+        return problems
+    if name not in LAB_WORKSPACES:
+        return problems + [f'{LOG_UNAVAILABLE}: the record has no Lab workspace']
+    with _problem(problems, LOG_UNAVAILABLE), _root(layout) as fd:
+        sealed = f'{SEALED}{name}-{call["id"]}'
+        if os.path.lexists(layout.root / sealed):
+            problems.extend(literature_logs.collect(layout.root / sealed, expected, call_dir))
+        else:
+            if literature_logs.identity(layout.root / name) != expected:
+                raise ValueError('the current workspace does not belong to this call')
+            if seal(fd, name, call['id']) is None:
+                raise ValueError('the workspace is missing')
+            try:
+                problems.extend(literature_logs.collect(layout.root / sealed, expected, call_dir))
+            finally:
+                _rename_in(layout.root / sealed, fd, name)
+    return problems
+
+
 def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -> dict:
     """Start the call, run Codex, collect, finish.
 
@@ -490,13 +527,23 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     try:
         call_id = records.new_id('R')
         call_dir = records.call_dir(call_id)
+        if 'command' in run.config.get('mcp_servers', {}).get('literature', {}):
+            run.fields['literature_workspace'] = literature_logs.identity(layout.root / run.name)
         records.start_call(call_id, {**run.fields, 'started': _now()})
         result = run_codex(home=layout.lab_home, cwd=layout.root / run.name, prompt=run.prompt, config=run.config,
                            record_dir=call_dir, timeout=run.timeout, on_start=process_recorder(records, call_id),
                            root=layout.root)
     except BaseException:
         if call_id is not None:
-            _end_interrupted(records, call_id)
+            if 'literature_workspace' in run.fields:
+                try:
+                    problems = interrupted_literature(layout, records, {**run.fields, 'id': call_id})
+                    records.finish_call(call_id, {'status': 'interrupted', 'ended': _now(), 'usage': None,
+                                                  'problems': problems})
+                except Exception:
+                    pass  # recover retries with the identity in the started record
+            else:
+                _end_interrupted(records, call_id)
         raise
     end = {'status': result.status, 'exit_code': result.exit_code, 'thread_id': result.thread_id,
            'usage': result.usage, 'command': result.command, 'ended': _now(), 'check': None,
@@ -512,6 +559,7 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
         problems.append(f'Interrupted while collecting the results ({type(error).__name__}); the remaining steps were '
                         'not done')
         try:
+            problems += interrupted_literature(layout, records, {**run.fields, 'id': call_id})
             records.finish_call(call_id, {**end, 'problems': problems})
         except Exception:
             pass
@@ -532,6 +580,12 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
             entry = seal(root_fd, run.name, call_id)
             if entry is None:
                 problems.append(f'{run.name}/ was gone when the run ended')
+        if 'literature_workspace' in run.fields:
+            with _problem(problems, LOG_UNAVAILABLE):
+                if entry is None:
+                    raise ValueError('the workspace could not be sealed')
+                problems.extend(literature_logs.collect(layout.root / entry, run.fields['literature_workspace'],
+                                                        call_dir))
         out = call_dir / 'out'
         with _problem(problems, f'out/{run.out_name} could not be collected into the record'):
             if entry is None:

@@ -384,6 +384,9 @@ class _Round:
         lines += ['', f'Your working folder is meta/, that is {layout.meta}.',
                   f'- Records: {layout.records} (read-only). Each Codex call is in runs/<id>/, each Meta round in '
                   'rounds/<id>/, releases and rollbacks in releases/, applications in applications/.',
+                  '- A literature.jsonl attachment comes from a log the Lab can write. Verify a cited tool call '
+                  'against its receipt in the recorded sessions/ and its cited passage against the archived original '
+                  'in ../library/.',
                   f'- The Lab workspace: {layout.work} (read-only). It holds the current version.',
                   f'- The candidate: ../candidate, that is {layout.candidate} (writable). When this round began it was '
                   'a copy of the current version; trials and releases use it.',

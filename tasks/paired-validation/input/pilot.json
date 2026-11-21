@@ -1,0 +1,30 @@
+{
+  "comparison_id": "lab_comparison_v2",
+  "source": "RSI-Lab runs/lab_comparison_v2_readout/summary.json",
+  "source_sha256": "0591cf485063f7319a8497e985a074238645eb00ee3e427033fba9022bd204ec",
+  "design_source": "RSI-Lab_Comparison_v2_2026-10-20_Report_zh.md (pilot design and run order)",
+  "arms": {
+    "H0": {
+      "presentation_mode": "expanded_json_v1",
+      "complete_lab_trajectories": 1,
+      "valid_selected_items": 5,
+      "shortlist_size": 5,
+      "mean_qualified_median_CNNscore": 0.97060296535,
+      "observed_lab_tokens": 162096,
+      "model_calls": 4
+    },
+    "H1": {
+      "presentation_mode": "compact_json_v1",
+      "complete_lab_trajectories": 1,
+      "valid_selected_items": 5,
+      "shortlist_size": 5,
+      "mean_qualified_median_CNNscore": 0.97141479254,
+      "observed_lab_tokens": 137521,
+      "model_calls": 4
+    }
+  },
+  "scoring_seeds_per_item": 2,
+  "H0_H1_shared_shortlisted_items": 4,
+  "one_off_meta_development_tokens": 105031,
+  "metric_notes": "CNNscore is higher-is-better and is averaged over selected items valid on both seeds after taking their seed median. Report coverage alongside it. Token counts are observed input plus output. Dollar costs are unavailable."
+}
