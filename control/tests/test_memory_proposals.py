@@ -1,0 +1,365 @@
+"""Require a sealed submission and prior, verified deliveries for every judgment reference."""
+import hashlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from rsi import memory_ingest as ingest, memory_store as ledger
+from rsi.memory_snapshot import place_snapshot
+from rsi.paths import Layout
+from rsi.records import Records
+from tests.test_memory_audit import ADDR, DOC, TEXT, returned
+
+
+class Proposals(unittest.TestCase):
+    def setUp(self):
+        self.layout = Layout(Path(self.enterContext(tempfile.TemporaryDirectory())))
+        self.records = Records(self.layout.records)
+        origin = {'task': 'history', 'run': 'R0000', 'version': 'V0001'}
+        content = {'type': 'passage', 'text': TEXT, 'source_sha256': DOC['source_sha256'], 'locator': ADDR['locator']}
+        obj = dict(kind='evidence', id='passage_1', revision=1, origin=origin, supersedes=None, content=content)
+        obj['record_sha256'] = ledger.digest(obj)
+        hist = dict(origin, id=obj['id'], revision=1, at='2026-01-01T00:00:00Z', invocation_id='original-read', **DOC)
+        ledger.publish(self.layout, ledger.load(self.layout), 'R0000', [('object', obj), ('delivery', hist)], {})
+        self.read = returned('memory', 'get_evidence', 'read', {'results': [{'object': obj, 'deliveries': [hist]}]})
+        self.ref = dict(ADDR, relation='supports', evidence_id=obj['id'], revision=1, source_run='R0000', quote='test quote')
+        self.args = dict(kind='judgment', id='judgment_paired', expected_revision=0, question_id='experiment',
+                         statement='Use within-pool differences.', scope='Paired pools', source_refs=[self.ref])
+
+    def write(self, num, args=None):
+        pid = f'{num:032x}'
+        item = returned('memory', 'propose_memory', num, {'status': 'pending', 'proposal_id': pid})
+        item['arguments'] = args if args is not None else self.args
+        return item
+
+    def record(self, items, files, *, goal='Compare pairs', task='experiment', corrupt_snapshot=False, child=(), clocks=None):
+        run = self.records.new_id('R')
+        directory = self.records.call_dir(run)
+        staging = self.layout.root / run
+        staging.mkdir()
+        memory = place_snapshot(self.layout, staging)
+        if corrupt_snapshot:
+            memory['fingerprint'] = '0' * 64
+        self.records.start_call(run, {'purpose': 'task', 'task': task, 'task_goal': goal, 'memory': memory,
+                                      'thread_id': 'lead', 'subagent_threads': ['child'] if child else [],
+                                      'version_before': 'V0001'})
+        (directory / 'sessions').mkdir()
+        sessions = {'lead': items, 'child': child} if child else {'lead': items}
+        for thread, events in sessions.items():
+            with (directory / 'sessions' / (thread + '.jsonl')).open('wb') as out:
+                for index, item in enumerate(events):
+                    payload = dict(type='item_completed', thread_id=thread, item=item)
+                    if clocks is None:
+                        payload.update(started_at_ms=index * 1000, completed_at_ms=index * 1000 + 1)
+                    else:
+                        payload.update(clocks.get(item['id'], {}))
+                    event = {'type': 'event_msg', 'timestamp': f'2026-11-20T12:01:{index:02d}Z', 'payload': payload}
+                    out.write(ledger.encode(event) + b'\n')
+        (directory / 'proposals').mkdir()
+        for num, value in files.items():
+            (directory / 'proposals' / f'{num:032x}.json').write_bytes(ledger.encode(value) + b'\n')
+        self.records.finish_call(run, {'status': 'finished'})
+        report, = ingest.backfill(self.layout)
+        return report
+
+    def passage(self, original=b'<article>Fresh passage.</article>', **changes):
+        sha = hashlib.sha256(original).hexdigest()
+        path = self.layout.library / 'objects' / 'sha256' / sha
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(original)
+        text = 'Fresh passage.'
+        row = dict(document_id='doc_' + 'a' * 64, document_version='b' * 64, source_sha256=sha,
+                   locator='block:2', parser_version='1', kind='paragraph', text=text,
+                   section='Methods', section_path=['Methods'], content_scope='full_text', block_complete=True,
+                   char_range=[0, len(text)], byte_range=[0, len(text)], source_metadata={})
+        return row | changes
+
+    def literature(self, row, invocation='a' * 32, tool='find_passages', native_id='search'):
+        native = returned('literature', tool, native_id, dict(status='ok', invocation_id=invocation,
+                                                               data={'passages': [row]}))
+        native['arguments'] = {'document_id': row['document_id']}
+        ref = {k: row[k] for k in ('document_id', 'document_version', 'source_sha256', 'locator')}
+        ref.update(delivery_source='literature', invocation_id=invocation, relation='supports', quote=row['text'])
+        return native, ref
+
+    def test_current_and_historical_references_preserve_both_native_calls(self):
+        found, new = self.literature(self.passage())
+        args = dict(self.args, source_refs=[self.ref, new])
+        report = self.record([self.read, found, self.write(1, args)], {1: args})
+        self.assertEqual(report['objects'], {'passage': 1, 'question': 1, 'judgment': 1})
+        state = ledger.load(self.layout)
+        passage, question, judgment = state.objects[-3:]
+        history, current = judgment['source_refs']
+        self.assertEqual(history['historical_invocation'], 'original-read')
+        self.assertEqual(current, dict(new, id=passage['id'], revision=1, source_run=report['run'],
+                                       thread='lead', call_id='native-search'))
+        self.assertEqual(question['id'], judgment['object_refs'][0]['id'])
+        # Redelivery of the same passage under a different invocation reuses its revision.
+        again, another = self.literature(self.passage(), 'b' * 32, 'read_document', 'again')
+        revised = dict(args, expected_revision=1, source_refs=[another])
+        second = self.record([again, self.write(2, revised)], {2: revised})
+        self.assertEqual(second['objects'], {'judgment': 1})
+        proof, = ledger.load(self.layout).objects[-1]['source_refs']
+        self.assertEqual((proof['source_run'], proof['id'], proof['revision']), (second['run'], passage['id'], 1))
+
+    def test_current_reference_rejects_wrong_quote_address_invocation_and_ledger_fields(self):
+        found, ref = self.literature(self.passage())
+        variants = [dict(ref, quote='invented'), dict(ref, document_id='doc_' + '0' * 64),
+                    dict(ref, invocation_id='b' * 32), dict(ref, source_run='R0000'), dict(ref, revision=1)]
+        files = {i: dict(self.args, source_refs=[v]) for i, v in enumerate(variants, 1)}
+        report = self.record([found, *(self.write(i, a) for i, a in files.items())], files)
+        self.assertEqual(report['objects'], {'passage': 1})
+        self.assertEqual(len(report['rejected']), len(variants))
+
+    def test_an_invocation_with_two_blocks_binds_each_quote_to_its_own_locator(self):
+        first = self.passage()
+        second = self.passage(text='Other passage.', locator='block:3')
+        found, ref = self.literature(first)
+        payload = json.loads(found['result']['content'][0]['text'])
+        payload['data']['passages'].append(second)
+        found['result']['content'][0]['text'] = json.dumps(payload)
+        right = dict(ref, locator=second['locator'], quote=second['text'])
+        files = {1: dict(self.args, source_refs=[ref, right]),
+                 2: dict(self.args, id='judgment_mismatch', source_refs=[dict(ref, quote=second['text'])])}
+        report = self.record([found, self.write(1, files[1]), self.write(2, files[2])], files)
+        self.assertEqual(report['objects'], {'passage': 2, 'question': 1, 'judgment': 1})
+        self.assertIn('quotation does not occur verbatim in the returned evidence', report['reasons'])
+        citations = ledger.load(self.layout).objects[-1]['source_refs']
+        self.assertEqual([p['locator'] for p in citations], [first['locator'], second['locator']])
+        self.assertNotEqual(citations[0]['id'], citations[1]['id'])
+
+    def test_current_reference_requires_a_verified_full_block_even_if_memory_contains_it(self):
+        row = self.passage()
+        complete, ref = self.literature(row)
+        self.record([complete], {})
+        damaged = [dict(row, block_complete=False), dict(row, byte_range=[0, 999]),
+                   dict(row, source_sha256='e' * 64)]
+        for bad in damaged:
+            with self.subTest(bad=bad):
+                invalid, current = self.literature(bad)
+                args = dict(self.args, source_refs=[current])
+                report = self.record([invalid, self.write(1, args)], {1: args})
+                self.assertEqual(report['objects'], {})
+                self.assertIn('invocation has no verified complete passage delivery in this run', report['reasons'])
+        bad, _ = self.literature(dict(row, text='conflict'), native_id='other')
+        args = dict(self.args, source_refs=[ref])
+        conflict = self.record([complete, bad, self.write(1, args)], {1: args})
+        self.assertIn('conflicting invocation_id', conflict['reasons'])
+        self.assertEqual(conflict['deliveries'], {})
+
+    def test_cross_thread_current_read_must_finish_before_proposal_begins(self):
+        found, ref = self.literature(self.passage())
+        args = dict(self.args, source_refs=[ref])
+        for start, expected in ((90, False), (100, False), (None, False), (101, True)):
+            with self.subTest(start=start):
+                write = self.write(1, args)
+                clocks = {found['id']: {'started_at_ms': 50, 'completed_at_ms': 100},
+                          write['id']: {'completed_at_ms': 110}}
+                if start is not None:
+                    clocks[write['id']]['started_at_ms'] = start
+                report = self.record([write], {1: args}, child=[found], clocks=clocks)
+                self.assertEqual('judgment' in report['objects'], expected)
+                if expected:
+                    proof, = ledger.load(self.layout).objects[-1]['source_refs']
+                    self.assertEqual(proof['thread'], 'child')
+
+    def test_current_read_in_the_same_session_still_needs_a_verifiable_proposal_start(self):
+        found, ref = self.literature(self.passage())
+        args = dict(self.args, source_refs=[ref])
+        write = self.write(1, args)
+        unproven = self.record([found, write], {1: args}, clocks={})
+        self.assertEqual(unproven['objects'], {'passage': 1})
+        self.assertIn('without verifiable ordering', unproven['rejected'][0]['reason'])
+        write['duration'] = {'secs': 0, 'nanos': 1000000}
+        timed = self.record([found, write], {1: args}, clocks={})
+        self.assertEqual(timed['objects'], {'question': 1, 'judgment': 1})
+
+    def test_registration_and_optimistic_revisions(self):
+        good = self.record([self.read, self.write(1)], {1: self.args})
+        self.assertEqual(good['objects'], {'question': 1, 'judgment': 1})
+        self.assertEqual(ingest.backfill(self.layout), [])
+        next_args = dict(self.args, expected_revision=1, statement='Revised within-pool comparison.')
+        second = self.record([self.read, self.write(1, next_args), self.write(2, next_args)], {1: next_args, 2: next_args},
+                             goal='Compare fresh pairs')
+        self.assertEqual(second['reasons'], {'expected judgment revision differs from the ledger': 1})
+        obj = ledger.show(self.layout, self.args['id'])['versions'][-1]
+        self.assertEqual((obj['revision'], obj['supersedes'], obj['object_refs'][0]['revision']), (2, 1, 2))
+        self.assertEqual(obj['authority'], 'model_interpretation')
+        self.assertEqual(obj['content']['support_status'], 'pending_review')
+        proof, = obj['source_refs']
+        self.assertEqual((proof['historical_invocation'], proof['call_id']), ('original-read', 'native-read'))
+
+    def test_single_submission_failures_leave_other_judgments_intact(self):
+        bad_args = [dict(self.args, id='judgment_bad', source_refs=[dict(self.ref, **changes)]) for changes in
+                    ({'quote': 'altered quote'}, {'document_id': 'other-doc'}, {'revision': 2}, {'source_run': 'R0009'})]
+        files = {i: a for i, a in enumerate([self.args, *bad_args], 1)}
+        writes = [self.write(i, args) for i, args in files.items()]
+        files[6] = self.args  # workspace file only
+        writes.append(self.write(7))  # native call only
+        writes.append(self.write(8))
+        files[8] = dict(self.args, statement='Changed after submission.')
+        report = self.record([self.read, *writes], files)
+        self.assertEqual(report['objects'], {'question': 1, 'judgment': 1})
+        self.assertEqual({v['proposal_id'] for v in report['rejected']}, {f'{i:032x}' for i in range(2, 9)})
+
+    def test_a_late_read_and_overlapping_read_cannot_support_the_submission(self):
+        write = self.write(2)
+        write['duration'] = {'secs': 2, 'nanos': 0}
+        report = self.record([self.write(1), self.read, write], {1: self.args, 2: self.args}, clocks={})
+        self.assertEqual(report['objects'], {})
+        self.assertEqual(len(report['rejected']), 2)
+        self.assertTrue(all('after the proposal' in r['reason'] for r in report['rejected']))
+
+    def test_read_without_starting_snapshot_fingerprint_cannot_support_a_judgment(self):
+        report = self.record([self.read, self.write(1)], {1: self.args}, corrupt_snapshot=True)
+        self.assertEqual(report['objects'], {})
+        self.assertIn('fingerprint', report['rejected'][0]['reason'])
+
+    def test_current_paper_and_proposal_share_one_recoverable_batch(self):
+        paper = {'paper_id': 'source:one', 'provider': 'source', 'title': 'Another study'}
+        native = returned('literature', 'get_paper', 'paper', {
+            'status': 'ok', 'data': {'paper': paper}, 'invocation_id': '1' * 32})
+        native['arguments'] = {'paper_ref': 'source:one'}
+        with mock.patch.object(ledger, 'finish_report', side_effect=OSError('interrupted')), self.assertRaises(OSError):
+            self.record([native, self.read, self.write(1)], {1: self.args})
+        partial = ledger.load(self.layout)
+        run, = partial.missing_reports
+        report, = ingest.backfill(self.layout)
+        self.assertEqual(report['run'], run)
+        self.assertEqual(report['objects'], {'paper': 1, 'question': 1, 'judgment': 1})
+        self.assertEqual((partial.tail, partial.version), (report['tail_sha256'], report['version_after']))
+        self.assertEqual(ingest.backfill(self.layout), [])
+
+    def test_no_files_uses_the_existing_session_scan_and_missing_proof_preserves_literature(self):
+        native = returned('literature', 'get_paper', 'paper', {'status': 'ok', 'data': {
+            'paper': {'paper_id': 'a:1', 'provider': 'a'}}, 'invocation_id': 'a' * 32})
+        native['arguments'] = {}
+        with mock.patch('rsi.memory_proposals.timeline', side_effect=AssertionError('unnecessary replay')):
+            ordinary = self.record([native], {})
+            missing = self.record([self.write(1)], {})
+        self.assertEqual(ordinary['reasons'], {})
+        self.assertEqual(missing['reasons'], {'native submission lacks a sealed proposal attachment': 1})
+        with mock.patch('rsi.memory_proposals.timeline', side_effect=FileNotFoundError('session missing')):
+            failed = self.record([native, self.read, self.write(1)], {1: self.args})
+        self.assertEqual(failed['deliveries'], {'paper': 1})
+        self.assertIn('session missing', failed['rejected'][0]['reason'])
+
+    def submit_subquestion(self):
+        args = dict(kind='question', id='subquestion_pairing', question_id='experiment', expected_revision=0,
+                    text='Do both arms use the same pool?')
+        report = self.record([self.write(1, args)], {1: args})
+        self.assertEqual(report['objects'], {'question': 2})
+        root, sub = ledger.load(self.layout).objects[-2:]
+        self.assertEqual((root['authority'], sub['authority']), ('task_contract', 'model_interpretation'))
+        self.assertEqual(sub['question_ids'], [root['id']])
+        return sub
+
+    def test_all_interpretations_attach_to_an_exact_previously_read_subquestion(self):
+        sub = self.submit_subquestion()
+        read = returned('memory', 'recall_objects', 'subquestion', {'results': [{'object': sub}]})
+        content = dict(decision={'decision': 'Compare arms within pool.', 'scope': ''},
+                       investigation={'description': 'Checked how arms were assigned.', 'scope': 'Shared pools'},
+                       method_experience={'change': 'Paired comparisons', 'rationale': 'Pools vary.',
+                                          'outcome': 'unchanged', 'scope': 'Shared pools'},
+                       judgment={'statement': 'Pairing is appropriate.', 'scope': 'Shared pools'})
+        files = {}
+        for i, ((kind, fields), relation) in enumerate(zip(content.items(), ('derived_from', 'challenges', 'background', 'supports')), 1):
+            ref = dict(id=sub['id'], revision=sub['revision'], relation=relation)
+            files[i] = dict(kind=kind, id=kind + '_a', expected_revision=0, question_id=sub['id'], object_refs=[ref], **fields)
+        result = self.record([read, *(self.write(i, args) for i, args in files.items())], files)
+        self.assertEqual(result['objects'], dict.fromkeys(content, 1))
+        for obj, args in zip(ledger.load(self.layout).objects[-4:], files.values()):
+            self.assertEqual(obj['question_ids'], [sub['id']])
+            self.assertEqual(obj['object_refs'], [dict(args['object_refs'][0], thread='lead', call_id='native-subquestion')])
+            self.assertEqual(obj['content'], dict(type=args['kind'], support_status='pending_review', **content[args['kind']]))
+
+    def test_model_cannot_claim_contract_ownership_or_revise_another_tasks_question(self):
+        sub = self.submit_subquestion()
+        root = sub['question_ids'][0]
+        base = dict(kind='question', id=sub['id'], expected_revision=1, question_id='other', text='New proposal')
+        files = {1: base, 2: dict(base, id=root), 3: dict(base, id='subquestion_other', expected_revision=0,
+                                                         authority='task_contract')}
+        denied = self.record([self.write(i, args) for i, args in files.items()], files, task='other')
+        self.assertEqual(denied['objects'], {})
+        self.assertEqual(len(denied['reasons']), 3)
+        valid = dict(base, question_id='experiment')
+        result = self.record([self.write(1, valid)], {1: valid})
+        self.assertEqual(result['objects'], {'question': 1})
+        self.assertEqual(ledger.load(self.layout).objects[-1]['supersedes'], 1)
+
+    def test_object_reads_must_match_the_snapshot_and_precede_the_proposal(self):
+        sub = self.submit_subquestion()
+        ref = dict(id=sub['id'], revision=sub['revision'], relation='background')
+        decision = dict(kind='decision', id='decision_match', expected_revision=0, decision='Pair by pool.', scope='',
+                        question_id='experiment', object_refs=[ref])
+        read = returned('memory', 'get_evidence', 'object', {'results': [{'object': sub}]})
+        forged = returned('memory', 'get_evidence', 'forged', {'results': [{'object': dict(sub, authority='task_contract')}]})
+        nested = returned('memory', 'get_evidence', 'nested', {'results': [{'questions': [sub]}]})
+        write = self.write(1, decision)
+        for events, opts in (([forged, nested, write], {}), ([write, read], {}), ([read, write], {'corrupt_snapshot': True}),
+                             ([write], {'child': [read], 'clocks': {'native-object': {'completed_at_ms': 10},
+                                                                  'native-1': {'started_at_ms': 10, 'completed_at_ms': 20}}})):
+            with self.subTest(options=opts):
+                rejected = self.record(events, {1: decision}, **opts)
+                self.assertEqual(rejected['objects'], {})
+                self.assertEqual(len(rejected['rejected']), 1)
+        accepted = self.record([write], {1: decision}, child=[read],
+                               clocks={'native-object': {'completed_at_ms': 10},
+                                       'native-1': {'started_at_ms': 11, 'completed_at_ms': 20}})
+        self.assertEqual(accepted['objects'], {'decision': 1})
+        self.assertEqual(ledger.load(self.layout).objects[-1]['object_refs'][-1]['thread'], 'child')
+
+    def test_rejects_unread_or_self_references_and_unattributed_outcomes(self):
+        sub = self.submit_subquestion()
+        read = returned('memory', 'get_evidence', 'sub', {'results': [{'object': sub}]})
+        ref = dict(id=sub['id'], revision=1, relation='challenges')
+        method = dict(kind='method_experience', id='method_experience_m', change='Compare pairs.', rationale='Balance.',
+                      outcome='failed', scope='', question_id='experiment', expected_revision=0)
+        files = {1: method, 2: dict(method, object_refs=[dict(ref, revision=2)]),
+                 3: dict(method, object_refs=[dict(ref, relation='verified')]), 4: dict(method, outcome='verified', object_refs=[ref]),
+                 5: dict(method, question_id=sub['id'], source_refs=[self.ref]),
+                 6: dict(kind='question', id=sub['id'], expected_revision=1, question_id=sub['id'], object_refs=[ref], text='Self'),
+                 7: dict(method, object_refs=[ref], freshness='verified'),
+                 8: dict(method, source_refs=[self.ref])}
+        report = self.record([self.read, read, *(self.write(i, a) for i, a in files.items())], files)
+        self.assertEqual(report['objects'], {'method_experience': 1})
+        self.assertEqual(len(report['rejected']), 7)
+
+    def test_exact_subquestion_pin_survives_later_revision_and_same_named_task(self):
+        old = self.submit_subquestion()
+        edit = dict(kind='question', id=old['id'], expected_revision=1, question_id='experiment', text='Which pool?')
+        self.record([self.write(1, edit)], {1: edit})
+        new = ledger.load(self.layout).objects[-1]
+        read = returned('memory', 'get_evidence', 'q1', {'results': [{'object': old}]})
+        reread = returned('memory', 'get_evidence', 'q2', {'results': [{'object': new}]})
+        pin = dict(id=old['id'], revision=1, relation='background')
+        args = dict(kind='decision', id='decision_old_q', expected_revision=0, question_id=old['id'],
+                    decision='Evaluate the earlier question.', scope='', object_refs=[pin])
+        ambiguous = dict(args, object_refs=[pin, dict(pin, revision=2)])
+        accepted = self.record([read, reread, self.write(1, ambiguous), self.write(2, args)],
+                               {1: ambiguous, 2: args}, task=old['id'])
+        self.assertEqual(accepted['objects'], {'decision': 1})
+        self.assertIn('subquestion requires a single, exact question revision', accepted['reasons'])
+        decision = ledger.load(self.layout).objects[-1]
+        self.assertEqual(decision['question_ids'], [old['id']])
+        self.assertEqual(decision['object_refs'], [dict(pin, thread='lead', call_id='native-q1')])
+
+    def test_quotation_disambiguates_two_parser_versions_in_the_same_literature_delivery(self):
+        row = self.passage()
+        text = row['text'] + ' Different reading.'
+        newer = dict(row, parser_version='2', text=text, char_range=[0, len(text)], byte_range=[0, len(text)])
+        found, ref = self.literature(row)
+        native_result = json.loads(found['result']['content'][0]['text'])
+        native_result['data']['passages'].append(newer)
+        found['result']['content'][0]['text'] = json.dumps(native_result)
+        ambiguous = dict(self.args, source_refs=[ref])
+        exact = dict(self.args, source_refs=[dict(ref, quote='Different reading.')])
+        report = self.record([found, self.write(1, ambiguous), self.write(2, exact)], {1: ambiguous, 2: exact})
+        self.assertEqual(report['objects'], {'passage': 2, 'judgment': 1, 'question': 1})
+        self.assertEqual(report['reasons'], {'ambiguous current passage revision': 1})
+        objects = ledger.load(self.layout).objects
+        pin = objects[-1]['source_refs'][0]
+        matched, = [o for o in objects if o['id'] == pin['id'] and o['revision'] == pin['revision']]
+        self.assertEqual(matched['content']['parser_version'], '2')

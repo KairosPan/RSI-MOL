@@ -17,6 +17,13 @@ benefit is always `not evaluated`.
 ```text
 ./rsi init               create the folders, the version store and both Codex configurations
 ./rsi install-literature install the Literature server into an existing workspace, preserving its rollback version
+./rsi install-memory     install Scientific Memory retrieval into an existing workspace
+./rsi memory backfill    register eligible completed task records (optional arguments: run IDs)
+./rsi memory status      inspect the ledger version, evidence counts and registrations
+./rsi memory verify      verify the ledger against registration reports and original files
+./rsi memory source-changed <sha256>    flag a registered original for review
+./rsi memory withdraw <id> <revision>   withdraw one exact object revision
+./rsi memory show <id>   inspect the revisions and deliveries of a memory object
 ./rsi check              measure the isolation rules with no model call (about 200 cases)
 ./rsi task <id>          run tasks/<id>/task.md with the Lab, then one Meta round (--no-meta: task only)
 ./rsi meta               one Meta round over task runs no round has looked at
@@ -46,6 +53,37 @@ Note: the literature server has network access by default and runs code from fol
 without network; it does not mean the Lab cannot reach the internet. The file rules are unchanged. The server's
 call log (`literature.jsonl`) is its own record: the Lab's commands can write to it, so it is not proof that a
 call happened. PDFs are read with Poppler only.
+
+## Scientific Memory
+
+The control program registers complete passages, paper identifiers and acquisition outcomes from finalized
+Literature tool receipts in the local `memory/` ledger. Each delivery points to a specific revision. The Lab
+searches a workspace snapshot with `lookup_sources`, `recall_passages`, `get_evidence` and `memory_status`.
+Original-file hashes are checked at registration. The passage text retains its status as a historical tool return.
+
+On an existing installation, run `./rsi memory backfill` followed by `./rsi install-memory` to put the populated
+snapshot into the manual workspace, then run `./rsi check`. Later task runs backfill pending records automatically.
+Named trials exclude evidence revisions available only from the same task. `./rsi task <id> --no-meta --memory none`
+runs a task with an empty snapshot and skips registration of that run. See the [design](docs/design-memory.md).
+
+On the installation holding the archived ledger, sessions and originals, compare the two completed runs with
+`python3 -B tasks/paired-validation-followup/audit.py records/runs/R0015 records/runs/R0016`. The audit
+matches the final quotes to actual tool returns and reports the calls, lead token usage and elapsed time for each run.
+
+During a managed task with live memory, `propose_memory` accepts subquestions, judgments, decisions,
+investigations and method experience. Cite a retrieved object by ID and revision, or cite a passage by its
+address and exact quote. For a complete passage first read in that run, include `delivery_source="literature"`
+and the service's `invocation_id`. The controller checks the read and commits the evidence and accepted
+proposals in the same batch. Later tasks can use `recall_objects` or `recall_judgments` to retrieve them.
+
+New snapshots carry review status down the chain of references. A changed source or a superseded citation
+marks dependent interpretations `needs_review`. A missing original or withdrawn revision makes its pinned
+references `unavailable`. The owner commands above return an independent registration receipt. An open
+task keeps its starting snapshot. Run `./rsi install-memory` to refresh the manual workspace.
+
+To replay both types of passage citation in a temporary ledger on that installation, run
+`python3 -B tasks/paired-validation-followup/replay_judgment.py` and repeat it with `--current-literature`.
+The [implementation plan](docs/plan-memory-proposals.md) records the recovery tests and their results.
 
 ## Requirements
 

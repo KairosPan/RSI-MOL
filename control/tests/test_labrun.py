@@ -447,7 +447,8 @@ class SealFirst(unittest.TestCase):
             self.assertEqual((root.layout.root / before['path'] / 'mine.txt').read_text(), 'an owner edit')
             self.assertEqual((after['call'], after['path']), (call['id'], f'sealed/{call["id"]}/work'))
             self.assertTrue((root.layout.root / after['path'] / 'notes' / 'n.md').is_file())
-            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'out'])   # main's head
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'memory', 'out'])
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'live')
             root.model.push(say('again'))
             second = run_task(root.layout, 'T1')
             self.assertEqual((second['status'], second['version_before']), ('finished', 'V0001'))
@@ -490,7 +491,7 @@ class SealFirst(unittest.TestCase):
                 with self.assertRaisesRegex(Refused, 'git checkout failed'): run_task(root.layout, 'T1')
             self.assertEqual((root.store.head(), (root.layout.work / 'mine.txt').read_text()),
                              ('V0002', 'an owner edit'))
-            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'mine.txt', 'out'])
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'memory', 'mine.txt', 'out'])
             self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
 
     def test_an_oversize_file_with_a_long_chinese_name_never_reaches_a_version(self):

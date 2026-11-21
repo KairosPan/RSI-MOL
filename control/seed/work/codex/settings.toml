@@ -3,7 +3,7 @@
 # Only the keys below are accepted; any other key has no effect and is noted in the record of that run. A key that is
 # not written keeps its default value.
 # The examples below are commented out. To use one, remove the "# " at the start of its lines, then change the
-# values to the ones you want. One table is in effect: the Literature server, at the end.
+# values to the ones you want. The Memory and Literature servers are enabled below.
 
 # The model name. If it is not written, Codex's default model is used.
 # model = "<model name>"
@@ -48,6 +48,11 @@
 # [tool_servers.web_tool]
 # url = "https://example.com/mcp"
 # bearer_token_env_var = "RSI_TOOL_WEB"
+
+# The Memory server reads the snapshot placed in this workspace. It runs offline.
+[tool_servers.memory]
+command = "python3"
+args = ["-B", "tools/memory/server.py"]
 
 # The Literature server (its code is in tools/literature/). It has network access by default, through its own
 # proxy, even while network for Lab commands (network above) is off. It runs code from tools/literature/ and

@@ -42,6 +42,7 @@ from rsi.compose import (ENVELOPE, HOME_CONFIG, TOOL_FOLDERS, backup_names, keep
                          read_regular, write_home_config)
 from rsi.labrun import (MANUAL, PROCESS_FILE, WORKSPACE_ERRORS, discard, interrupted_literature, move_in, now,
                         process_start, refusing, restore_work, root_descriptor, settle, stage, stamp)
+from rsi.memory_store import init_store
 from rsi.paths import Layout, Refused
 from rsi.records import STARTED, Records
 from rsi.settings import Settings
@@ -55,7 +56,7 @@ UNSAFE_IN_ROOT = '"[]*?\n\r'                    # Codex's own sandbox cannot con
 # What Codex loads from a project root. The RSI root is a git repository, so Codex may take it for the project root of
 # work/ (and meta/): none of these may be in it.
 LOADED_AT_ROOT = ('AGENTS.md', 'AGENTS.override.md', '.agents', '.codex')
-OWNER_FOLDERS = ('owner', 'tasks', 'records', 'versions', 'staging', 'sealed', 'codex-home', 'codex-home-meta')
+OWNER_FOLDERS = ('owner', 'tasks', 'records', 'memory', 'versions', 'staging', 'sealed', 'codex-home', 'codex-home-meta')
 AGENT_FOLDERS = ('meta', 'library')             # env/ is made by venv; work/ is renamed in; trial/, candidate/ later
 OWNER_SEED = (Path('limits.toml'), Path('meta', 'AGENTS.md'), Path('meta', 'settings.toml'))
 LOGIN_SECONDS = 60
@@ -387,6 +388,7 @@ def init(layout: Layout, seed: Path) -> dict:
     report, context = _report(), {'command': 'init'}
     with root_descriptor(layout) as root_fd:
         _folders(layout, root_fd, report)
+        init_store(layout)
         _keep_owner_config(layout, report)
         original, source = _original(layout, report['problems'])
         _envelope(layout, report, original, source)

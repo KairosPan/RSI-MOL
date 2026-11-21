@@ -1,4 +1,4 @@
-"""Command line of the control program: init, check, install-literature, task, meta, status, rollback, recover.
+"""Command line of the control program, including its workspace installers and scientific memory ledger.
 
 Every command but `status` holds the lock (rsi.init.locked), so two never run at once. Exit codes: 0 done, 2 usage,
 3 refused (a Refused, or a request that fails the checks made before anything runs: an unknown task, a bad or
@@ -19,6 +19,8 @@ from rsi.init import init, locked, recover
 from rsi.labrun import noting_refusals, run_task, unrecovered
 from rsi.limits import usage_by_class
 from rsi.install_literature import ConfigNotUpdated, NotInWork, install_literature
+from rsi.install_memory import install_memory
+from rsi import memory_ingest, memory_store
 from rsi.meta import RELEASE_FILE, rollback, run_round
 from rsi.paths import Layout, Refused, find_layout
 from rsi.programs import clean_path, inside
@@ -56,7 +58,17 @@ USAGE = """Usage: rsi <command>
                        whether the two Codex homes are signed in
   check                test the isolation requirements one by one; no model is called
   install-literature   merge the Literature service into the current Lab workspace and print its rollback version
-  task <id>            run a task, then a Meta round; with --no-meta, only the task
+  install-memory       merge the Scientific Memory service into the current Lab workspace
+  memory status        show the store version, counts, recent registrations and pending runs
+  memory verify        verify the ledger, registration reports and archived originals
+  memory backfill [R…] register eligible older runs or complete missing registration reports
+  memory show <id>     show a memory object, its revisions and deliveries
+  memory source-changed <source_sha256>
+                       mark a registered original as changed
+  memory withdraw <object_id> <revision>
+                       withdraw a registered object revision
+  task <id>            run a task, then a Meta round; --no-meta runs only the task;
+                       --memory none supplies an empty snapshot and skips registration for this task
   meta                 run a Meta round on the task runs that no round has looked at (none: no round)
   status [--json]      the current version, recent runs and releases, pending applications, costs by class
   rollback <version>   go back to an earlier version
@@ -86,17 +98,30 @@ def _parse(args: list[str]) -> tuple[str, dict]:
     if not args:
         raise Usage('')
     command, rest = args[0], args[1:]
-    if command in ('init', 'check', 'meta', 'recover', 'install-literature') and not rest:
+    if command in ('init', 'check', 'meta', 'recover', 'install-literature', 'install-memory') and not rest:
         return command, {}
+    if command == 'memory' and rest:
+        action, *values = rest
+        if ((action in ('status', 'verify') and not values) or (action in ('show', 'source-changed') and len(values) == 1)
+                or (action == 'withdraw' and len(values) == 2 and re.fullmatch(r'[1-9][0-9]*', values[1]))
+                or (action == 'backfill' and all(re.fullmatch(r'R[0-9]{4,}', v) for v in values))):
+            return command, {'action': action, 'values': values}
     if command == 'status' and rest in ([], ['--json']):
         return command, {'json': bool(rest)}
     if command == 'rollback' and len(rest) == 1:
         return command, {'version': rest[0]}
     if command == 'task':
+        memory = 'live'
+        if '--memory' in rest:
+            pos = rest.index('--memory')
+            if rest[pos + 1:pos + 2] != ['none']:
+                raise Usage('--memory takes the value none.')
+            memory = 'none'
+            rest = rest[:pos] + rest[pos + 2:]
         flags = [arg for arg in rest if arg == '--no-meta']
         names = [arg for arg in rest if arg != '--no-meta']
         if len(names) == 1 and len(flags) <= 1 and not names[0].startswith('-'):
-            return command, {'task': names[0], 'meta': not flags}
+            return command, {'task': names[0], 'meta': not flags, 'memory': memory}
     if command in ('help', '-h', '--help') and not rest:
         return 'help', {}
     raise Usage(f'Unknown command: rsi {" ".join(args)}')
@@ -263,7 +288,8 @@ def _call_lines(layout: Layout, call: dict) -> list[str]:
                          'problems)')
         else:
             lines.append(f'  version: still {before} (the workspace did not change)')
-    return lines + _problem_lines(call.get('problems'), f'{folder}/call.json')
+    return (lines + _problem_lines(call.get('problems'), f'{folder}/call.json')
+            + _problem_lines(call.get('post_call_problems'), 'records/index.jsonl'))
 
 
 def _round_lines(layout: Layout, record: dict) -> list[str]:
@@ -343,10 +369,14 @@ def _state(layout: Layout) -> tuple[dict, list[dict]]:
     recent = list(reversed(calls[-5:]))
     store = VersionStore(layout.versions)
     log = store.log() if (store.git_dir / 'HEAD').is_file() else []
+    try:
+        memory = memory_ingest.status(layout)
+    except (OSError, ValueError, RuntimeError) as error:
+        memory = {'problem': str(error)}
     return {'version': log[0]['version'] if log else None, 'versions': log[:5],
             'calls': [{key: call.get(key) for key in CALL_KEYS} for call in recent],
             'releases': _releases(layout.records, 3), 'applications': _pending(layout.records),
-            'usage': usage_by_class(calls), 'check': check_state(layout)}, recent
+            'usage': usage_by_class(calls), 'check': check_state(layout), 'memory': memory}, recent
 
 
 def status(layout: Layout) -> dict:
@@ -362,6 +392,12 @@ def _status(layout: Layout, as_json: bool) -> int:
         return 0
     version = safe(state['version'], ID_CHARS) if state['version'] else 'none yet (run rsi init first)'
     lines = [f'Current version: {version}']
+    memory = state['memory']
+    if 'problem' in memory:
+        lines.append(f'Memory unavailable: {safe(memory["problem"])}')
+    else:
+        lines.append(f'Memory: version {memory["version"]}, {sum(memory["counts"].values())} objects, '
+                     f'{memory["pending"]} runs awaiting registration')
     if state['versions']:
         lines.append('Recent versions: ' + '; '.join(
             f'{safe(entry["version"], ID_CHARS)} ({safe(entry["author"], ID_CHARS)})' for entry in state['versions']))
@@ -444,10 +480,10 @@ def _check(layout: Layout) -> int:
     return 0 if report['passed'] else 1
 
 
-def _task(layout: Layout, task: str, meta: bool) -> int:
+def _task(layout: Layout, task: str, meta: bool, memory: str = 'live') -> int:
     with _validating():
         load_task(layout.tasks, task)           # an unknown task or a bad id: refused before anything runs
-    call = run_task(layout, task)
+    call = run_task(layout, task, memory=memory)
     _print(_call_lines(layout, call))
     if meta:                                    # the task run is done: its exit code is 0 whatever the round does
         try:
@@ -513,22 +549,43 @@ def _recover(layout: Layout) -> int:
     return 0
 
 
-def _install_literature(layout: Layout) -> int:
+def _install(layout: Layout, installer, name: str) -> int:
     lines = []
     try:
-        baseline, version = install_literature(layout, SEED / 'work', lines)
+        baseline, version = installer(layout, SEED / 'work', lines)
     except (NotInWork, ConfigNotUpdated) as error:
         _error(error)
         _print([f'  {safe(line)}' for line in lines], sys.stderr)
         return 1
     if baseline == version:
-        out = [f'Literature already installed in {safe(version, ID_CHARS)}.']
+        out = [f'{name} already installed in {safe(version, ID_CHARS)}.']
     else:
-        out = [f'Literature installed in {safe(version, ID_CHARS)}. Roll back with: rsi rollback '
+        out = [f'{name} installed in {safe(version, ID_CHARS)}. Roll back with: rsi rollback '
                f'{safe(baseline, ID_CHARS)}']
     _print(out + [f'  {safe(line)}' for line in lines])
     return 0
 
 
+def _memory(layout: Layout, action: str, values: list[str]) -> int:
+    if action == 'status':
+        result = memory_ingest.status(layout)
+    elif action == 'verify':
+        result = memory_ingest.verify(layout)
+    elif action == 'backfill':
+        result = memory_ingest.backfill(layout, values or None)
+    elif action == 'show':
+        with _validating():
+            result = memory_store.show(layout, values[0])
+    else:
+        with _validating():
+            if action == 'source-changed':
+                result = memory_store.record_owner_action(layout, 'source_changed', {'source_sha256': values[0]})
+            else:
+                result = memory_store.record_owner_action(layout, 'withdrawn', {'id': values[0], 'revision': int(values[1])})
+    print(json.dumps(result, ensure_ascii=True, indent=2))
+    return 0
+
+
 COMMANDS = {'init': _init, 'check': _check, 'task': _task, 'meta': _meta, 'rollback': _rollback, 'recover': _recover,
-            'install-literature': _install_literature}
+            'install-literature': lambda layout: _install(layout, install_literature, 'Literature'),
+            'install-memory': lambda layout: _install(layout, install_memory, 'Scientific Memory'), 'memory': _memory}

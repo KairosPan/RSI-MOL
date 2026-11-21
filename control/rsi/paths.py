@@ -58,6 +58,10 @@ class Layout:
         return self.root / 'library'
 
     @property
+    def memory(self) -> Path:
+        return self.root / 'memory'
+
+    @property
     def env(self) -> Path:
         return self.root / 'env'
 

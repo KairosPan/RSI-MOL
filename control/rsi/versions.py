@@ -75,7 +75,7 @@ def same_entries(fd: int, names) -> set[str]:
 
 class VersionStore:
     # Never versioned, never removed by checkout. .agents/ is built by the control program alone (rsi.skills).
-    EXCLUDED = ('.tmp/', 'out/', 'in/', '.agents/')
+    EXCLUDED = ('.tmp/', 'out/', 'in/', '.agents/', 'memory/')
 
     def __init__(self, git_dir: Path) -> None:
         self.git_dir = Path(git_dir).resolve()

@@ -26,6 +26,13 @@ from tests.support import Root, needs_codex, plant_programs
 from tests.test_cli import run
 
 WANTED = (('lab', 'read_records'), ('lab_net', 'local_tcp'), ('lab_net', 'local_unix_socket'), ('trial', 'write_work'),
+          ('lab', 'read_memory_store'), ('trial', 'read_memory_store'), ('trial_net', 'write_memory_store'),
+          ('meta', 'read_memory_store'), ('meta', 'write_memory_store'), ('lab', 'memory_status_call'),
+          ('lab', 'memory_read_snapshot'), ('trial', 'memory_write_snapshot'), ('trial', 'memory_connect_out'),
+          ('lab', 'memory_write_proposals'), ('trial', 'memory_write_proposals'),
+          ('lab', 'memory_live_write_proposals'), ('lab', 'memory_live_write_store'),
+          ('lab', 'memory_read_store'), ('lab', 'memory_write_store'), ('lab_net', 'literature_memory_store'),
+          ('trial_net', 'literature_read_memory_store'),
           ('meta', 'write_records'), ('lab', 'edit_via_symlink'), ('meta', 'edit_existing_record'),
           ('trial', 'write_env'), ('meta', 'replace_own_root'), ('lab', 'dot_codex_link'), ('meta', 'dot_codex_link'),
           ('meta', 'meta_agents_md_not_loaded'), ('lab', 'lab_agents_md_loaded'),
@@ -84,14 +91,10 @@ def scratch_left(root: Root) -> list[str]:
     return [name for name in os.listdir(staging) if name.startswith('check-')] if staging.exists() else []
 
 
-def sockets_left() -> set[str]:
-    return {name for name in os.listdir('/tmp') if name.startswith('rsi-check-')}
-
-
 @needs_codex
 class Check(unittest.TestCase):
     def test_a_fresh_root_passes_with_the_owners_connectors_on(self):
-        home, sockets = set(os.listdir(Path.home())), sockets_left()
+        home = set(os.listdir(Path.home()))
         with Root(passed_check=False) as root:
             (root.layout.owner / 'lab-envelope.toml').write_text(APPS_ON)
             marker = root.path / 'planted-ran'                      # programs an agent could plant on the PATH
@@ -99,7 +102,9 @@ class Check(unittest.TestCase):
             os.environ['PATH'] = f'{root.layout.env / "bin"}{os.pathsep}{os.environ["PATH"]}'     # Root restores it
             self.assertIsNotNone(gate(root.layout))
             work, records = tree(root.layout.work), tree(root.layout.records)
-            report = run_check(root.layout)
+            sockets = _Sockets()
+            with mock.patch('rsi.check._Sockets', return_value=sockets):
+                report = run_check(root.layout)
             failed = [(r['profile'], r['name'], r['observed'], r['detail']) for r in report['results'] if not r['ok']]
             self.assertEqual(failed, [])
             self.assertEqual(report['problems'], []); self.assertTrue(report['passed'])
@@ -141,7 +146,7 @@ class Check(unittest.TestCase):
             lines = (root.layout.records / 'index.jsonl').read_text().splitlines()
             self.assertEqual([json.loads(line)['kind'] for line in lines], ['check'])
             self.assertFalse(marker.exists(), marker.read_text() if marker.exists() else '')
-        self.assertEqual(sockets_left(), sockets)
+        self.assertFalse(os.path.lexists(sockets.folder))  # another root's concurrent check owns its own sockets
         new = set(os.listdir(Path.home())) - home
         self.assertEqual([name for name in new if 'rsi' in name.lower() or 'codex' in name.lower()], [])
 
