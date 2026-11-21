@@ -527,16 +527,18 @@ def _meta(layout: Layout) -> int:
 
 
 def _rollback(layout: Layout, version: str) -> int:
+    notices = []
     with _validating():
         if not VERSION.fullmatch(version):
             raise ValueError(f'{version} is not a version name. A version name looks like V0001.')
         VersionStore(layout.versions).resolve(version)          # a version the store lacks
         # rollback's ValueErrors are all about the request (its documented contract), the last one being a
         # version whose content is already the current one.
-        new = rollback(layout, version, OWNER)
+        new = rollback(layout, version, OWNER, notices=notices)
     new, version = safe(new, ID_CHARS), safe(version, ID_CHARS)
-    _print([f'Rolled back: the new version {new} has the content of {version}, and work/ now holds it.',
-            f'Record: {_shown(layout, layout.records / "releases")}/{new}.json'])
+    _print([f'Rolled back: the new version {new} has the content of {version}.',
+            f'Record: {_shown(layout, layout.records / "releases")}/{new}.json',
+            *(f'  {safe(line)}' for line in notices)])
     return 0
 
 

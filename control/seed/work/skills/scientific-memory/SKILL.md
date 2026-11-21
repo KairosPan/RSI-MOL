@@ -10,8 +10,10 @@ A `none` snapshot contains no historical evidence.
 Before delegating literature research or acquiring a paper, call `lookup_sources` with its
 DOI, PMID, PMCID, provider identifier, document ID or title. Check which request and source record
 link the paper to a document. Different papers may share an original file. Use the verification
-and conflict fields when judging the match. Narrow your query or increase `max_bytes` if whole
-results were omitted. Use `get_evidence` for a specific ID and revision.
+and conflict fields when judging the match. Narrow the query when whole results were omitted.
+Use `get_evidence` for a specific ID and revision. Reads show up to three recent deliveries and
+their total count. The tool caps the full MCP receipt at 32 KiB so the native session can record it.
+If a whole passage cannot fit, read the original by document and locator before citing it.
 
 Cite a passage using the evidence ID and revision, source run, document ID and version, original
 SHA-256, locator and an exact quote. Identify whether it was returned by memory, read by the
@@ -22,6 +24,8 @@ requires a fresh read, pass the document ID, version and locator to `read_docume
 Use `recall_judgments` for judgments and `recall_objects` to search all kinds or filter by kind.
 Read the scope, freshness, supporting and challenging references. Check the original or reassess
 the interpretation when a result is marked `needs_review` or `unavailable`.
+If `omitted_details` is present, the object still contains its exact source and object references.
+Use `get_evidence` with their IDs and revisions to inspect the linked material separately.
 
 Before sending the final answer in a managed live task, the lead reviews the report for a judgment
 another task could apply. If the report draws a new conclusion with clear conditions of use and

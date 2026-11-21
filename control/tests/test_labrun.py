@@ -9,10 +9,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rsi import labrun, workspace
+from rsi import labrun, memory_ingest, workspace
 from rsi.codexrun import codex_version
 from rsi.init import recover
 from rsi.labrun import run_task, run_trial
+from rsi.meta import rollback
 from rsi.mockmodel import add_file, say, slow, with_usage
 from rsi.paths import Refused
 from rsi.sessions import collect_sessions
@@ -86,6 +87,18 @@ class LabRuns(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in dest.iterdir()),
                          [f'rollout-1-{lead}.jsonl', f'rollout-2-{child}.jsonl'])
         self.assertEqual(collect_sessions(home, 'no-such-thread', home / 'dest2'), [])
+        (day / f'rollout-2-{child}.jsonl').unlink()
+        problems = []
+        self.assertEqual(collect_sessions(home, lead, home / 'missing-child', problems=problems), [child])
+        self.assertEqual(problems, [f'Missing session archive for thread {child}'])
+
+        def partial(source, target):
+            target.write(source.read(5))
+            raise OSError('session copy stopped')
+
+        with mock.patch('rsi.sessions.shutil.copyfileobj', side_effect=partial), self.assertRaises(OSError):
+            collect_sessions(home, lead, home / 'partial')
+        self.assertEqual(list((home / 'partial').iterdir()), [])
 
     def test_failed_check_and_inputs(self):
         with Root() as root:
@@ -266,6 +279,11 @@ class MoreLabRuns(unittest.TestCase):
             # Codex had ended: the call keeps its status and usage, and says what was not done.
             self.assertEqual((second['status'], second['usage']['input_tokens']), ('finished', 0))
             self.assertTrue(any('KeyboardInterrupt' in line for line in second['problems']))
+            self.assertFalse(second['memory_collection_complete'])
+            self.assertFalse(memory_ingest.eligible({**second, 'problems': []}))
+            legacy = dict(second)
+            del legacy['memory_collection_complete']
+            self.assertFalse(memory_ingest.eligible(legacy))
             # The collection left its sealed tree in the root and no work/: nothing runs until rsi recover has kept
             # the tree under sealed/ and put main's head back.
             with self.assertRaisesRegex(Refused, 'rsi recover'):
@@ -274,6 +292,58 @@ class MoreLabRuns(unittest.TestCase):
             root.model.push(say('ok'))
             self.assertEqual(run_task(root.layout, 'T1')['status'], 'finished')
             self.assertEqual((root.layout.work / 'left.txt').read_text(), 'what the interrupted run left')
+            self.assertFalse((root.layout.records / 'memory' / f'{second["id"]}.json').exists())
+
+    def test_damaged_memory_preserves_work_and_the_no_memory_control(self):
+        with Root() as root:
+            root.add_task('T')
+            root.records.write_json('memory/R0001.json', {})
+            work = root.layout.work
+            (work / 'notes.md').write_text('keep me')
+            with self.assertRaisesRegex(Refused, 'no matching memory batch'):
+                run_task(root.layout, 'T')
+            self.assertEqual((work / 'notes.md').read_text(), 'keep me')
+            self.assertEqual(json.loads((work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+            with self.assertRaisesRegex(Refused, 'no matching memory batch'):
+                run_trial(root.layout, commit=root.store.head(), round_id='M0001', task_id='T')
+            self.assertEqual(root.records.calls(), [])
+
+            root.model.push(say('done'))
+            with mock.patch.object(memory_ingest, 'backfill', side_effect=AssertionError('none ran backfill')):
+                call = run_task(root.layout, 'T', memory='none')
+            self.assertEqual((call['status'], call['memory']['condition']), ('finished', 'none'))
+            self.assertFalse(call['problems'])
+            self.assertTrue(any('unavailable' in line for line in call['post_call_problems']))
+            work.rename(root.path / 'previous-work')
+            lines = []
+            recover(root.layout, lines)
+            self.assertTrue(any('restored' in line and 'unavailable' in line for line in lines))
+            self.assertEqual((work / 'notes.md').read_text(), 'keep me')
+            notices = []
+            version = rollback(root.layout, 'V0001', 'owner', notices=notices)
+            self.assertEqual(version, root.store.head())
+            self.assertTrue(any('unavailable' in line for line in notices))
+            self.assertEqual((work / 'AGENTS.md').read_text(), 'hello\n')
+            self.assertFalse((work / 'notes.md').exists())
+            self.assertEqual(json.loads((work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+
+    def test_failed_proof_collection_keeps_the_model_status_and_skips_registration(self):
+        with Root() as root:
+            root.add_task('T')
+            (root.layout.work / 'codex').mkdir()
+            (root.layout.work / 'codex/settings.toml').write_text('[tool_servers.memory]\ncommand = "python3"\n')
+            for collection in ('collect_sessions', 'proposal_files.collect'):
+                with self.subTest(collection=collection):
+                    root.model.push(say('done'))
+                    with mock.patch('rsi.labrun.' + collection, side_effect=OSError('recording could not be copied')):
+                        call = run_task(root.layout, 'T')
+                    self.assertEqual(call['status'], 'finished')
+                    self.assertFalse(call['memory_collection_complete'])
+                    self.assertFalse(memory_ingest.eligible(call))
+                    legacy = dict(call)
+                    del legacy['memory_collection_complete']
+                    self.assertFalse(memory_ingest.eligible(legacy))
+                    self.assertFalse((root.layout.records / 'memory' / f'{call["id"]}.json').exists())
 
     def test_unusable_control_folders_never_block_a_run(self):
         with Root() as root:

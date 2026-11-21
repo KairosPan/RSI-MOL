@@ -22,10 +22,49 @@ from runtime import Runtime  # noqa: E402
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 MAX_MESSAGE = 256 * 1024
 KEPT_DATA = ('document_id', 'document_version', 'source_sha256')     # what a replaced reply keeps of its data
+MEMORY_EVIDENCE_TOOLS = ('read_document', 'find_passages', 'get_paper', 'search_papers', 'get_citations',
+                         'acquire_fulltext')
+NATIVE_RECEIPT_BYTES = 32 * 1024
 
 
 def encode(value):
     return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
+
+
+def text_result(response, invocation_id):
+    text = encode({**response, 'invocation_id': invocation_id}).decode()
+    return {'content': [{'type': 'text', 'text': text}], 'isError': response['status'] in {'failed', 'unavailable'}}
+
+
+def fits_receipt(response, invocation_id):
+    return len(encode(text_result(response, invocation_id))) <= NATIVE_RECEIPT_BYTES
+
+
+def compact_metadata(name, response):
+    """Keep the same acquired document or the complete provider page and its original cursor."""
+    if response['status'] not in ('ok', 'partial'):
+        return response
+    data = dict(response['data'])
+    if name == 'acquire_fulltext':
+        # build_reading_package can fetch the full navigation index separately.
+        omitted = {}
+        for key in ('references', 'sections', 'pages'):
+            if isinstance(data.get(key), list):
+                omitted[key] = len(data.pop(key))
+        if omitted:
+            data['omitted_reading_index_items'] = omitted
+    elif name in ('get_paper', 'search_papers', 'get_citations'):
+        key = 'paper' if name == 'get_paper' else 'papers'
+        papers = [data[key]] if key == 'paper' else data[key]
+        fields = ('paper_id', 'provider', 'provider_id', 'title', 'doi', 'pmid', 'pmcid', 'year', 'url')
+        summaries = []
+        for paper in papers:
+            summary = {k: paper[k] for k in fields if k in paper}
+            summary.update(content_scope='metadata', omitted_fields=sorted(paper.keys() - fields - {'content_scope'}))
+            summaries.append(summary)
+        data[key] = summaries[0] if key == 'paper' else summaries
+        return {**response, 'data': data, 'coverage': {**response['coverage'], 'content_scope': 'metadata'}}
+    return {**response, 'data': data}
 
 
 def reject_constant(_):
@@ -46,11 +85,11 @@ class Session:
         response['provenance'] = self.service.contacted()
         return response
 
-    def _replaced(self, response):
+    def _replaced(self, response, invocation_id):
         """The reply that stands in for one over RESPONSE_BYTES: the same provenance (the sources and hosts that
         were contacted) and the identity of a document that was archived, so the model can still read it."""
         data = response.get('data') if isinstance(response.get('data'), dict) else {}
-        kept = {key: data[key] for key in KEPT_DATA if isinstance(data.get(key), str)}
+        kept = {key: data[key] for key in KEPT_DATA if isinstance(data.get(key), str) and len(data[key]) <= 100}
         detail = 'Narrow the request to obtain a bounded result.'
         if 'document_id' in kept:
             detail += ' The document was archived; read it with read_document or find_passages.'
@@ -58,7 +97,7 @@ class Session:
         substitute['data'] = kept
         if isinstance(response.get('provenance'), dict):
             substitute['provenance'] = response['provenance']
-        if len(encode(substitute)) > RESPONSE_BYTES // 2:
+        if not fits_receipt(substitute, invocation_id):
             substitute['provenance'] = self.service.contacted()
         return substitute
 
@@ -67,8 +106,20 @@ class Session:
         image = None
         try:
             response, image = self.service.call(name, args, invocation_id)
+            # Passage reads are local and side-effect free. Re-read the same selection
+            # with less text until its complete MCP receipt fits, preserving the cursor
+            # and coordinates issued by the document store at that exact boundary.
+            if name in ('read_document', 'find_passages'):
+                budget = args.get('max_bytes', 8000)
+                while budget > 4 and not fits_receipt(response, invocation_id):
+                    budget = max(4, budget // 2)
+                    response, image = self.service.call(name, {**args, 'max_bytes': budget}, invocation_id)
             if len(encode(response)) > RESPONSE_BYTES:
-                response, image = self._replaced(response), None
+                response, image = self._replaced(response, invocation_id), None
+            elif name in MEMORY_EVIDENCE_TOOLS and not fits_receipt(response, invocation_id):
+                response = compact_metadata(name, response)
+                if not fits_receipt(response, invocation_id):
+                    response, image = self._replaced(response, invocation_id), None
         except DocumentError as exc:
             missing = exc.code in {'trial_cache_miss', 'unknown_document', 'unknown_source'}
             status = 'unavailable' if missing else 'failed'
@@ -88,11 +139,10 @@ class Session:
         except Exception:
             response = failure('log_unavailable', 'The tool invocation could not be recorded in this workspace.')
             image = None
-        response['invocation_id'] = invocation_id
-        content = [{'type': 'text', 'text': encode(response).decode()}]
+        result = text_result(response, invocation_id)
         if image is not None:
-            content.append(image)
-        return {'content': content, 'isError': response['status'] in {'failed', 'unavailable'}}
+            result['content'].append(image)
+        return result
 
     def handle(self, message):
         if not isinstance(message, dict) or message.get('jsonrpc') != '2.0' \

@@ -233,7 +233,7 @@ class _Registration:
         self.accepted[subtype] += 1
         return body
 
-    def run(self):
+    def prepare(self):
         pending = set() if 'task_goal' in self.call else None
         current = defaultdict(list)
         calls = native_calls(self.layout, self.call, self.reject, self.deadline, pending)
@@ -277,13 +277,38 @@ class _Registration:
         summary = {'service': self.source, 'objects': dict(self.created), 'deliveries': dict(self.accepted),
                    'delivery_count': sum(self.accepted.values()), 'reasons': dict(self.reasons), 'rejected': self.rejections}
         deadline_check(self.deadline)
-        return ledger.publish(self.layout, self.state, self.call['id'], self.rows, summary)
+        return summary
+
+
+def _legacy_collection_incomplete(problems):
+    for line in problems:
+        if not isinstance(line, str):
+            continue
+        if line.startswith(('Interrupted while collecting the results (', 'Could not copy the session record',
+                            'Missing session archive for thread ', 'Memory proposals could not be collected:')):
+            return True
+        if line.startswith('Proposal ') and ' could not be collected: ' in line:
+            reason = line.partition(' could not be collected: ')[2]
+            if reason not in ('expected a bounded single-link regular file', 'file changed while opening',
+                              'file changed while copying'):
+                return True
+    return False
 
 
 def eligible(call):
+    if call.get('purpose') != 'task' or call.get('status') not in ('finished', 'failed', 'timed_out'):
+        return False
     memory = call.get('memory') or {}
-    return (call.get('purpose') == 'task' and call.get('status') in ('finished', 'failed', 'timed_out')
-            and memory.get('condition', 'live') != 'none' and bool(session_paths(call)))
+    if not isinstance(memory, dict):
+        raise ValueError('Invalid memory metadata in call record')
+    if memory.get('condition', 'live') != 'live' or call.get('memory_collection_complete') is False:
+        return False
+    # Older records expose proof collection failures only through their problems and attachment manifest.
+    if 'memory_collection_complete' not in call and _legacy_collection_incomplete(call.get('problems') or ()):
+        return False
+    paths = session_paths(call)
+    expected = {call.get('thread_id'), *(call.get('subagent_threads') or [])} - {None}
+    return bool(paths) and {thread for _, thread, _ in paths} == expected
 
 
 def _calls(layout):
@@ -298,7 +323,7 @@ def backfill(layout: Layout, run_ids=None):
     unknown = requested - {call['id'] for call in calls}
     if unknown:
         raise ValueError(f'Unknown registration run: {", ".join(sorted(unknown))}')
-    reports = []
+    reports, failures = [], []
     if not requested:
         for owner in sorted(state.missing_owner_reports, key=lambda key: state.owner_reports[key]['version_after']):
             reports.append(ledger.finish_report(layout, state, owner))
@@ -309,8 +334,29 @@ def backfill(layout: Layout, run_ids=None):
         if run in state.reports:
             if run in state.missing_reports or requested:
                 reports.append(ledger.finish_report(layout, state, run))
-        elif eligible(call):
-            reports.append(_Registration(layout, state, call).run())
+        else:
+            failure_path = f'memory-failures/{run}.json'
+            previously_failed = (layout.records / failure_path).is_file()
+            if previously_failed and not requested:
+                continue
+            try:
+                if not eligible(call):
+                    continue
+                registration = _Registration(layout, state, call)
+                summary = registration.prepare()
+            except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+                reason = f'{type(error).__name__}: {error}'
+                if isinstance(error, (FileNotFoundError, ValueError, TypeError, KeyError, RecursionError)):
+                    # An immutable archive needs owner repair. A named backfill can retry it.
+                    if not previously_failed:
+                        Records(layout.records).write_json(failure_path, {'run': run, 'reason': reason})
+                    reason += f' (after repairing the archive, run rsi memory backfill {run})'
+                failures.append(f'{run}: {reason}')
+                continue
+            # Publication and report writes affect shared state. Let recovery re-read the chain on any failure.
+            reports.append(ledger.publish(layout, state, run, registration.rows, summary))
+    if failures:
+        raise ValueError('Could not register the following runs: ' + '; '.join(failures))
     return reports
 
 
@@ -318,8 +364,24 @@ def status(layout: Layout):
     state = ledger.load(layout)
     counts = {kind: len({o['id'] for o in state.objects if o['content']['type'] == kind})
               for kind in (*ledger.TYPES, *memory_proposals.CONTENT_FIELDS)}
-    pending = sum(eligible(c) and (c['id'] not in state.reports or c['id'] in state.missing_reports) for c in _calls(layout))
-    return {'version': state.version, 'counts': counts, 'deliveries': len(state.deliveries), 'pending': pending,
+    blocked = []
+    pending = set(state.missing_reports)
+    failure_folder = layout.records / 'memory-failures'
+    for call in _calls(layout):
+        run = call['id']
+        if run in state.reports:
+            continue
+        try:
+            if not eligible(call):
+                continue
+            failed = (failure_folder / f'{run}.json').is_file()
+        except (ValueError, KeyError, TypeError):
+            failed = True
+        pending.add(run)
+        if failed:
+            blocked.append(run)
+    return {'version': state.version, 'counts': counts, 'deliveries': len(state.deliveries), 'pending': len(pending),
+            'blocked_runs': blocked,
             'owner_actions': len(state.owner_events), 'pending_owner_reports': len(state.missing_owner_reports),
             'recent': [{k: r[k] for k in ('run', 'version_after', 'delivery_count')} for r in list(state.reports.values())[-5:]]}
 

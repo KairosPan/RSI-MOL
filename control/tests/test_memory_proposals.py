@@ -89,6 +89,18 @@ class Proposals(unittest.TestCase):
         ref.update(delivery_source='literature', invocation_id=invocation, relation='supports', quote=row['text'])
         return native, ref
 
+    def test_truncated_native_receipts_have_a_specific_diagnostic_and_give_no_credit(self):
+        wrapper = {'isError': False, 'content': [{'type': 'text', 'text': '{"results":[…1234 chars truncated…]}'}]}
+        memory = returned('memory', 'get_evidence', 'cut-read', wrapper)
+        lit = returned('literature', 'find_passages', 'cut-literature', wrapper)
+        failed = returned('memory', 'get_evidence', 'failed-read', {})
+        failed['result'] = {'isError': True, 'content': [{'type': 'text', 'text': 'Tool error: …22 chars truncated…'}]}
+        report = self.record([lit, memory, failed, self.write(1)], {1: self.args})
+        self.assertEqual(report['reasons']['native tool receipt truncated by Codex'], 2)
+        self.assertEqual(report['reasons'], {'native tool receipt truncated by Codex': 2,
+                                             'evidence revision was not returned by memory in this run': 1})
+        self.assertNotIn('judgment', report['objects'])
+
     def test_current_and_historical_references_preserve_both_native_calls(self):
         found, new = self.literature(self.passage())
         args = dict(self.args, source_refs=[self.ref, new])
@@ -323,6 +335,43 @@ class Proposals(unittest.TestCase):
         result = self.record([self.write(1, valid)], {1: valid})
         self.assertEqual(result['objects'], {'question': 1})
         self.assertEqual(ledger.load(self.layout).objects[-1]['supersedes'], 1)
+
+    def test_canonical_author_can_update_legacy_judgment_and_its_contract_goal(self):
+        folder = self.layout.tasks / 'experiment'
+        folder.mkdir(parents=True)
+        legacy = self.layout.tasks / 'Experiment'
+        if not legacy.exists():  # Model the historical spelling on a case-sensitive test volume.
+            legacy.symlink_to(folder, target_is_directory=True)
+        old = dict(self.args, question_id='Experiment')
+        self.record([self.read, self.write(1, old)], {1: old}, task='Experiment')
+        original_root, original = ledger.load(self.layout).objects[-2:]
+        self.assertEqual(original_root['id'], 'question_' + ledger.digest('Experiment'))
+        edit = dict(self.args, expected_revision=1)
+        revised = self.record([self.read, self.write(2, edit)], {2: edit}, goal='Updated goal')
+        self.assertEqual(revised['objects'], {'question': 1, 'judgment': 1})
+        earlier_root, earlier, new_root, new = ledger.load(self.layout).objects[-4:]
+        self.assertEqual((earlier_root, earlier), (original_root, original))
+        self.assertEqual((new_root['id'], new_root['revision'], new_root['content']['text']),
+                         (original_root['id'], 2, 'Updated goal'))
+        self.assertEqual(new['origin']['task'], 'experiment')
+        self.assertEqual(new['supersedes'], original['revision'])
+        self.assertEqual(new['question_ids'], [original_root['id']])
+        self.assertEqual(new['object_refs'][0]['revision'], 2)
+
+    def test_distinct_case_sensitive_task_cannot_revise_legacy_author(self):
+        old = dict(self.args, question_id='Experiment')
+        self.record([self.read, self.write(1, old)], {1: old}, task='Experiment')
+        edit = dict(self.args, expected_revision=1)
+        # Different parent paths let the test use genuinely distinct directories on every volume.
+        first = self.layout.tasks / 'experiment'
+        other = self.layout.root / 'other' / 'Experiment'
+        first.mkdir(parents=True)
+        other.mkdir(parents=True)
+        from rsi.tasks import same_task_directory
+        with mock.patch('rsi.memory_proposals.same_task_directory', return_value=same_task_directory(first, other)):
+            denied = self.record([self.read, self.write(2, edit)], {2: edit})
+        self.assertEqual(denied['objects'], {})
+        self.assertIn('judgment belongs to a different task or authority', denied['reasons'])
 
     def test_object_reads_must_match_the_snapshot_and_precede_the_proposal(self):
         sub = self.submit_subquestion()

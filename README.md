@@ -62,9 +62,16 @@ searches a workspace snapshot with `lookup_sources`, `recall_passages`, `get_evi
 Original-file hashes are checked at registration. The passage text retains its status as a historical tool return.
 
 On an existing installation, run `./rsi memory backfill` followed by `./rsi install-memory` to put the populated
-snapshot into the manual workspace, then run `./rsi check`. Later task runs backfill pending records automatically.
-Named trials exclude evidence revisions available only from the same task. `./rsi task <id> --no-meta --memory none`
-runs a task with an empty snapshot and skips registration of that run. See the [design](docs/design-memory.md).
+snapshot into the manual workspace. The installer preserves local memory instructions and upgrades recognized
+reader and skill templates. On an installation using Literature, run `./rsi install-literature` to update the
+Literature service's paged receipts as well, then run `./rsi check`. Live tasks backfill pending records automatically.
+If an archived session needs repair, `./rsi memory status` lists its run under `blocked_runs`. After the repair,
+retry that run with `./rsi memory backfill <run-id>`.
+
+Use the task directory's exact spelling. Named trials exclude same-task evidence and interpretations, including
+historical spellings and dependent revisions. `./rsi task <id> --no-meta --memory none` uses an empty snapshot
+without reading the ledger. When the ledger cannot be verified, the manual workspace can still be restored and
+its `memory_status` reports `unavailable`. See the [design](docs/design-memory.md).
 
 On the installation holding the archived ledger, sessions and originals, compare the two completed runs with
 `python3 -B tasks/paired-validation-followup/audit.py records/runs/R0015 records/runs/R0016`. The audit

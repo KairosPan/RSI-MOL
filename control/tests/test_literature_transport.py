@@ -229,6 +229,38 @@ class Replies(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for line in self.runtime.logfile.read_text().splitlines()]
 
+    def test_large_reading_index_keeps_its_acquisition_receipt(self):
+        data = {'document_id': 'doc_' + 'a' * 64, 'document_version': 'b' * 64, 'source_sha256': 'c' * 64,
+                'media_type': 'application/xml', 'content_scope': 'full_text', 'references': ['ref' * 200] * 60,
+                'sections': ['Methods'], 'pages': []}
+        response = {'status': 'ok', 'coverage': {'verified_paper_identifiers': ['doi']}, 'data': data,
+                    'provenance': {'provider': 'local'}, 'continuation': {}, 'errors': []}
+        reply = server.Session(Stub(self.runtime, response)).tool_call('acquire_fulltext', {'source_id': 'large'})
+        self.assertFalse(reply['isError'])
+        self.assertLessEqual(len(server.encode(reply)), server.NATIVE_RECEIPT_BYTES)
+        shown = json.loads(reply['content'][0]['text'])
+        self.assertEqual(shown['coverage'], response['coverage'])
+        self.assertEqual(shown['data']['omitted_reading_index_items'], {'references': 60, 'sections': 1, 'pages': 0})
+        for key in ('document_id', 'document_version', 'source_sha256', 'media_type', 'content_scope'):
+            self.assertEqual(shown['data'][key], data[key])
+
+    def test_oversized_paper_page_retains_all_identities_and_the_provider_cursor(self):
+        papers = [{'paper_id': f'europe_pmc:MED:{i}', 'provider': 'europe_pmc', 'pmid': str(i),
+                   'abstract': 'Large abstract. ' * 900, 'title': f'Paper {i}'} for i in range(8)]
+        continuation = {'next_cursor': 'next-complete-page', 'complete_for_query': False}
+        response = {'status': 'partial', 'data': {'papers': papers}, 'coverage': {'returned': 8},
+                    'continuation': continuation, 'provenance': {'provider': 'europe_pmc'}, 'errors': []}
+        for name in ('search_papers', 'get_citations'):
+            reply = server.Session(Stub(self.runtime, response)).tool_call(name, {})
+            shown = json.loads(reply['content'][0]['text'])
+            self.assertFalse(reply['isError'])
+            self.assertEqual(shown['continuation'], continuation)
+            self.assertEqual(shown['coverage'], {'returned': 8, 'content_scope': 'metadata'})
+            for original, row in zip(papers, shown['data']['papers'], strict=True):
+                self.assertEqual(row['paper_id'], original['paper_id'])
+                self.assertEqual(row['omitted_fields'], ['abstract'])
+            self.assertLessEqual(len(server.encode(reply)), server.NATIVE_RECEIPT_BYTES)
+
     def test_a_replaced_reply_keeps_its_sources_hosts_and_archived_document(self):
         provenance = {'provider': 'europe_pmc', 'attempt_count': 2, 'download_hosts': ['files.example.org'],
                       'requests': [{'url': 'https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=x'}]}

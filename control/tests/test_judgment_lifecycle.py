@@ -16,15 +16,27 @@ from tests.support import Root, needs_codex
 
 SEED = Path(__file__).resolve().parents[1] / 'seed/work'
 SOURCE = b'<article><body><sec><p>Score the difference within each pair.</p></sec></body></article>'
+# Enough matching blocks and JSON escapes to exceed Codex's old native receipt budget.
+PARAGRAPHS = ''.join(f'<p>Score the difference within each pair. Pool {n}: ' + '"\\中' * 35 + '</p>'
+                     for n in range(48))
+LARGE_SOURCE = ('<article><body><sec>' + PARAGRAPHS + '</sec></body></article>').encode()
 
 ACQUIRE = """
 const result = await tools.mcp__literature__acquire_fulltext({source_id:'paired'});
 const doc = JSON.parse(result.content[0].text).data.document_id;
-text((await tools.mcp__literature__read_document({document_id:doc})).content[0].text);
+let cursor;
+do {
+    const read = await tools.mcp__literature__read_document({document_id:doc, max_bytes:65536, ...(cursor && {cursor})});
+    const page = JSON.parse(read.content[0].text);
+    if (read.isError) throw Error(JSON.stringify(page.errors));
+    cursor = page.continuation.next_cursor;
+} while (cursor);
 """
 SUBMIT = """
 const r = await tools.mcp__memory__recall_passages({query:'within each pair'});
-const row = JSON.parse(r.content[0].text).results[0];
+const page = JSON.parse(r.content[0].text);
+if (!page.omitted) throw Error('Expected the native receipt budget to omit whole matching blocks');
+const row = page.results[0];
 const d = row.deliveries[0];
 const ref = {evidence_id:row.id,revision:row.revision,source_run:d.run,document_id:d.document_id,
     document_version:d.document_version,source_sha256:row.content.source_sha256,locator:row.content.locator,
@@ -69,9 +81,9 @@ class JudgmentLifecycle(unittest.TestCase):
             work = root.layout.work
             for folder in ('tools', 'codex'):
                 shutil.copytree(SEED / folder, work / folder, ignore=shutil.ignore_patterns('__pycache__'))
-            (work / 'paired.xml').write_bytes(SOURCE)
+            (work / 'paired.xml').write_bytes(LARGE_SOURCE)
             (work / 'tools/literature/sources.json').write_text(json.dumps({'paired': {
-                'path': 'paired.xml', 'media_type': 'application/xml', 'sha256': hashlib.sha256(SOURCE).hexdigest()}}))
+                'path': 'paired.xml', 'media_type': 'application/xml', 'sha256': hashlib.sha256(LARGE_SOURCE).hexdigest()}}))
             root.model.push(run_js(ACQUIRE), say('done'))
             archive = run_task(root.layout, 'archive')
             self.assertEqual(archive['status'], 'finished', archive['problems'])

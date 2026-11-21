@@ -36,10 +36,15 @@ def _copy(source: Path, dest: Path) -> Path | None:
         dest.mkdir(parents=True, exist_ok=True)
         target = dest / source.name
         try:
-            with open(target, 'xb') as copy:
-                shutil.copyfileobj(stream, copy)
+            copy = open(target, 'xb')
         except FileExistsError:
             return None
+        try:
+            with copy:
+                shutil.copyfileobj(stream, copy)
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
     return target
 
 
@@ -62,7 +67,7 @@ def _sub_agents(session: Path) -> list[str]:
     return found
 
 
-def collect_sessions(home: Path, thread_id: str, dest: Path) -> list[str]:
+def collect_sessions(home: Path, thread_id: str, dest: Path, *, problems: list[str] | None = None) -> list[str]:
     """Copy the lead thread's session file and those of its sub-agents (and theirs, at any depth) into dest.
 
     Returns the sub-agent thread ids, in the order they were found. dest is created only when something is copied.
@@ -72,9 +77,16 @@ def collect_sessions(home: Path, thread_id: str, dest: Path) -> list[str]:
     seen, queue, children = {thread_id}, [thread_id], []
     while queue:
         current = queue.pop(0)
-        for source in _session_files(Path(home), current):
+        sources = _session_files(Path(home), current)
+        if not sources and problems is not None:
+            problems.append(f'Missing session archive for thread {current}')
+        for source in sources:
             copy = _copy(source, Path(dest))
-            for child in _sub_agents(copy) if copy is not None else []:
+            if copy is None:
+                if problems is not None:
+                    problems.append(f'Could not copy the session record {source.name}')
+                continue
+            for child in _sub_agents(copy):
                 if child not in seen:
                     seen.add(child)
                     children.append(child)

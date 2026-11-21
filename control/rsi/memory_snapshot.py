@@ -8,10 +8,11 @@ from pathlib import Path
 from rsi import memory_store
 from rsi.memory_receipts import original_problem
 from rsi.paths import Layout
+from rsi.tasks import same_task_directory
 
 SNAPSHOT_BYTES = 16 * 1024 * 1024
 STATUS_RESERVE = 1024
-PROJECTION_VERSION = 3
+PROJECTION_VERSION = 4
 
 
 def _encode(value: dict) -> bytes:
@@ -148,16 +149,22 @@ def _annotate_freshness(rows, owner_events, unavailable, check_original, revisio
 
 
 def _project(state, condition: str, task: str | None, budget: int, *, unavailable=None, check_original=None,
-             projection_version=PROJECTION_VERSION):
+             projection_version=PROJECTION_VERSION, case_distinct_tasks=()):
     """Derive each index, origin and capacity choice from this run's visible revisions and deliveries."""
     task_filter = task if condition == 'trial' else None
+
+    def same_task(name):
+        if task_filter is None or projection_version < 4:
+            return task_filter is not None and name == task_filter
+        return name.casefold() == task_filter.casefold() and name not in case_distinct_tasks
+
     excluded = Counter()
     omitted = Counter()
     included = Counter()
     by_revision = defaultdict(list)
     if condition != 'none':
         for delivery in state.deliveries:
-            if task_filter is not None and delivery['task'] == task_filter:
+            if same_task(delivery['task']):
                 excluded['deliveries'] += 1
             else:
                 by_revision[delivery['id'], delivery['revision']].append(delivery)
@@ -183,8 +190,7 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
         deliveries = by_revision.get(key, [])
         authored = obj['kind'] != 'evidence'
         required = _dependencies(obj, rows) if authored else ()
-        if not deliveries or required is None or (authored and task_filter is not None
-                                                  and obj['origin']['task'] == task_filter):
+        if not deliveries or required is None or (authored and same_task(obj['origin']['task'])):
             excluded[obj['content']['type']] += 1
             if deliveries:
                 excluded['deliveries'] += len(deliveries)
@@ -230,14 +236,31 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
 
 
 def place_snapshot(layout: Layout, staged_work: Path, condition: str = 'live', task: str | None = None,
-                   *, max_bytes: int = SNAPSHOT_BYTES) -> dict:
+                   *, max_bytes: int = SNAPSHOT_BYTES, manual_problems: list[str] | None = None) -> dict:
     """Return the memory field for the run; only call on a private checkout before moving it into place."""
     if condition not in {'live', 'trial', 'none'} or max_bytes < STATUS_RESERVE:
         raise ValueError('Invalid memory snapshot condition or capacity')
-    state = memory_store.load(layout)
+    # A case-sensitive installation may have separate tasks whose names differ only by case.
+    # Save that distinction in the owner record so historical replay never consults today's folders.
+    distinct = []
+    if condition == 'trial' and task and (layout.tasks / task).is_dir():
+        distinct = sorted(p.name for p in layout.tasks.iterdir()
+                          if p.name != task and p.name.casefold() == task.casefold() and p.is_dir()
+                          and not same_task_directory(p, layout.tasks / task))
     unavailable = set()
-    status, rows = _project(state, condition, task, max_bytes - STATUS_RESERVE,
-                            unavailable=unavailable, check_original=lambda sha: original_problem(layout, sha))
+    try:
+        state = memory_store.State() if condition == 'none' else memory_store.load(layout)
+        status, rows = _project(state, condition, task, max_bytes - STATUS_RESERVE,
+                                unavailable=unavailable, check_original=lambda sha: original_problem(layout, sha),
+                                case_distinct_tasks=distinct)
+    except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, RecursionError) as error:
+        if manual_problems is None or condition != 'live':
+            raise ValueError(f'Cannot prepare the memory snapshot: {error}') from error
+        manual_problems.append(f'Scientific Memory is unavailable in work/: {error}')
+        unavailable.clear()
+        status = {'condition': 'unavailable', 'version': None, 'task_filter': None, 'counts': {}, 'omitted': {},
+                  'excluded': {}, 'problem': 'The memory ledger could not be read or verified.'}
+        rows = []
     header = _encode(status)
     if len(header) > STATUS_RESERVE:
         raise ValueError('Memory snapshot status exceeds its limit')
@@ -255,4 +278,4 @@ def place_snapshot(layout: Layout, staged_work: Path, condition: str = 'live', t
                 digest.update(data)
     # The owner replays the original observation even if a file disappears or is restored later.
     return {**status, 'fingerprint': digest.hexdigest(), 'projection_version': PROJECTION_VERSION, 'max_bytes': max_bytes,
-            'unavailable_sources': sorted(unavailable)}
+            'unavailable_sources': sorted(unavailable), **({'case_distinct_tasks': distinct} if distinct else {})}

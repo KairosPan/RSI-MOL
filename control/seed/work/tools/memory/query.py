@@ -6,9 +6,12 @@ from collections import defaultdict
 
 NOTICE = ('Historical text returned by the literature server. The original file hash was checked. '
           'This passage has not been independently checked against the original.')
-DEFAULT_BYTES = 64 * 1024
-MAX_RESULT_BYTES = 16 * 1024 * 1024
+DEFAULT_BYTES = 24 * 1024
+# Native Codex sessions have truncated MCP results around 50 KB. Size the escaped
+# MCP envelope with headroom, including when a caller supplies an older, larger budget.
+NATIVE_RECEIPT_BYTES = 32 * 1024
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
+RECENT_DELIVERIES = 3
 ID_FIELDS = ('paper_id', 'doi', 'pmid', 'pmcid')
 
 
@@ -18,37 +21,91 @@ def encode(value):
 
 def normalized(value):
     key = str(value or '').strip().casefold()
+    # These provider-relative IDs have unambiguous namespaces, even before a paper is indexed.
+    if re.fullmatch(r'(?:med|pmc|ppr|agr|pat|cba):[a-z0-9._-]+', key):
+        return 'europe_pmc:' + key
+    openalex = re.fullmatch(r'(?:https?://openalex\.org/)?(w\d+)', key)
+    if openalex:
+        return 'openalex:' + openalex[1]
+    if re.fullmatch(r'[0-9a-f]{40}', key):
+        return 'semantic_scholar:' + key
     if key.startswith('pmcid:'):
         identifier = key[6:].strip()
         return 'pmc' + identifier if identifier.isdigit() else identifier
-    for prefix in ('https://doi.org/', 'http://doi.org/', 'https://dx.doi.org/', 'http://dx.doi.org/', 'doi:', 'pmid:'):
+    for prefix in ('https://doi.org/', 'http://doi.org/', 'https://dx.doi.org/', 'http://dx.doi.org/',
+                   'doi:', 'pmid:', 'pubmed:'):
         if key.startswith(prefix):
             return key[len(prefix):].strip()
     return key
+
+
+def source_identifier(query):
+    key = normalized(query)
+    return bool(re.fullmatch(r'[a-z][\w.-]*:\S+|10\.\d+/\S+|doc_[\w-]+|pmc\d+|\d{1,12}', key)
+                or query.strip().casefold().startswith(('doi:', 'pmid:', 'pmcid:', 'pubmed:')))
 
 
 def doc_key(doc):
     return tuple(doc.get(k) for k in ('document_id', 'document_version', 'source_sha256'))
 
 
+def result_views(item):
+    """Expand interpretations when there is room. Their own exact revision carries all outbound pins."""
+    yield item
+    if 'related_objects' not in item:
+        return
+    details = ('related_objects', 'questions', 'evidence', 'counterevidence')
+    summary = {k: v for k, v in item.items() if k not in details}
+    counts = {k: len(item[k]) for k in details if item.get(k)}
+    if not counts:
+        return
+    summary['omitted_details'] = counts
+    challengers = item.get('counterevidence', ())
+    if challengers:
+        summary['counterevidence'] = [{k: v for k, v in row.items() if k != 'content'} for row in challengers]
+    yield summary
+    # Incoming challenges are unbounded. If even their addresses do not all fit,
+    # keep the highest-ranked ones and disclose exactly how many addresses are absent.
+    while len(summary.get('counterevidence', ())) > 0:
+        keep = len(summary['counterevidence']) // 2
+        summary = {**summary, 'counterevidence': summary['counterevidence'][:keep],
+                   'omitted_details': {**counts, 'counterevidence_addresses': len(challengers) - keep}}
+        yield summary
+
+
 def bounded(items, limit):
-    """Preserve whole records, count every omitted item and bound the UTF-8 tool result including its envelope."""
-    size = len(encode({'results': [], 'omitted': 0}))
+    """Keep complete rows within both the requested JSON budget and the escaped MCP receipt budget."""
+    empty = encode({'results': [], 'omitted': 0})
+    size = len(empty)
+    wire = len(encode({'content': [{'type': 'text', 'text': empty.decode()}], 'isError': False}))
     result, sizes = [], []
     omitted = 0
     for item in items:
-        extra = len(encode(item)) + int(bool(result))
-        if size + extra <= limit:
-            result.append(item)
-            sizes.append(extra)
-            size += extra
+        for view in result_views(item):
+            raw = encode(view)
+            extra = len(raw) + int(bool(result))
+            # The item is already JSON. Quotes and backslashes are escaped again
+            # when it becomes the text of an MCP content block.
+            escaped = extra + raw.count(b'"') + raw.count(b'\\')
+            if size + extra <= limit and wire + escaped <= NATIVE_RECEIPT_BYTES:
+                result.append(view)
+                sizes.append((extra, escaped))
+                size += extra
+                wire += escaped
+                break
         else:
             omitted += 1
-    while result and size + len(str(omitted)) - 1 > limit:
+    while result and len(str(omitted)) - 1 > min(limit - size, NATIVE_RECEIPT_BYTES - wire):
         result.pop()
-        size -= sizes.pop()
+        extra, escaped = sizes.pop()
+        size -= extra
+        wire -= escaped
         omitted += 1
     return {'results': result, 'omitted': omitted}
+
+
+def recent_deliveries(deliveries):
+    return {'deliveries': list(reversed(deliveries[-RECENT_DELIVERIES:])), 'delivery_count': len(deliveries)}
 
 
 class Snapshot:
@@ -65,8 +122,11 @@ class Snapshot:
         self.by_doc = defaultdict(list)
         self.by_hash = defaultdict(list)
         self.by_identifier = defaultdict(list)
+        self.paper_refs = {}
+        self.paper_records = {}
         self.delivery_identifiers = set()
         self.challengers = defaultdict(list)
+        paper_history = defaultdict(list)
         if self.status['condition'] != 'none':
             with (folder / 'evidence.jsonl').open('rb') as stream:
                 data = stream.read(MAX_SNAPSHOT_BYTES + 1)
@@ -76,6 +136,8 @@ class Snapshot:
                 row = json.loads(line)
                 obj = row['object']
                 self.versions[obj['id'], obj['revision']] = row
+                if obj['content']['type'] == 'paper':
+                    paper_history[obj['id']].append(row)
                 # A late backfill can give older paper metadata a larger revision number.
                 if obj['content']['type'] == 'paper' and 'newer_visible_revision' in row.get('freshness_reasons', ()):
                     continue
@@ -91,8 +153,7 @@ class Snapshot:
             for target in challenged:
                 self.challengers[target].append(row)
             if kind == 'paper':
-                for key in {normalized(content.get(k)) for k in ID_FIELDS} - {''}:
-                    self.by_identifier[key].append(row)
+                self.index_paper(row, paper_history[obj['id']])
             elif kind == 'acquisition':
                 self.acquisitions.append(row)
                 if all(doc_key(content)):
@@ -102,6 +163,36 @@ class Snapshot:
                 self.passages.append(row)
                 self.delivery_identifiers.update(value for d in row['deliveries']
                                                  for value in (normalized(d.get('document_id')), self.request(d)) if value)
+
+    def index_paper(self, head, history):
+        """Fill unreported identifiers using compatible observations from this snapshot."""
+        def order(row):
+            d = row['deliveries'][-1]
+            return int(d['run'][1:]), d['at'], d['seq']
+
+        ident = head['object']['id']
+        head_order = order(head)
+        known = {}
+        records = []
+        for row in sorted(history, key=order, reverse=True):
+            if order(row) > head_order or (row is not head and 'withdrawn' in row.get('freshness_reasons', ())):
+                continue
+            obj = row['object']
+            reported = {k: normalized(obj['content'][k]) for k in ID_FIELDS if obj['content'].get(k)}
+            if any(known[k] != reported[k] for k in known.keys() & reported.keys()):
+                # A correction is a boundary; do not revive a superseded identifier.
+                break
+            if row is head or reported.keys() - known.keys():
+                records.append(dict(id=ident, revision=obj['revision'],
+                                    **{k: obj['content'].get(k) for k in ID_FIELDS}))
+                known.update(reported)
+            if len(known) == len(ID_FIELDS):
+                break
+        refs = set(known.values())
+        self.paper_refs[ident] = refs
+        self.paper_records[ident] = records
+        for key in refs:
+            self.by_identifier[key].append(head)
 
     @staticmethod
     def request(content):
@@ -114,7 +205,8 @@ class Snapshot:
     def dois_for(self, row):
         content = row['object']['content']
         requested = normalized(content.get('paper_ref'))
-        dois = {normalized(p['object']['content'].get('doi')) for p in self.papers_for(row)}
+        dois = {normalized(s['doi']) for p in self.papers_for(row)
+                for s in self.paper_records[p['object']['id']] if s.get('doi')}
         if requested.startswith('10.') and '/' in requested:
             dois.add(requested)
         return dois - {''}
@@ -135,9 +227,7 @@ class Snapshot:
                 'source_id': content.get('source_id'), 'provider': content.get('provider'),
                 'identifiers_reported_verified': content.get('verified_paper_identifiers') or [],
                 'verification': 'reported' if content.get('verified_paper_identifiers') else 'unverified',
-                'source_records': [dict(id=p['object']['id'], revision=p['object']['revision'],
-                                        **{k: p['object']['content'].get(k) for k in ID_FIELDS})
-                                   for p in self.papers_for(row)],
+                'source_records': [s for p in self.papers_for(row) for s in self.paper_records[p['object']['id']]],
                 'conflicting_requests_sharing_file': conflicts, **self.freshness(row)}
 
     def acquisitions_for(self, delivery, content):
@@ -157,10 +247,10 @@ class Snapshot:
     def candidates(self, query, *, allow_title=True):
         key = normalized(query)
         papers = list(self.by_identifier.get(key, []))
-        if allow_title and not papers and key:
+        if allow_title and not papers and key and not source_identifier(query):
             papers = [row for row in self.latest.values() if row['object']['content']['type'] == 'paper'
                       and key in normalized(row['object']['content'].get('title'))]
-        refs = {normalized(p['object']['content'].get(field)) for p in papers for field in ID_FIELDS} - {''}
+        refs = {ref for p in papers for ref in self.paper_refs[p['object']['id']]}
         if key:
             refs.add(key)
         acquisitions = {}
@@ -193,7 +283,7 @@ class Snapshot:
         content = obj['content']
         # Filtered requests can expose a narrower set of deliveries than the stored object view.
         return {'id': obj['id'], 'revision': obj['revision'], 'content': content,
-                'deliveries': list(reversed(deliveries)), 'sources': [self.attribution(r) for r in sources.values()],
+                **recent_deliveries(deliveries), 'sources': [self.attribution(r) for r in sources.values()],
                 'passage_verification': 'not_independently_checked', 'notice': NOTICE,
                 **self.delivery_freshness(row, deliveries)}
 
@@ -223,7 +313,7 @@ class Snapshot:
         row = self.latest.get(evidence_id) if revision is None else self.versions.get((evidence_id, revision))
         if row is None:
             return []
-        item = dict(row)
+        item = {**row, **recent_deliveries(row['deliveries'])}
         kind = row['object']['content']['type']
         if kind == 'passage':
             payload = self.passage(row, *self.selected_deliveries(row))
@@ -279,9 +369,13 @@ class Snapshot:
     def lookup(self, query):
         papers, refs, acquisitions = self.candidates(query)
         for paper in papers:
-            yield dict(type='paper', **paper)
+            result = {'type': 'paper', **paper, **recent_deliveries(paper['deliveries'])}
+            records = self.paper_records[paper['object']['id']]
+            if len(records) > 1:
+                result['identifier_records'] = records
+            yield result
         for acq in acquisitions.values():
-            yield dict(type='acquisition', **acq, attribution=self.attribution(acq))
+            yield {'type': 'acquisition', **acq, **recent_deliveries(acq['deliveries']), 'attribution': self.attribution(acq)}
         for row in self.passages:
             obj = row['object']
             kept, _ = self.selected_deliveries(row, filters=[(refs, acquisitions)])
@@ -289,16 +383,15 @@ class Snapshot:
                 yield {'type': 'passage', 'id': obj['id'], 'revision': obj['revision'],
                        'locator': obj['content']['locator'], 'source_sha256': obj['content']['source_sha256'],
                        'deliveries': [{k: d[k] for k in ('run', 'task', 'document_id', 'document_version')}
-                                      for d in reversed(kept)],
+                                      for d in reversed(kept[-RECENT_DELIVERIES:])], 'delivery_count': len(kept),
                        'passage_verification': 'not_independently_checked', **self.delivery_freshness(row, kept)}
 
     def recall(self, query, paper, source_sha256, task):
         key = normalized(query)
-        words = set(re.findall(r'\w+', query.casefold()))
+        words = set(re.findall(r'[^\W_]+', query.casefold()))
         papers, refs, acquisitions = self.candidates(query, allow_title=False)
-        source_query = bool(papers or acquisitions or key in self.delivery_identifiers or
-                            re.fullmatch(r'10\.\d+/\S+|doc_[\w-]+|pmc\d+', key) or
-                            query.strip().casefold().startswith(('pmid:', 'pmcid:')))
+        source_query = bool(papers or acquisitions or key in self.delivery_identifiers or source_identifier(query))
+        passage_address = re.fullmatch(r'(?:passage_)?[0-9a-f]{64}', key)
         filters = [(refs, acquisitions)] if source_query else []
         if paper:
             _, paper_refs, paper_acquisitions = self.candidates(paper)
@@ -313,8 +406,10 @@ class Snapshot:
             if not kept:
                 continue
             exact = source_query or key in (normalized(obj['id']), normalized(content['source_sha256']))
-            text = (str(content.get('section') or '') + ' ' + content['text']).casefold()
-            lexical = sum(word in text for word in words)
+            if passage_address and not exact:
+                continue
+            text = ' '.join([*content.get('section_path', ()), content['text']]).casefold()
+            lexical = len(words.intersection(re.findall(r'[^\W_]+', text)))
             if lexical or exact:
                 rank = (exact, lexical, len({d['task'] for d in kept}), kept[-1]['at'], kept[-1]['seq'], obj['id'])
                 matches.append((rank, row, kept, sources))

@@ -9,14 +9,16 @@ import sys
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from query import DEFAULT_BYTES, MAX_RESULT_BYTES, Snapshot, bounded, encode
+from query import DEFAULT_BYTES, NATIVE_RECEIPT_BYTES, Snapshot, bounded, encode
 
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 MAX_REQUEST = 64 * 1024
 MAX_PROPOSALS = 64
 TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 4096}
-BYTES = {'type': 'integer', 'minimum': 64, 'maximum': MAX_RESULT_BYTES,
-         'description': 'Maximum UTF-8 bytes in the result JSON. Whole items that do not fit count as omitted.'}
+# Older callers request up to 16 MiB; accept those requests and apply the receipt cap.
+BYTES = {'type': 'integer', 'minimum': 64, 'maximum': 16 << 20,
+         'description': 'Maximum UTF-8 result bytes. The escaped MCP receipt is also capped at 32 KiB. '
+                        'Whole items that do not fit count as omitted.'}
 CITATION_FIELDS = {key: TEXT for key in ('document_id', 'document_version', 'source_sha256', 'locator', 'quote')}
 CITATION_FIELDS['relation'] = {'type': 'string', 'enum': ['supports', 'challenges', 'background', 'derived_from']}
 HISTORICAL_FIELDS = dict(CITATION_FIELDS, evidence_id=TEXT, revision={'type': 'integer', 'minimum': 1}, source_run=TEXT)
@@ -184,6 +186,8 @@ class Server:
             self.snapshot = Snapshot(self.folder)
         if name == 'memory_status':
             return self.snapshot.status
+        if self.snapshot.status['condition'] == 'unavailable':
+            raise ValueError(self.snapshot.status['problem'])
         if name == 'propose_memory':
             if not self.proposals_enabled():
                 raise ValueError('Memory proposals require a managed task with live memory')
@@ -198,8 +202,8 @@ class Server:
             items = self.snapshot.recall_objects(args['query'], args.get('kind'))
         else:
             items = self.snapshot.get_evidence(args['id'], args.get('revision'))
-        limit = MAX_RESULT_BYTES if name == 'get_evidence' else DEFAULT_BYTES
-        return bounded(items, args.get('max_bytes', limit))
+        default = NATIVE_RECEIPT_BYTES if name == 'get_evidence' else DEFAULT_BYTES
+        return bounded(items, args.get('max_bytes', default))
 
     def handle(self, message):
         if not isinstance(message, dict) or message.get('jsonrpc') != '2.0' or not isinstance(message.get('method'), str):

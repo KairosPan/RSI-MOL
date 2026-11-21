@@ -844,7 +844,8 @@ def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo)
         return state.run(trigger, instructions)
 
 
-def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrinfo) -> str:
+def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrinfo,
+             notices: list[str] | None = None) -> str:
     """A new version on main with the content of an earlier version, by `who` (the author, e.g. owner); work/ then
     holds it, and records/releases/<new version>.json says kind rollback. What sits in work/ is versioned first (as
     before a task run). ValueError for a bad version name or author, a version the store lacks, or one whose content
@@ -887,4 +888,6 @@ def rollback(layout: Layout, version: str, who: str, *, resolve=socket.getaddrin
             'kind': 'rollback', 'version': new, 'parent': parent, 'target': version, 'round': None, 'who': who,
             'author': who, 'time': now(), 'tree': tree, 'diff': diff, 'diff_sha256': digest,
             'decision': None, 'evidence': [], 'trials': [], 'benefit': BENEFIT, 'problems': problems}, problems)
+    if notices is not None:
+        notices.extend(problems)
     return new

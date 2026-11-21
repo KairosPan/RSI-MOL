@@ -9,6 +9,7 @@ from rsi.memory_history import (ADDRESS, attachment, passage_index, require, ret
                                 returned_objects, timeline, trusted_rows)
 from rsi.memory_receipts import CALLS_LIMIT, INVOCATION, deadline_check
 from rsi.records import CALL_ID
+from rsi.tasks import same_task_directory
 
 PROPOSAL_FILE = re.compile(r'proposals/([0-9a-f]{32})\.json')
 CONTENT_FIELDS = {'question': ('text',), 'judgment': ('statement', 'scope'), 'decision': ('decision', 'scope'),
@@ -194,7 +195,21 @@ def _object(ident, kind, prior, origin, content, *, sources=(), parents=(), ques
     return {**obj, 'record_sha256': ledger.digest(obj)}
 
 
-def _question_parent(reg, requested, parents, origin):
+def _task_contract(reg):
+    task = reg.call['task']
+    authors = {task}
+    # Legacy calls could record another spelling on a case-insensitive volume. Do not
+    # authorize a similarly named task that has a separate directory or is now absent.
+    names = {obj['origin']['task'] for obj in reg.latest.values() if obj['kind'] != 'evidence'}
+    authors.update(name for name in names if name != task and name.casefold() == task.casefold()
+                   and same_task_directory(reg.layout.tasks / task, reg.layout.tasks / name))
+    canonical = 'question_' + ledger.digest(task)
+    roots = [obj['id'] for obj in reg.latest.values() if obj.get('authority') == 'task_contract'
+             and obj['origin']['task'] in authors]
+    return authors, roots, canonical if canonical in roots or not roots else roots[0]
+
+
+def _question_parent(reg, requested, parents, origin, question_id):
     """An explicit subquestion pin distinguishes it from a task that happens to have the same name."""
     require(_text(requested), 'missing task or subquestion ID')
     pins = {r['revision'] for r in parents if r['id'] == requested}
@@ -204,7 +219,6 @@ def _question_parent(reg, requested, parents, origin):
         return requested, []
     require(requested == reg.call['task'], 'subquestion requires an exact object reference read in this run')
     require(_text(reg.call.get('task_goal'), 65536), 'missing task question')
-    question_id = 'question_' + ledger.digest(requested)
     question = reg.latest.get(question_id)
     created = []
     if question is None or question['content']['text'] != reg.call['task_goal']:
@@ -216,7 +230,7 @@ def _question_parent(reg, requested, parents, origin):
     return question_id, created
 
 
-def _objects(reg, args, reads, write, history_error):
+def _objects(reg, args, reads, write, history_error, contract):
     require(isinstance(args, dict) and isinstance(args.get('kind'), str) and args['kind'] in CONTENT_FIELDS,
             'invalid proposal kind')
     kind = args['kind']
@@ -232,9 +246,10 @@ def _objects(reg, args, reads, write, history_error):
     if kind == 'method_experience':
         require(content['outcome'] in OUTCOMES, 'unknown method experience outcome')
     prior = reg.latest.get(ident)
+    authors, roots, default_root = contract
     require((prior['revision'] if prior else 0) == expected, f'expected {kind} revision differs from the ledger')
     require(not prior or (prior['kind'] == kind and prior.get('authority') == 'model_interpretation' and
-                          prior['origin']['task'] == reg.call['task']), f'{kind} belongs to a different task or authority')
+                          prior['origin']['task'] in authors), f'{kind} belongs to a different task or authority')
     source_refs, object_refs = args.get('source_refs', []), args.get('object_refs', [])
     require(all(isinstance(refs, list) and len(refs) <= 16 for refs in (source_refs, object_refs)),
             'expected at most sixteen references per reference list')
@@ -242,7 +257,10 @@ def _objects(reg, args, reads, write, history_error):
     refs = [_reference(ref, reads, write, history_error) for ref in source_refs]
     parents = [_object_reference(ref, ident, reads, write, history_error) for ref in object_refs]
     origin = {'run': reg.call['id'], 'task': reg.call['task'], 'version': reg.call.get('version_before')}
-    question_id, objects = _question_parent(reg, args['question_id'], parents, origin)
+    # If different spellings had already produced two roots, preserve a revised object's
+    # own contract lineage. Explicit subquestion pins still take precedence.
+    root = next((key for key in prior['question_ids'] if key in roots), default_root) if prior else default_root
+    question_id, objects = _question_parent(reg, args['question_id'], parents, origin, root)
     content['support_status'] = 'pending_review'
     objects.append(_object(ident, kind, prior, origin, content, sources=refs, parents=parents, questions=[question_id]))
     return objects
@@ -298,6 +316,7 @@ def register(reg, pending, current, max_bytes, max_items):
     for pid in sorted(files.keys() - writes.keys()):
         reg.reject('no completed native submission for the sealed proposal', proposal_id=pid)
     # Process concurrent submissions deterministically; competing writes to the same revision admit one.
+    contract = _task_contract(reg)
     for pid in sorted(writes, key=lambda key: (writes[key][0]['at'], writes[key][0]['position'], key)):
         deadline_check(reg.deadline)
         try:
@@ -307,6 +326,6 @@ def register(reg, pending, current, max_bytes, max_items):
             raw = attachment(reg.layout, reg.call, files[pid], MAX_FILE_BYTES)
             args = json.loads(raw)
             require(ledger.encode(args) == ledger.encode(write['args']), 'sealed proposal differs from native arguments')
-            _append(reg, pid, write, _objects(reg, args, reads, write, history_error), max_bytes, max_items)
+            _append(reg, pid, write, _objects(reg, args, reads, write, history_error, contract), max_bytes, max_items)
         except (OSError, ValueError, TypeError, RecursionError) as exc:
             reg.reject(str(exc)[:160], proposal_id=pid)

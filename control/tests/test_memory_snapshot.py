@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rsi.memory_history import trusted_passages
+from rsi.memory_history import trusted_passages, trusted_rows
 from rsi.memory_snapshot import _encode, _project, place_snapshot
 from rsi.memory_store import State
 from rsi.paths import Layout
@@ -88,6 +88,19 @@ class MemorySnapshot(unittest.TestCase):
         self.assertFalse(any(r['isError'] for r in replies), replies)
         return [json.loads(r['content'][0]['text']) for r in replies]
 
+    def test_unavailable_manual_snapshot_reports_the_problem_to_readers(self):
+        work = self.parent / 'manual'
+        shutil.copytree(SEED / 'tools' / 'memory', work / 'tools' / 'memory')
+        notices = []
+        with patch('rsi.memory_snapshot.memory_store.load', side_effect=KeyError('missing ledger field')):
+            place_snapshot(self.layout, work, manual_problems=notices)
+        self.assertIn('missing ledger field', notices[0])
+        status, lookup = self.mcp(work, [('memory_status', {}), ('lookup_sources', {'query': 'paper'})])
+        self.assertFalse(status['isError'])
+        self.assertEqual(json.loads(status['content'][0]['text'])['condition'], 'unavailable')
+        self.assertTrue(lookup['isError'])
+        self.assertIn('could not be read or verified', lookup['content'][0]['text'])
+
     def test_trial_projects_every_field_and_hashes_what_it_wrote(self):
         work, meta = self.place()
         folder = work / 'memory'
@@ -164,6 +177,59 @@ class MemorySnapshot(unittest.TestCase):
             self.assertEqual(sources[0]['conflicting_requests_sharing_file'][0]['dois'], ['10.1/alpha'])
         self.assertEqual({s['acquisition_id'] for s in whole['results'][0]['sources']}, {'get_a', 'get_b'})
 
+    def test_sparse_paper_uses_visible_identifier_observations_without_changing_pins(self):
+        # The latest citation list only reports the provider ID and PMID. A prior run
+        # corrected the DOI; a trial excluding that run must use its own visible history.
+        paper = self.state.objects[1]
+        sparse = dict(paper, revision=3, content=dict(paper['content'], doi=None, pmcid=None))
+        self.state.objects.append(sparse)
+        self.state.deliveries.append(receipt('paper', 3, 8, 'B', 'R4'))
+        self.state.objects[2]['content']['paper_ref'] = 'PMC123'
+        for condition, available, absent in (
+                ('live', '10.1/secret', '10.1/alpha'), ('trial', '10.1/alpha', '10.1/secret')):
+            work, _ = self.place(condition, 'T', name=condition)
+            found, other, pinned = self.values(work, [
+                ('lookup_sources', {'query': available}), ('lookup_sources', {'query': absent}),
+                ('get_evidence', {'id': 'paper', 'revision': 3})])
+            self.assertEqual([r['type'] for r in found['results']], ['paper', 'acquisition', 'passage'])
+            self.assertEqual(other['results'], [])
+            self.assertIsNone(pinned['results'][0]['object']['content']['doi'])
+            self.assertEqual(found['results'][0]['object'], pinned['results'][0]['object'])
+            sources = found['results'][1]['attribution']['source_records']
+            reported = [(s['revision'], s['doi']) for s in sources if s.get('doi')]
+            self.assertEqual(reported, [(2 if condition == 'live' else 1, available)])
+
+    def test_partial_identifier_correction_stops_fallback_to_superseded_record(self):
+        self.state.objects[1]['content'].update(doi=None, pmcid='PMC999')
+        work, _ = self.place('live')
+        old_doi, old_pmcid, new_pmcid = self.values(work, [
+            ('lookup_sources', {'query': q}) for q in ('10.1/alpha', 'PMC123', 'PMC999')])
+        self.assertEqual(old_doi['results'], [])
+        self.assertEqual(old_pmcid['results'], [])
+        self.assertEqual(new_pmcid['results'][0]['object']['revision'], 2)
+
+    def test_provider_references_scope_recall_and_passage_search_uses_heading_words(self):
+        paper = self.state.objects[0]['content']
+        paper.update(paper_id='europe_pmc:MED:123', provider='europe_pmc')
+        self.state.objects[2]['content'].update(provider='europe_pmc', paper_ref='MED:123')
+        self.state.objects[-1]['content'].update(section='section:000007', section_path=['Methods'],
+                                                  text='Remediation with medication for pubmed W999. A passage.')
+        oa = object_row('oa', 1, 'R4', 'B', 'paper', provider='openalex', paper_id='openalex:W456',
+                        doi='10.1/oa', title='OpenAlex record')
+        self.state.objects.append(oa)
+        self.state.deliveries.append(receipt('oa', 1, 8, 'B', 'R4'))
+        self.state.objects[3]['content'].update(provider='openalex', paper_ref='W456')
+        work, _ = self.place()
+        queries = ['MED:123', 'europe_pmc:MED:123', 'pubmed:123', 'W456', 'https://openalex.org/W456',
+                   '10.1/oa', 'methods section', 'MED:999', 'pubmed:999', 'W999', 'section', '000007', 'med',
+                   'passage_' + 'f' * 64]
+        results = self.values(work, [('recall_passages', {'query': query}) for query in queries])
+        for result, expected in zip(results[:7], [['doc_a']] * 3 + [['doc_b']] * 3 + [['doc_b', 'doc_a']]):
+            self.assertEqual([d['document_id'] for d in result['results'][0]['deliveries']], expected)
+        self.assertTrue(all(r['results'] == [] for r in results[7:]))
+        for result in self.values(work, [('lookup_sources', {'query': key}) for key in ('MED:123', 'W456')]):
+            self.assertEqual([r['type'] for r in result['results']], ['paper', 'acquisition', 'passage'])
+
     def test_none_has_only_status_and_caps_apply_to_whole_projected_revisions(self):
         work, meta = self.place('none')
         self.assertEqual([p.name for p in (work / 'memory').iterdir()], ['status.json'])
@@ -172,6 +238,27 @@ class MemorySnapshot(unittest.TestCase):
         limited, info = self.place('live', max_bytes=1024, name='capped')
         self.assertEqual(info['omitted']['deliveries'], len(self.state.deliveries))
         self.assertEqual((limited / 'memory' / 'evidence.jsonl').read_bytes(), b'')
+
+    def test_native_budget_counts_escaping_and_caps_repeated_deliveries(self):
+        from seed.work.tools.memory.query import NATIVE_RECEIPT_BYTES, bounded, encode
+        # A single large row and a dense mix of quotes, escapes and UTF-8 text.
+        rows = [{'text': '中' * 20000}] + [{'text': '"\\中\n' * 50, 'i': i} for i in range(150)]
+        page = bounded(rows, 16 << 20)
+        self.assertLessEqual(len(encode({'content': [{'type': 'text', 'text': encode(page).decode()}],
+                                         'isError': False})), NATIVE_RECEIPT_BYTES)
+        self.assertGreater(page['omitted'], 1)
+        self.assertEqual(page['results'], rows[1:1 + len(page['results'])])
+        self.assertEqual(len(page['results']) + page['omitted'], len(rows))
+
+        original = self.state.deliveries[-1]
+        for seq in range(10, 22):
+            self.state.deliveries.append(dict(original, seq=seq, at=f'{seq:04}', invocation_id=str(seq)))
+        work, _ = self.place()
+        for page in self.values(work, [('get_evidence', {'id': 'paragraph', 'max_bytes': 16 << 20}),
+                                       ('recall_passages', {'query': 'quoted'})]):
+            row, = page['results']
+            self.assertEqual(row['delivery_count'], 14)
+            self.assertEqual([d['invocation_id'] for d in row['deliveries']], ['21', '20', '19'])
 
     def test_latest_visible_revision_can_have_a_hidden_predecessor(self):
         work, _ = self.place('trial', 'A')
@@ -262,6 +349,29 @@ class MemorySnapshot(unittest.TestCase):
         for response in self.values(work, calls):
             self.assertEqual([r['object']['id'] for r in response['results']], [identity])
 
+    def test_expanded_evidence_can_be_omitted_without_losing_the_exact_judgment(self):
+        from rsi.memory_history import returned_objects
+        from rsi.memory_store import encode
+
+        self.add_judgments()
+        passage = next(o for o in self.state.objects if o['id'] == 'paragraph')
+        passage['content']['text'] += ' Large supporting passage.' * 2500
+        challenger = next(o for o in self.state.objects if o['id'] == 'derived')
+        challenger['object_refs'].append({'id': 'J', 'revision': 1, 'relation': 'challenges'})
+        work, _ = self.place('live')
+        obj = next(row['object'] for row in map(json.loads, (work / 'memory/evidence.jsonl').read_bytes().splitlines())
+                   if row['object']['id'] == 'J')
+        calls = [('get_evidence', {'id': 'J'}), ('recall_judgments', {'query': 'J', 'max_bytes': 16 << 20})]
+        for (name, _), reply in zip(calls, self.values(work, calls)):
+            row = next(r for r in reply['results'] if r['object']['id'] == 'J')
+            self.assertEqual(row['object'], obj)
+            self.assertEqual(row['omitted_details'], {'questions': 1, 'related_objects': 1, 'evidence': 1,
+                                                     'counterevidence': 1})
+            self.assertEqual([(r['id'], r['revision']) for r in row['counterevidence']], [('derived', 1)])
+            self.assertEqual(list(returned_objects(name, reply, {('J', 1): encode(obj)})), [('J', 1)])
+        tiny, = self.values(work, [('get_evidence', {'id': 'J', 'max_bytes': 64})])
+        self.assertEqual(tiny, {'results': [], 'omitted': 1})
+
     def test_trial_drops_authored_revisions_hidden_aliases_and_transitive_dependents(self):
         self.add_judgments()
         work, _ = self.place('trial', 'T')
@@ -272,6 +382,34 @@ class MemorySnapshot(unittest.TestCase):
         self.assertEqual([item['object']['id'] for item in found['results']], ['J'])
         other, _ = self.place('trial', 'B', name='trial-B')
         self.assertEqual(self.values(other, [('recall_judgments', {'query': 'paired'})])[0]['results'], [])
+
+    def test_trial_groups_historical_task_spellings_and_replays_prior_rules(self):
+        self.add_judgments()
+        self.state.reports['R3'] = {'version_after': self.state.version}
+        work, meta = self.place('trial', 't')
+        rows = [json.loads(line) for line in (work / 'memory/evidence.jsonl').read_bytes().splitlines()]
+        self.assertEqual(trusted_rows(self.state, meta), rows)
+        self.assertEqual({r['object']['id'] for r in rows}, {'paper', 'get_a', 'get_b', 'paragraph', 'Q', 'J'})
+        self.assertTrue(all(d['task'] != 'T' for row in rows for d in row['deliveries']))
+
+        # Version 3 used exact spelling. Its recorded fingerprint must still reproduce that view.
+        historical = {**meta, 'projection_version': 3,
+                      'fingerprint': 'c71be9c6c41206984536926dab7e443254a3589a64ac982b945ed30b635a4e07'}
+        self.assertIn('from-T', [r['object']['id'] for r in trusted_rows(self.state, historical)])
+
+    def test_case_distinct_task_directories_remain_independent_during_replay(self):
+        self.add_judgments()
+        self.state.reports['R3'] = {'version_after': self.state.version}
+        # Model directory listings from a case-sensitive volume, including on macOS CI.
+        first, other = self.parent / 't', self.parent / 'other' / 'T'
+        first.mkdir()
+        other.mkdir(parents=True)
+        self.layout.tasks.mkdir(parents=True)
+        (self.layout.tasks / 't').symlink_to(first, target_is_directory=True)
+        with patch.object(Path, 'iterdir', return_value=iter([first, other])):
+            _, meta = self.place('trial', 't')
+        self.assertEqual(meta['case_distinct_tasks'], ['T'])
+        self.assertIn('from-T', [r['object']['id'] for r in trusted_rows(self.state, meta)])
 
     def test_budget_includes_judgment_together_with_all_referenced_revisions(self):
         self.add_judgments()

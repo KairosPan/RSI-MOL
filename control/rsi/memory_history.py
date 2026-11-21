@@ -3,7 +3,7 @@ import hashlib
 import json
 
 from rsi.memory_receipts import open_evidence_file, session_lines, session_paths
-from rsi.memory_snapshot import SNAPSHOT_BYTES, STATUS_RESERVE, _encode, _project
+from rsi.memory_snapshot import PROJECTION_VERSION, SNAPSHOT_BYTES, STATUS_RESERVE, _encode, _project
 from rsi.memory_store import State, encode
 
 ADDRESS = ('document_id', 'document_version', 'source_sha256', 'locator')
@@ -39,8 +39,10 @@ def trusted_rows(state, memory):
     before = State(version=version, objects=objects, deliveries=deliveries,
                    owner_events=[e for e in state.owner_events if e['seq'] <= version])
     projection = memory.get('projection_version', 1)
-    require(type(projection) is int and projection in (1, 2, 3), 'Unknown starting snapshot projection')
+    require(type(projection) is int and 1 <= projection <= PROJECTION_VERSION, 'Unknown starting snapshot projection')
     options = {'unavailable': frozenset(memory['unavailable_sources'])} if projection >= 2 else {}
+    if projection >= 4:
+        options['case_distinct_tasks'] = memory.get('case_distinct_tasks', ())
     budget = memory.get('max_bytes', SNAPSHOT_BYTES) - STATUS_RESERVE
     status, rows = _project(before, condition, memory.get('task_filter'), budget, projection_version=projection, **options)
     digest = hashlib.sha256(b'status.json\0' + _encode(status))

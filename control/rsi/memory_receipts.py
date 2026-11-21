@@ -134,12 +134,16 @@ def service_source(layout, call):
 
 
 def session_paths(call):
-    threads = [call.get('thread_id'), *(call.get('subagent_threads') or [])]
+    children = call.get('subagent_threads') or []
+    files, links = call.get('files') or {}, call.get('links') or {}
+    if not isinstance(children, list) or not isinstance(files, dict) or not isinstance(links, dict):
+        raise ValueError('Invalid session manifest in call record')
+    threads = [call.get('thread_id'), *children]
     valid = {t for t in threads if isinstance(t, str) and SAFE_ID.fullmatch(t)}
     paths = []
-    for rel, checksum in (call.get('files') or {}).items():
+    for rel, checksum in files.items():
         pieces = rel.split('/')
-        if len(pieces) != 2 or pieces[0] != 'sessions' or not pieces[1].endswith('.jsonl') or rel in (call.get('links') or {}):
+        if len(pieces) != 2 or pieces[0] != 'sessions' or not pieces[1].endswith('.jsonl') or rel in links:
             continue
         thread = next((t for t in valid if pieces[1] == t + '.jsonl' or pieces[1].endswith('-' + t + '.jsonl')), None)
         if thread:
@@ -216,13 +220,28 @@ def _parts(event, thread):
     return None
 
 
+def _check_truncation(wrapper):
+    # Codex wraps a shortened tool result in another text MCP envelope. A
+    # passage that merely quotes this marker inside its own data is still valid.
+    if not isinstance(wrapper, dict) or not isinstance(wrapper.get('isError'), bool):
+        return
+    parts = wrapper.get('content')
+    if isinstance(parts, list):
+        for part in parts:
+            content = part.get('text') if isinstance(part, dict) and part.get('type') == 'text' else None
+            if isinstance(content, str) and re.search(r'…\d+ chars truncated…', content):
+                raise ValueError('native tool receipt truncated by Codex')
+
+
 def _receipt(item):
     reply = item.get('result') or {}
     parts = [p.get('text') for p in reply.get('content', []) if isinstance(p, dict) and p.get('type') == 'text']
     if len(parts) != 1 or not isinstance(parts[0], str) or len(parts[0].encode()) > CALL_BYTES:
         raise ValueError('invalid or oversized tool response')
     rec = json.loads(parts[0])
-    if not isinstance(rec, dict) or not INVOCATION.fullmatch(str(rec.get('invocation_id', ''))):
+    _check_truncation(rec)
+    invocation = rec.get('invocation_id') if isinstance(rec, dict) else None
+    if not isinstance(invocation, str) or not INVOCATION.fullmatch(invocation):
         raise ValueError('invalid invocation_id')
     status = rec.get('status')
     good = status in ('ok', 'partial') and item.get('status') == 'completed' and not reply.get('isError')
@@ -252,6 +271,19 @@ def native_calls(layout, call, reject, deadline, pending_proposals=None):
                 roles[rel] = role
             item = _parts(ev, thread)
             if not item:
+                continue
+            if item.get('server') == 'memory' and item.get('tool') in (
+                    'get_evidence', 'recall_objects', 'recall_passages', 'recall_judgments'):
+                reply = item.get('result') or {}
+                parts = reply.get('content') or []
+                if item.get('status') == 'completed' and not reply.get('isError') and len(parts) == 1:
+                    text = parts[0].get('text') if isinstance(parts[0], dict) else None
+                    if isinstance(text, str) and ' chars truncated' in text:
+                        try:
+                            value = json.loads(text)
+                        except ValueError:
+                            continue
+                        _check_truncation(value)
                 continue
             if item.get('server') == 'memory' and item.get('tool') == 'propose_memory':
                 if pending_proposals is not None and item.get('status') == 'completed':

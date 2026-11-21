@@ -141,6 +141,45 @@ class Ledger(unittest.TestCase):
         self.assertEqual(ingest.verify(self.layout)['originals'], 1)
         self.assertEqual(ingest.backfill(self.layout), [])
 
+    def test_bad_archive_is_isolated_until_the_owner_retries_it(self):
+        bad = self.call([])
+        healthy = self.call([self.event(1, 'read_document', {'passages': [self.row]})])
+        archived = self.records.call_dir(bad) / 'sessions/rollout-lead.jsonl'
+        original = archived.read_bytes()
+        archived.write_bytes(original + b'\n')
+        with self.assertRaisesRegex(ValueError, bad + '.*checksum mismatch'):
+            ingest.backfill(self.layout)
+        self.assertEqual(ingest.status(self.layout)['blocked_runs'], [bad])
+        self.assertEqual(ledger.load(self.layout).reports.keys(), {healthy})
+        archived.write_bytes(original)
+        self.assertEqual(ingest.backfill(self.layout), [])
+        report, = ingest.backfill(self.layout, [bad])
+        self.assertEqual(report['run'], bad)
+        self.assertEqual(ingest.status(self.layout)['blocked_runs'], [])
+        self.assertEqual(ingest.verify(self.layout)['runs'], 2)
+
+    def test_only_string_invocation_ids_are_registered(self):
+        self.call([self.event(1, 'read_document', {'passages': [self.row]}, invocation_id=10**31),
+                   self.event(1, 'read_document', {'passages': [self.row]})])
+        report, = ingest.backfill(self.layout)
+        self.assertEqual(report['reasons'], {'invalid invocation_id': 1})
+        self.assertEqual(report['delivery_count'], 1)
+
+    def test_malformed_session_manifest_does_not_hide_healthy_pending_records(self):
+        bad, good = self.call([]), self.call([])
+        first, second = self.records.calls()
+        with mock.patch.object(ingest, '_calls', return_value=[{**first, 'files': 'bad manifest'}, second]):
+            with self.assertRaisesRegex(ValueError, 'Invalid session manifest'):
+                ingest.backfill(self.layout)
+            self.assertEqual(ingest.status(self.layout)['blocked_runs'], [bad])
+        self.assertEqual(ledger.load(self.layout).reports.keys(), {good})
+        self.assertFalse(ingest.eligible({**second, 'subagent_threads': ['missing-child']}))
+        self.assertTrue(ingest.eligible({**second, 'problems': [
+            'Proposal collection exceeded its 64-file limit',
+            'Proposal sample.json could not be collected: expected a bounded single-link regular file']}))
+        self.assertFalse(ingest.eligible({**second, 'problems': [
+            'Proposal sample.json could not be collected: [Errno 5] Input/output error']}))
+
     def test_distinguish_source_failures_from_local_failures_and_unknown_stage(self):
         def failed(i, code, attempts):
             return self.event(i, 'acquire_fulltext', {}, {'paper_ref': '10.1/a'}, status='unavailable',
