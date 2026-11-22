@@ -1,0 +1,476 @@
+"""Register literature evidence and checked, explicitly attributed interpretations in a single run batch."""
+from collections import Counter, defaultdict
+import hashlib
+import json
+import re
+import time
+
+from rsi import memory_proposals, memory_store as ledger
+from rsi.memory_history import read
+from rsi.memory_receipts import deadline_check, native_calls, original_problem, service_source, session_paths
+from rsi.paths import Layout
+from rsi.records import Records
+
+TIME_LIMIT = 120
+MAX_ITEMS = 4096
+MAX_TOTAL = 16 << 20
+MAX_PASSAGE = 128 << 10
+DOC_ID = re.compile(r'doc_[0-9a-f]{64}')
+LOCAL_ERRORS = {'invalid_arguments': 'invalid arguments', 'runtime_unavailable': 'local runtime unavailable',
+                'source_storage_error': 'local archive failure', 'response_too_large': 'response too large',
+                'log_unavailable': 'local log failure', 'internal_error': 'local service error',
+                'trial_cache_miss': 'local cache miss', 'unknown_source': 'unknown local source',
+                'configuration_required': 'local configuration required'}
+
+
+def _string(row, field, limit=2048, optional=False):
+    value = row.get(field)
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not value.strip() or len(value.encode()) > limit:
+        raise ValueError(f'invalid {field}')
+    return value
+
+
+def _address(row):
+    doc = _string(row, 'document_id')
+    version = _string(row, 'document_version')
+    source = _string(row, 'source_sha256')
+    if not (DOC_ID.fullmatch(doc) and ledger.DIGEST.fullmatch(version) and ledger.DIGEST.fullmatch(source)):
+        raise ValueError('invalid document address')
+    return {'document_id': doc, 'document_version': version, 'source_sha256': source}
+
+
+def _strings(value, field, *, maximum=128):
+    if not isinstance(value, list) or len(value) > maximum or not all(isinstance(s, str) and len(s) <= 4096 for s in value):
+        raise ValueError(f'invalid {field}')
+    return value
+
+
+def _range(row, key, size):
+    pair = row.get(key)
+    if (not isinstance(pair, list) or len(pair) != 2 or not all(type(x) is int for x in pair)
+            or pair[0] < 0 or pair[1] - pair[0] != size):
+        raise ValueError(f'invalid {key}')
+    return pair
+
+
+def _passage(row, original):
+    if row.get('block_complete') is False:
+        raise ValueError('partial block')
+    if row.get('block_complete') is not True:
+        raise ValueError('invalid block_complete')
+    text = _string(row, 'text', MAX_PASSAGE)
+    data = text.encode()
+    address = _address(row)
+    meta = row.get('source_metadata')
+    if not isinstance(meta, dict):
+        raise ValueError('invalid source_metadata')
+    parent = meta.get('derived_from')
+    if parent is None and ('parser_identity' in meta or 'extraction_coverage' in meta):
+        raise ValueError('missing derived document parent')
+    if 'derived_from' in meta:
+        if not isinstance(parent, dict):
+            raise ValueError('invalid derived document parent')
+        parent = _address(parent)
+        original(parent['source_sha256'])
+    original(address['source_sha256'])
+    body = {'type': 'passage', 'text': text, 'text_sha256': hashlib.sha256(data).hexdigest(),
+            'source_sha256': address['source_sha256'], 'parser_version': _string(row, 'parser_version'),
+            'locator': _string(row, 'locator'), 'kind': _string(row, 'kind'),
+            'section': _string(row, 'section'), 'section_path': _strings(row.get('section_path'), 'section_path'),
+            'char_range': _range(row, 'char_range', len(text)), 'byte_range': _range(row, 'byte_range', len(data))}
+    extra = {key: _string(meta, key, 4096, optional=True) for key in ('paper_ref', 'source_id', 'provider', 'source_url')}
+    extra.update(address, content_scope=_string(row, 'content_scope'), derived_from=parent)
+    key = [body[name] for name in ('source_sha256', 'parser_version', 'locator')]
+    return key, body, extra
+
+
+def _paper(row):
+    paper_id, provider = _string(row, 'paper_id'), _string(row, 'provider')
+    if not paper_id.startswith(provider + ':') or not paper_id[len(provider) + 1:]:
+        raise ValueError('invalid source paper ID')
+    if 'title' in _strings(row.get('omitted_fields', []), 'omitted_fields'):
+        raise ValueError('paper title omitted from receipt; retrieve the individual paper with get_paper')
+    body = {k: _string(row, k, 8192, optional=True) for k in ('doi', 'pmid', 'pmcid', 'title')}
+    year = row.get('year')
+    if year is not None and type(year) not in (str, int):
+        raise ValueError('invalid year')
+    body.update(type='paper', provider=provider, paper_id=paper_id, year=year)
+    return paper_id, body, {}
+
+
+def _attempts(prov):
+    attempts = prov.get('download_attempts', [])
+    if not isinstance(attempts, list) or len(attempts) > 256 or not all(isinstance(v, dict) for v in attempts):
+        raise ValueError('invalid download_attempts')
+    cleaned = []
+    for row in attempts:
+        attempt = {k: _string(row, k, optional=True) for k in ('format', 'host', 'outcome') if k in row}
+        if 'http_status' in row:
+            if type(row['http_status']) is not int:
+                raise ValueError('invalid download HTTP status')
+            attempt['http_status'] = row['http_status']
+        cleaned.append(attempt)
+    return cleaned
+
+
+def _acquisition(run, args, rec, original):
+    data, prov = rec['data'], rec.get('provenance')
+    if not isinstance(prov, dict):
+        raise ValueError('invalid acquisition provenance')
+    errors = rec.get('errors', [])
+    if not isinstance(errors, list) or any(not isinstance(e, dict) for e in errors):
+        raise ValueError('invalid acquisition errors')
+    code = _string(errors[0], 'code') if errors else None
+    if code in LOCAL_ERRORS:
+        raise ValueError(LOCAL_ERRORS[code])
+    attempts = _attempts(prov)
+    success = rec['status'] in ('ok', 'partial') or (data.get('document_id') and data.get('source_artifact') and not code)
+    if not success:
+        if code in ('fulltext_format_unavailable', 'fulltext_location_unavailable'):
+            stage = 'candidate_resolution'
+        elif code == 'fulltext_unavailable' and any((attempt.get('http_status') or 0) >= 400 for attempt in attempts):
+            stage = 'source_http'
+        else:
+            raise ValueError('unknown failure stage')
+    ref = _string(args, 'paper_ref', optional=True)
+    source_id = _string(args, 'source_id', optional=True)
+    if bool(ref) == bool(source_id):
+        raise ValueError('invalid acquisition request identity')
+    body = {'type': 'acquisition', 'paper_ref': ref, 'source_id': source_id,
+            'provider': _string(args, 'provider', optional=True) or _string(prov, 'provider'),
+            'download_attempts': attempts, 'download_hosts': _strings(prov.get('download_hosts', []), 'download_hosts')}
+    if success:
+        address = _address(data)
+        original(address['source_sha256'])
+        coverage = rec.get('coverage')
+        if not isinstance(coverage, dict):
+            raise ValueError('invalid acquisition coverage')
+        verified = coverage.get('verified_paper_identifiers')
+        if verified is not None:
+            _strings(verified, 'verified_paper_identifiers')
+        meta = data.get('source_metadata') or {}
+        body.update(address, media_type=_string(data, 'media_type'), content_scope=_string(data, 'content_scope'),
+                    source_url=_string(meta, 'source_url', 4096, optional=True), status='acquired',
+                    verified_paper_identifiers=verified)
+    else:
+        body.update(status='unavailable', stage=stage, errors=[{'code': code, 'detail': _string(errors[0], 'detail', 4096, optional=True)}])
+    return [run, rec['invocation_id']], body, {}
+
+
+def _earlier_papers(state, run, withdrawn):
+    """Find the metadata in effect before this run, even if earlier batches were backfilled out of order."""
+    before = int(run[1:])
+    latest = {}
+    for d in state.deliveries:
+        ident = d['id']
+        if not ident.startswith('paper_') or (ident, d['revision']) in withdrawn:
+            continue
+        delivered = int(d['run'][1:]), d['seq'], d['revision']
+        if delivered[0] < before and (ident not in latest or delivered > latest[ident]):
+            latest[ident] = delivered
+    return {o['id']: o for o in state.objects if o['id'] in latest and o['revision'] == latest[o['id']][2]}
+
+
+class _Registration:
+    def __init__(self, layout, state, call):
+        self.layout = layout
+        self.call = call
+        self.state = state
+        self.deadline = time.monotonic() + TIME_LIMIT
+        self.source = service_source(layout, call)
+        self.rows = []
+        self.withdrawn = {(e['id'], e['revision']) for e in state.owner_events if e['type'] == 'withdrawn'}
+        self.latest = {}  # Includes withdrawals, for monotonic revision numbers and ownership.
+        self.active = {}
+        self.withdrawn_evidence = defaultdict(dict)
+        for obj in state.objects:
+            ident = obj['id']
+            self.latest[ident] = obj
+            if (ident, obj['revision']) not in self.withdrawn:
+                self.active[ident] = obj
+            elif obj['kind'] == 'evidence':
+                self.withdrawn_evidence[ident][ledger.digest(obj['content'])] = obj
+        self.earlier_papers = _earlier_papers(state, call['id'], self.withdrawn)
+        self.rejections = []
+        self.reasons = Counter()
+        self.accepted = Counter()
+        self.created = Counter()
+        self.checked = {}
+        self.bytes = 0
+
+    def reject(self, reason, **where):
+        self.reasons[reason] += 1
+        # One diagnostic per rejected return up to the run's item bound; all counts remain exact.
+        if len(self.rejections) < MAX_ITEMS:
+            self.rejections.append({'reason': reason, **where})
+
+    def original(self, address):
+        if address not in self.checked:
+            self.checked[address] = original_problem(self.layout, address)
+        if self.checked[address]:
+            raise ValueError(self.checked[address])
+
+    def add(self, key, content, extra, delivery):
+        subtype = content['type']
+        ident = subtype + '_' + ledger.digest(key)
+        last_registered = self.latest.get(ident)
+        prior = self.earlier_papers.get(ident) if subtype == 'paper' else self.active.get(ident)
+        if prior and subtype == 'passage' and prior['content'] != content:
+            raise ValueError('conflicting text or coordinates at the same passage address')
+        observed = prior if prior and prior['content'] == content else None
+        if observed is None and ident in self.withdrawn_evidence:
+            # Redelivery of exactly the withdrawn content is a receipt for that same revision.
+            observed = self.withdrawn_evidence[ident].get(ledger.digest(content))
+        if observed is None and prior is None and last_registered and last_registered['content'] == content:
+            # A later run already delivered these same bytes. Preserve its immutable revision pin.
+            observed = last_registered
+        new = observed is None
+        if new:
+            rev = last_registered['revision'] + 1 if last_registered else 1
+        else:
+            rev = observed['revision']
+        body = {**delivery, **extra, 'id': ident, 'revision': rev}
+        size = len(ledger.encode(body)) + (len(ledger.encode(content)) if new else 0)
+        if self.bytes + size > MAX_TOTAL or sum(self.accepted.values()) >= MAX_ITEMS:
+            raise ValueError('registration capacity exceeded')
+        self.bytes += size
+        if new:
+            origin = {k: delivery[k] for k in ('run', 'task', 'version')}
+            superseded = last_registered if subtype == 'passage' else prior
+            obj = {'schema_version': 'rsi_mol_memory_v1', 'id': ident, 'kind': 'evidence', 'revision': rev,
+                   'supersedes': superseded['revision'] if superseded else None, 'content': content, 'origin': origin,
+                   'question_ids': [], 'source_refs': [], 'object_refs': [], 'authority': 'receipt'}
+            obj['record_sha256'] = ledger.digest(obj)
+            self.latest[ident] = obj
+            self.active[ident] = obj
+            self.rows.append(('object', obj))
+            self.created[subtype] += 1
+            observed = obj
+        if subtype == 'paper' and (ident, rev) not in self.withdrawn:
+            self.earlier_papers[ident] = observed
+        self.rows.append(('delivery', body))
+        self.accepted[subtype] += 1
+        return body
+
+    def prepare(self):
+        pending = set() if 'task_goal' in self.call else None
+        current = defaultdict(list)
+        calls = native_calls(self.layout, self.call, self.reject, self.deadline, pending)
+        for at, thread, role, tool, args, rec, native_id in calls:
+            base = {'run': self.call['id'], 'task': self.call['task'], 'version': self.call.get('version_before'),
+                    'thread': thread, 'role': role, 'at': at, 'tool': tool, 'invocation_id': rec['invocation_id'], 'service': self.source}
+            data = rec['data']
+            if tool in ('find_passages', 'read_document'):
+                rows = data.get('passages')
+            elif tool == 'acquire_fulltext':
+                rows = [data]
+            elif tool == 'get_paper':
+                rows = [data.get('paper')]
+            else:
+                rows = data.get('papers')
+            if not isinstance(rows, list):
+                self.reject('missing result rows', invocation_id=rec['invocation_id'])
+                continue
+            within_call = set()
+            for index, row in enumerate(rows):
+                deadline_check(self.deadline)
+                try:
+                    if not isinstance(row, dict):
+                        raise ValueError('invalid result row')
+                    if tool in ('find_passages', 'read_document'):
+                        result = _passage(row, self.original)
+                    elif tool == 'acquire_fulltext':
+                        result = _acquisition(base['run'], args, rec, self.original)
+                    else:
+                        result = _paper(row)
+                    signature = ledger.digest(result)
+                    if signature not in within_call:
+                        delivery = self.add(*result, base)
+                        if pending and result[1]['type'] == 'passage' and isinstance(native_id, str):
+                            # Only a successfully staged delivery can support a current-run citation.
+                            current[thread, native_id].append((delivery, result[1]))
+                        within_call.add(signature)
+                except (ValueError, TypeError, AttributeError, RecursionError) as exc:
+                    self.reject(str(exc)[:180], invocation_id=rec['invocation_id'], row=index)
+        memory_proposals.register(self, pending or (), current, MAX_TOTAL, MAX_ITEMS)
+        summary = {'service': self.source, 'objects': dict(self.created), 'deliveries': dict(self.accepted),
+                   'delivery_count': sum(self.accepted.values()), 'reasons': dict(self.reasons), 'rejected': self.rejections}
+        proposal_state = _proposal_collection(self.call)
+        if proposal_state not in ('complete', 'not_requested'):
+            summary['proposal_collection'] = proposal_state
+        deadline_check(self.deadline)
+        return summary
+
+
+def _proposal_collection(call):
+    if 'memory_collection' in call:
+        return call['memory_collection']['proposals']
+    problems = [line for line in call.get('problems') or () if isinstance(line, str)]
+    if any(line.startswith('Memory proposals could not be collected:') for line in problems):
+        return 'incomplete'
+    if any(line.startswith(('Proposal ', 'Unexpected entry in the proposal directory:')) for line in problems):
+        return 'partial'
+    return 'complete' if 'proposal_workspace' in call else 'not_requested'
+
+
+class _UncertifiedSession(ValueError):
+    """The sealed call itself cannot certify complete sessions, regardless of the files currently on disk."""
+
+
+def _session_problem(call):
+    stages = call.get('memory_collection')
+    if stages is not None:
+        if not isinstance(stages, dict) or stages.get('sessions') != 'complete':
+            return 'the controller did not complete session archive collection'
+    else:
+        problems = [line for line in call.get('problems') or () if isinstance(line, str)]
+        for line in problems:
+            if line.startswith(('Could not copy the session record', 'Missing session archive for thread ')):
+                return 'incomplete session archive: ' + line
+        interrupted = any(line.startswith('Interrupted while collecting the results (') for line in problems)
+        if interrupted or call.get('memory_collection_complete') is False:
+            # These later steps can only be reached after collect_sessions returned. A partial copy
+            # can have a valid call.json checksum in older records, so filenames and hashes alone do not suffice.
+            passed_sessions = ((interrupted and isinstance(call.get('check'), dict))
+                               or _proposal_collection(call) in ('partial', 'incomplete'))
+            if not passed_sessions:
+                return 'the legacy record does not establish that session archive collection finished'
+    paths = session_paths(call)
+    expected = {call.get('thread_id'), *(call.get('subagent_threads') or [])} - {None}
+    if not call.get('thread_id') or not paths or {thread for _, thread, _ in paths} != expected:
+        return 'the sealed session archive manifest does not cover all expected threads'
+    return None
+
+
+def eligible(call, *, explain=False):
+    if call.get('purpose') != 'task' or call.get('status') not in ('finished', 'failed', 'timed_out'):
+        return False
+    memory = call.get('memory') or {}
+    if not isinstance(memory, dict):
+        raise ValueError('Invalid memory metadata in call record')
+    if memory.get('condition', 'live') != 'live':
+        return False
+    # Codex can fail or time out before starting a thread. Older collectors marked this as incomplete.
+    if call['status'] != 'finished' and call.get('thread_id') is None and not call.get('subagent_threads'):
+        files = call.get('files', {})
+        if isinstance(files, dict) and not any(path.partition('/')[0] == 'sessions' for path in files):
+            return False
+    reason = _session_problem(call)
+    if reason and explain:
+        raise _UncertifiedSession(reason)
+    return reason is None
+
+
+def _calls(layout):
+    return Records(layout.records).calls() if layout.records.is_dir() else []
+
+
+class BlockedRegistrations(ValueError):
+    def __init__(self, reasons):
+        self.notices = [f'Memory registration blocked for {run}: {reason}' for run, reason in reasons.items()]
+        super().__init__('; '.join(self.notices))
+
+
+def _recorded_failure(layout, run):
+    path = f'records/memory-failures/{run}.json'
+    try:
+        record = json.loads(read(layout.root, path, 64 << 10))
+        if isinstance(record, dict) and record.get('run') == run and isinstance(record.get('reason'), str):
+            return f'{record["reason"]}. Retry with rsi memory backfill {run}'
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError, RecursionError):
+        pass
+    return f'Could not read the registration failure in {path}. Retry with rsi memory backfill {run}'
+
+
+def registration_reports(layout: Layout, run_ids=None):
+    """Yield committed reports in order, then report any runs that remain blocked."""
+    state = ledger.load(layout)
+    calls = _calls(layout)
+    requested = set(run_ids or [])
+    unknown = requested - {call['id'] for call in calls}
+    if unknown:
+        raise ValueError(f'Unknown registration run: {", ".join(sorted(unknown))}')
+    failures = {}
+    if not requested:
+        for owner in sorted(state.missing_owner_reports, key=lambda key: state.owner_reports[key]['version_after']):
+            yield ledger.finish_report(layout, state, owner)
+    for call in calls:
+        run = call['id']
+        if requested and run not in requested:
+            continue
+        if run in state.reports:
+            if run in state.missing_reports or requested:
+                yield ledger.finish_report(layout, state, run)
+        else:
+            previous = _recorded_failure(layout, run)
+            if previous and not requested:
+                failures[run] = previous
+                continue
+            try:
+                if not eligible(call, explain=True):
+                    continue
+                registration = _Registration(layout, state, call)
+                summary = registration.prepare()
+            except _UncertifiedSession as error:
+                failures[run] = f'{error}. A new task run is needed for a new archive'
+                continue
+            except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+                reason = f'{type(error).__name__}: {error}'
+                # This failure belongs to a single run, including a session read that hit its deadline.
+                # A named retry bypasses the marker. A published report always takes precedence.
+                if not previous:
+                    Records(layout.records).write_json(f'memory-failures/{run}.json', {'run': run, 'reason': reason})
+                failures[run] = f'{reason}. Retry with rsi memory backfill {run}'
+                continue
+            # Publication and report writes affect shared state. Let recovery re-read the chain on any failure.
+            yield ledger.publish(layout, state, run, registration.rows, summary)
+    if failures:
+        raise BlockedRegistrations(failures)
+
+
+def backfill(layout: Layout, run_ids=None):
+    return list(registration_reports(layout, run_ids))
+
+
+def status(layout: Layout):
+    state = ledger.load(layout)
+    counts = {kind: len({o['id'] for o in state.objects if o['content']['type'] == kind})
+              for kind in (*ledger.TYPES, *memory_proposals.CONTENT_FIELDS)}
+    blocked_reasons = {}
+    pending = set(state.missing_reports)
+    for call in _calls(layout):
+        run = call['id']
+        if run in state.reports:
+            continue
+        try:
+            if not eligible(call, explain=True):
+                continue
+            failure = _recorded_failure(layout, run)
+            if failure:
+                blocked_reasons[run] = failure
+        except _UncertifiedSession as error:
+            blocked_reasons[run] = f'{error}. A new task run is needed for a new archive'
+        except (ValueError, KeyError, TypeError) as error:
+            blocked_reasons[run] = str(error)
+        pending.add(run)
+    return {'version': state.version, 'counts': counts, 'deliveries': len(state.deliveries), 'pending': len(pending),
+            'blocked_runs': list(blocked_reasons), 'blocked_reasons': blocked_reasons,
+            'owner_actions': len(state.owner_events), 'pending_owner_reports': len(state.missing_owner_reports),
+            'recent': [{k: r[k] for k in ('run', 'version_after', 'delivery_count')} for r in list(state.reports.values())[-5:]]}
+
+
+def verify(layout: Layout):
+    state = ledger.load(layout)
+    missing = state.missing_reports | state.missing_owner_reports
+    if missing:
+        raise ValueError('Missing registration report for ' + ', '.join(sorted(missing)))
+    originals = ledger.source_hashes(state)
+    for sha in sorted(originals):
+        if problem := original_problem(layout, sha):
+            raise ValueError(f'{sha}: {problem}')
+    return {'version': state.version, 'objects': len(state.objects), 'deliveries': len(state.deliveries),
+            'originals': len(originals), 'runs': len(state.reports), 'owner_actions': len(state.owner_events)}

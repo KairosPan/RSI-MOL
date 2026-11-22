@@ -1,0 +1,7 @@
+pool,expanded_status,expanded_score_seed1,expanded_score_seed2,expanded_input_tokens,compact_status,compact_score_seed1,compact_score_seed2,compact_input_tokens
+P1,ok,80,82,1000,ok,82,84,800
+P2,ok,75,77,1200,ok,75,79,920
+P3,ok,88,86,1150,ok,84,86,950
+P4,ok,69,71,1050,ok,71,73,900
+P5,ok,83,85,910,ok,81,83,800
+P6,ok,77,79,1020,timeout,,,

@@ -390,6 +390,20 @@ class Recover(unittest.TestCase):
 
 
 class Commands(unittest.TestCase):
+    def test_design_lists_the_cold_start_and_owner_commands_in_their_tables(self):
+        design = (LAUNCHER.parent / 'docs/design-memory.md').read_text()
+        conditions = design.split('### 5.5 ', 1)[1].split('### 5.6 ', 1)[0]
+        rows = [line.strip('|').split('|') for line in conditions.splitlines() if line.startswith('|')]
+        self.assertTrue(rows and all(len(row) == 4 for row in rows))
+        none, = [row for row in rows if '`none`' in row[0]]
+        args = none[1].strip().strip('`').split()
+        self.assertEqual(args[0], 'rsi')
+        self.assertEqual(cli._parse(args[1:]), ('task', {'task': args[2], 'memory': 'none', 'meta': True}))
+        commands = design.split('### 5.7 ', 1)[1].split('### ', 1)[0]
+        for action in ('source-changed', 'withdraw'):
+            entry, = [line for line in commands.splitlines() if line.startswith(f'| `rsi memory {action} ')]
+            self.assertEqual(len(entry.strip('|').split('|')), 2)
+
     def test_lock(self):
         with Root() as root, locked(root.layout):
             with self.assertRaises(Refused):
@@ -506,6 +520,33 @@ class Commands(unittest.TestCase):
             line = next(line for line in out.splitlines() if 'Meta' in line)
             self.assertIn('day.calls', line)
             self.assertEqual(len(root.records.calls()), 1); self.assertFalse((root.layout.records / 'rounds').exists())
+
+    @needs_codex
+    def test_corrupt_memory_refuses_automatic_and_manual_meta_before_a_call(self):
+        with Root() as root:
+            root.add_task('T1')
+            root.records.write_json('memory/R0010.json', {})
+            root.model.push(say('lab done'), say(decision('no_change')))
+            code, out, _ = run('task', 'T1', '--memory', 'none')
+            self.assertEqual(code, 0)
+            self.assertIn('No Meta round was run', out)
+            self.assertIn('no matching memory batch', out)
+
+            notes = root.layout.work / 'notes.md'
+            notes.write_text('owner edit')
+            code, out, err = run('meta')
+            self.assertEqual(code, 3)
+            self.assertIn('no matching memory batch', out + err)
+            self.assertEqual(notes.read_text(), 'owner edit')
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+            self.assertEqual(len(root.model.requests), 1)
+            self.assertEqual([c['purpose'] for c in root.records.calls()], ['task'])
+            self.assertFalse((root.layout.records / 'rounds').exists())
+
+            (root.layout.records / 'memory/R0010.json').unlink()
+            self.assertEqual(run('meta')[0], 0)
+            self.assertEqual([c['purpose'] for c in root.records.calls()], ['task', 'meta'])
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'live')
 
     @needs_codex
     def test_meta_command_takes_every_task_call_no_round_had(self):

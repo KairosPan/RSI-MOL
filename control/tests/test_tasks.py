@@ -15,6 +15,13 @@ def sealed(root: Root) -> Path:
 
 
 class TaskFiles(unittest.TestCase):
+    def test_task_ids_use_the_directory_spelling_on_every_filesystem(self):
+        with Root() as root:
+            root.add_task('Readout')
+            self.assertEqual(load_task(root.layout.tasks, 'Readout').id, 'Readout')
+            with self.assertRaisesRegex(ValueError, 'Use Readout'):
+                load_task(root.layout.tasks, 'readout')
+
     def test_sections(self):
         with Root() as root:
             root.add_task('T1')

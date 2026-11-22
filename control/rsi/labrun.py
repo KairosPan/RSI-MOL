@@ -36,17 +36,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from rsi import check, literature_logs
+from rsi import check, literature_logs, memory_ingest, proposal_files
 from rsi.codexrun import codex_version, run_codex
 from rsi.compose import lab_config, load_envelope, tool_server_problems, write_home_config, write_role_files
 from rsi.limits import Limits, load_limits, refusal
+from rsi.memory_snapshot import place_snapshot
 from rsi.paths import Layout, Refused, safe_id
 from rsi.records import STARTED, Records
 from rsi.sessions import collect_sessions
 from rsi.settings import Settings, load_settings
 from rsi.skills import materialise
 from rsi.tasks import Task, collect_out, load_task, place_inputs, prompt_for, results_sentence, run_check
-from rsi.versions import VersionStore
+from rsi.versions import VersionStore, same_entries
 from rsi.workspace import SEALED, has_entry, keep, open_folder, prepare_for_commit, remove, seal
 
 MANUAL = 'manual or leftover'   # author of what is found in work/ before a run: the owner's or a leftover process's
@@ -55,6 +56,7 @@ PROBE = 'probe'                 # the results folder of a probe: out/probe/
 PROBE_LIMIT = 20_000            # characters of a probe text
 PROCESS_FILE = 'process.json'   # in a call's record folder: the pid and start time of its Codex process
 LAB_WORKSPACES = ('work', 'trial')  # where a Lab Codex runs: moved in with the skills in .agents/skills/
+WORK_MEMORY_MANAGED = 'work-memory-managed'  # under records/, set only after work/ receives its first snapshot
 # The start of a problem line when the literature server's own call log of a run could not be copied into its record.
 LOG_UNAVAILABLE = "The literature server's own call log could not be collected"
 # What can go wrong with a sealed or staged folder, or with git on it (a time-out included).
@@ -221,10 +223,11 @@ def _codex_version(layout: Layout) -> str:
         raise Refused(f'The Codex program cannot be used: {error}') from None
 
 
-def _compose(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, resolve) -> tuple[dict, list[str]]:
+def _compose(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, resolve,
+             proposals: bool = False) -> tuple[dict, list[str]]:
     """The run's configuration, and its settings problems (load_settings', lab_config's and the URL servers')."""
     write_role_files(layout, settings, trial=trial)
-    config = lab_config(layout, envelope, settings, trial=trial, resolve=resolve)
+    config = lab_config(layout, envelope, settings, trial=trial, resolve=resolve, proposals=proposals)
     return config, list(settings.problems) + tool_server_problems(envelope, settings, resolve=resolve)
 
 
@@ -280,7 +283,8 @@ def _rename_in(staged: Path, root_fd: int, name: str) -> None:
 
 
 def _move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name: str, context: dict,
-             problems: list[str], *, skill_lines: list[str] | None = None) -> None:
+             problems: list[str], *, skill_lines: list[str] | None = None, skills_prepared: bool = False,
+             memory: str = 'live', task_id: str | None = None, manual: bool = False) -> dict | None:
     """Seal whatever sits at <root>/<name> now, then rename the staged folder there. A found trial/ (an earlier
     trial's leftover) is removed; a found work/ is kept under sealed/, never versioned: it appeared after work/ was
     sealed and committed. The staged folder is removed if this fails.
@@ -289,8 +293,11 @@ def _move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name:
     its skills/ copied to .agents/skills/ (rsi.skills.materialise); the lines of what was left out go to skill_lines,
     or to problems when that is None."""
     try:
+        snapshot = None
         if name in LAB_WORKSPACES:
-            (problems if skill_lines is None else skill_lines).extend(materialise(staged))
+            if not skills_prepared:
+                (problems if skill_lines is None else skill_lines).extend(materialise(staged))
+            snapshot = place_snapshot(layout, staged, memory, task_id, manual_problems=problems if manual else None)
         label = _stamp()
         entry = seal(root_fd, name, label)
         if entry is not None:
@@ -298,6 +305,9 @@ def _move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name:
                                                   'as a version']
             _dispose(layout, records, root_fd, entry, name, label, reasons, context, problems)
         _rename_in(staged, root_fd, name)
+        if name == 'work' and not (records.root / WORK_MEMORY_MANAGED).exists():
+            (records.root / WORK_MEMORY_MANAGED).touch()
+        return snapshot
     except BaseException:
         _discard(staged)
         raise
@@ -327,8 +337,25 @@ def _dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: s
     problems.append(f'The sealed {name}/: {"; ".join(reasons)}; it was kept whole at {where}')
 
 
+def _preserve_legacy_memory(layout: Layout, records: Records, tree: Path, label: str, context: dict,
+                            notices: list[str]) -> None:
+    """Before the first managed work snapshot, preserve any old entry the new version rules would exclude."""
+    fd = open_folder(tree)
+    try:
+        entries = same_entries(fd, ('memory',)) | {name for name in os.listdir(fd) if name.lower() == 'memory'}
+        for name in sorted(entries):
+            target = layout.sealed / label / 'legacy-work' / name
+            keep(fd, name, str(tree / name), target)
+            where = target.relative_to(layout.root).as_posix()
+            reason = f'work/{name} predates managed memory snapshots'
+            records.note('sealed', {'workspace': 'work', 'path': where, 'reasons': [reason], **context})
+            notices.append(f'{reason}; it was preserved at {where}')
+    finally:
+        os.close(fd)
+
+
 def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, save, context: dict,
-            problems: list[str]) -> None:
+            problems: list[str], *, preserved: list[str] | None = None) -> None:
     """Handle the sealed tree <root>/<entry>: make it storable (its lines go to problems), and save(tree), a commit
     or a tree id, unless it holds `.codex` or something that must be left out could not be moved out of it: a version
     never holds what the rules leave out. Then _dispose: the tree is kept when save failed or was not done, or when
@@ -347,6 +374,9 @@ def _settle(layout: Layout, records: Records, root_fd: int, entry: str, name: st
         if has_entry(tree, '.codex'):
             reasons.append('it holds .codex; the version was not saved')
         elif not blocked:
+            if name == 'work' and not (records.root / WORK_MEMORY_MANAGED).exists():
+                _preserve_legacy_memory(layout, records, tree, label, context,
+                                        problems if preserved is None else preserved)
             save(tree)
     except WORKSPACE_ERRORS as error:
         reasons.append(f'the version was not saved ({type(error).__name__}: {error})')
@@ -363,7 +393,7 @@ def _uncommitted(calls: list[dict]) -> str | None:
 
 
 def _take_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, calls: list[dict],
-               context: dict, notes: list[str]) -> None:
+               context: dict, notes: list[str], *, preserved: list[str] | None = None) -> None:
     """Before a task run: seal what sits in work/ and commit it as `manual or leftover` when it differs from head
     (the program cannot tell the owner's edits from what a leftover process wrote). Refused if work/ cannot be
     sealed; anything else becomes a problem line (and a `sealed` note when the tree is kept)."""
@@ -377,15 +407,19 @@ def _take_work(layout: Layout, records: Records, store: VersionStore, root_fd: i
     if previous is not None:
         message += f'; the last task run {previous} could not be saved as a version'
     _settle(layout, records, root_fd, entry, 'work', label, lambda tree: store.commit(tree, MANUAL, message), context,
-            notes)
+            notes, preserved=preserved)
 
 
 def _restore_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, context: dict) -> str:
     """After a refusal that came once work/ was sealed: stage main's head and move it into work/ again (best
-    effort), so the owner can keep opening the Lab Codex there. '' when that worked, else the sentence for the
-    refusal saying that there is no usable work/ now, and why."""
+    effort), so the owner can keep opening the Lab Codex there. Return a diagnostic when restoring work/ or its
+    live memory snapshot failed."""
     try:
-        _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context, [])
+        problems = []
+        snapshot = _move_in(layout, records, root_fd, _stage(layout, store, store.head())[0], 'work', context,
+                            problems, manual=True)
+        if snapshot['condition'] == 'unavailable':
+            return '; work/ was restored with Scientific Memory unavailable (' + '; '.join(problems) + ')'
         return ''
     except Exception as error:
         return (f'; work/ could not be put back to the newest version of main either ({type(error).__name__}: '
@@ -394,10 +428,13 @@ def _restore_work(layout: Layout, records: Records, store: VersionStore, root_fd
 
 # The two runs.
 
-def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dict:
+def run_task(layout: Layout, task_id: str, *, memory: str = 'live', resolve=socket.getaddrinfo,
+             on_memory_notice=None) -> dict:
     """Run a task in work/ and return its finished call record. Refused or ValueError before any call.
 
     resolve looks up the hosts of URL tool servers (socket.getaddrinfo; tests pass a stand-in)."""
+    if memory not in ('live', 'none'):
+        raise ValueError('A task memory condition must be live or none.')
     task = load_task(layout.tasks, task_id)
     records = Records(layout.records)
     context = {'purpose': 'task', 'task': task.id}
@@ -409,6 +446,15 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
         _own_interpreter(layout, task)
         codex = _codex_version(layout)
         notes, skill_lines = [], []
+        if memory == 'live':
+            with _problem(notes, 'Could not finish pending memory registrations before the task'):
+                try:
+                    memory_ingest.backfill(layout)
+                except memory_ingest.BlockedRegistrations as error:
+                    notes.extend(error.notices)
+                    if on_memory_notice:
+                        for line in error.notices:
+                            on_memory_notice(line)
         _take_work(layout, records, store, root_fd, calls, context, notes)
         try:
             with _refusing('The version store cannot be used'):
@@ -417,11 +463,20 @@ def run_task(layout: Layout, task_id: str, *, resolve=socket.getaddrinfo) -> dic
                           'tree': store.tree_of(version_before)}
                 staged, settings = _stage(layout, store, version_before, task)
             with _refusing('The staged workspace could not be moved into work/'):
-                _move_in(layout, records, root_fd, staged, 'work', context, notes, skill_lines=skill_lines)
+                if memory == 'live' and 'memory' in settings.tool_servers:
+                    try:
+                        fields['proposal_workspace'] = proposal_files.prepare(staged)
+                    except BaseException:
+                        _discard(staged)
+                        raise
+                    fields['task_goal'] = task.sections['Goal']
+                fields['memory'] = _move_in(layout, records, root_fd, staged, 'work', context, notes,
+                                            skill_lines=skill_lines, memory=memory)
         except Refused as refused:              # work/ is sealed by now: put main's head back for the owner
             raise Refused(f'{refused}{_restore_work(layout, records, store, root_fd, context)}') from None
         write_home_config(layout, envelope, settings, resolve=resolve)
-        config, settings_problems = _compose(layout, envelope, settings, trial=False, resolve=resolve)
+        config, settings_problems = _compose(layout, envelope, settings, trial=False, resolve=resolve,
+                                             proposals='proposal_workspace' in fields)
         fields = {**_common_fields(codex, settings, config, limits), 'purpose': 'task', 'cost_class': 'online',
                   'task': task.id, 'probe': None, 'round': None, 'workspace': 'work', **fields,
                   'settings_problems': settings_problems + skill_lines}
@@ -461,11 +516,12 @@ def run_trial(layout: Layout, *, commit: str, round_id: str, task_id: str | None
             staged, settings = _stage(layout, store, commit_id, task)
         notes, skill_lines = [], []
         with _refusing('The staged workspace could not be moved into trial/'):
-            _move_in(layout, records, root_fd, staged, 'trial', context, notes, skill_lines=skill_lines)
+            snapshot = _move_in(layout, records, root_fd, staged, 'trial', context, notes,
+                                skill_lines=skill_lines, memory='trial', task_id=task_id)
         write_home_config(layout, envelope, work_settings, resolve=resolve)
         config, settings_problems = _compose(layout, envelope, settings, trial=True, resolve=resolve)
         fields = {**_common_fields(codex, settings, config, limits), 'purpose': 'trial', 'cost_class': 'meta',
-                  'task': task_id, 'probe': probe, 'round': round_id, 'workspace': 'trial',
+                  'task': task_id, 'probe': probe, 'round': round_id, 'workspace': 'trial', 'memory': snapshot,
                   'version_before': None, 'commit': commit_id, 'tree': tree,
                   'settings_problems': settings_problems + skill_lines}
         if task is not None:
@@ -548,14 +604,20 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     end = {'status': result.status, 'exit_code': result.exit_code, 'thread_id': result.thread_id,
            'usage': result.usage, 'command': result.command, 'ended': _now(), 'check': None,
            'subagent_threads': [], 'version_after': None}
+    collection = {'sessions': 'not_started', 'proposals': 'not_started' if 'proposal_workspace' in run.fields
+                  else 'not_requested', 'results': 'not_started'}
+    end.update(memory_collection=collection, memory_collection_complete=False)
     if run.name == 'trial':
         end['tree_after'] = None
     else:
         end['commit_failed'] = True                 # until the Lab's commit succeeds, whatever stops collecting
     problems = list(run.notes)
     try:
-        _collect(layout, records, store, run, call_id, call_dir, result, end, problems)
+        manual = _collect(layout, records, store, run, call_id, call_dir, result, end, problems)
     except BaseException as error:                  # only an interruption gets here: each step catches Exception
+        for phase, state in collection.items():
+            if state == 'collecting':
+                collection[phase] = 'interrupted'
         problems.append(f'Interrupted while collecting the results ({type(error).__name__}); the remaining steps were '
                         'not done')
         try:
@@ -564,15 +626,42 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
         except Exception:
             pass
         raise
-    return records.finish_call(call_id, {**end, 'problems': problems})
+    collection['results'] = 'finished'
+    call = records.finish_call(call_id, {**end, 'problems': problems})
+    if run.name == 'trial':
+        return call
+
+    # Registration reads only finalized call artifacts. A manual workspace receives the subsequent live view,
+    # even when the task itself requested no memory. Neither step rewrites the completed call.
+    after = []
+    if run.fields['memory']['condition'] == 'live':
+        with _problem(after, 'Memory registration failed'):
+            memory_ingest.backfill(layout, [call_id])
+    if manual is not None:
+        staged, settings = manual
+        context = {**run.context, 'call': call_id}
+        with _problem(after, 'The manual Lab workspace could not be refreshed'), _root(layout) as root_fd:
+            _move_in(layout, records, root_fd, staged, 'work', context, after, skills_prepared=True, manual=True)
+            write_home_config(layout, run.envelope, settings, resolve=run.resolve)
+    if after:
+        with _problem(after, 'Could not record the post-call notice'):
+            records.note('post_call', {'call': call_id, 'problems': list(after)})
+        return {**call, 'post_call_problems': after}
+    return call
 
 
 def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, call_id: str, call_dir: Path, result,
-             end: dict, problems: list[str]) -> None:
-    """Everything after the Codex call, into end and problems; each failing step becomes a problem line."""
+             end: dict, problems: list[str]) -> tuple[Path, Settings] | None:
+    """Collect the call and prepare the owner's next workspace in private staging before finalizing the record."""
+    collection = end['memory_collection']
+    session_problems = []
     if result.thread_id is not None:
-        with _problem(problems, 'Could not copy the session records'):
-            end['subagent_threads'] = collect_sessions(layout.lab_home, result.thread_id, call_dir / 'sessions')
+        collection['sessions'] = 'collecting'
+        with _problem(session_problems, 'Could not copy the session records'):
+            end['subagent_threads'] = collect_sessions(layout.lab_home, result.thread_id, call_dir / 'sessions',
+                                                        problems=session_problems)
+        collection['sessions'] = 'incomplete' if session_problems else 'complete'
+    problems.extend(session_problems)
     context = {**run.context, 'call': call_id}
     with _root(layout) as root_fd:
         entry = None
@@ -586,6 +675,21 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
                     raise ValueError('the workspace could not be sealed')
                 problems.extend(literature_logs.collect(layout.root / entry, run.fields['literature_workspace'],
                                                         call_dir))
+        if 'proposal_workspace' in run.fields:
+            collection['proposals'] = 'collecting'
+            try:
+                if entry is None:
+                    raise ValueError('the workspace could not be sealed')
+                notices = proposal_files.collect(layout.root / entry, run.fields['proposal_workspace'], call_dir)
+            except Exception as error:
+                collection['proposals'] = 'incomplete'
+                problems.append(f'Memory proposals could not be collected: {type(error).__name__}: {error}')
+            else:
+                collection['proposals'] = 'partial' if notices else 'complete'
+                problems.extend(notices)
+        end['memory_collection_complete'] = (collection['sessions'] == 'complete'
+                                             and collection['proposals'] in ('complete', 'not_requested'))
+        collection['results'] = 'collecting'
         out = call_dir / 'out'
         with _problem(problems, f'out/{run.out_name} could not be collected into the record'):
             if entry is None:
@@ -609,15 +713,15 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
         with _problem(problems, 'Could not write diff.patch'):
             with open(call_dir / 'diff.patch', 'x', encoding='utf-8') as stream:
                 stream.write(diff)
-        restaged, settings = [], None       # what of the new head's skills/ the owner's work/ lacks: told at once
-        with _problem(problems, 'work/ could not be replaced by the newest version'):
-            staged, head_settings = _stage(layout, store, store.head())
-            _move_in(layout, records, root_fd, staged, 'work', context, problems, skill_lines=restaged)
-            settings = head_settings
-        problems += [RESTAGED + line for line in restaged]
-        if settings is not None:            # the owner's manual Lab Codex uses the version now in work/
-            with _problem(problems, "The Lab's Codex configuration (codex-home/config.toml) could not be updated"):
-                write_home_config(layout, run.envelope, settings, resolve=run.resolve)
+        with _problem(problems, 'work/ could not be prepared from the newest version'):
+            staged, settings = _stage(layout, store, store.head())
+            try:
+                problems.extend(RESTAGED + line for line in materialise(staged))
+                return staged, settings
+            except BaseException:
+                _discard(staged)
+                raise
+    return None
 
 
 def _saver(store: VersionStore, run: _Run, call_id: str, end: dict):
@@ -684,8 +788,8 @@ def rename_in(staged: Path, root_fd: int, name: str) -> None:
 
 
 def move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name: str, context: dict,
-            problems: list[str]) -> None:
-    _move_in(layout, records, root_fd, staged, name, context, problems)
+            problems: list[str]) -> dict | None:
+    return _move_in(layout, records, root_fd, staged, name, context, problems, manual=name == 'work')
 
 
 def dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, reasons: list[str],
@@ -699,8 +803,8 @@ def settle(layout: Layout, records: Records, root_fd: int, entry: str, name: str
 
 
 def take_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, calls: list[dict], context: dict,
-              notes: list[str]) -> None:
-    _take_work(layout, records, store, root_fd, calls, context, notes)
+              notes: list[str], *, preserved: list[str] | None = None) -> None:
+    _take_work(layout, records, store, root_fd, calls, context, notes, preserved=preserved)
 
 
 def restore_work(layout: Layout, records: Records, store: VersionStore, root_fd: int, context: dict) -> str:

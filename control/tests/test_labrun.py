@@ -9,15 +9,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from rsi import labrun, workspace
-from rsi.codexrun import codex_version
+from rsi import labrun, memory_ingest, workspace
+from rsi.codexrun import CallResult, codex_version
 from rsi.init import recover
 from rsi.labrun import run_task, run_trial
+from rsi.meta import rollback
 from rsi.mockmodel import add_file, say, slow, with_usage
 from rsi.paths import Refused
 from rsi.sessions import collect_sessions
 from rsi.versions import VersionStore
 from tests.support import PASS_CHECK, Root, needs_codex, plant_programs
+from tests.test_cli import run as cli_run
 from tests.test_workspace import DEPTH, deny, few_open_files
 
 
@@ -86,6 +88,18 @@ class LabRuns(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in dest.iterdir()),
                          [f'rollout-1-{lead}.jsonl', f'rollout-2-{child}.jsonl'])
         self.assertEqual(collect_sessions(home, 'no-such-thread', home / 'dest2'), [])
+        (day / f'rollout-2-{child}.jsonl').unlink()
+        problems = []
+        self.assertEqual(collect_sessions(home, lead, home / 'missing-child', problems=problems), [child])
+        self.assertEqual(problems, [f'Missing session archive for thread {child}'])
+
+        def partial(source, target):
+            target.write(source.read(5))
+            raise OSError('session copy stopped')
+
+        with mock.patch('rsi.sessions.shutil.copyfileobj', side_effect=partial), self.assertRaises(OSError):
+            collect_sessions(home, lead, home / 'partial')
+        self.assertEqual(list((home / 'partial').iterdir()), [])
 
     def test_failed_check_and_inputs(self):
         with Root() as root:
@@ -103,6 +117,21 @@ class LabRuns(unittest.TestCase):
             call = run_task(root.layout, 'T1')
             self.assertEqual(call['version_before'], 'V0002')
             self.assertEqual(root.store.log()[0]['author'], 'manual or leftover')     # it cannot tell which
+
+    def test_task_before_install_preserves_legacy_memory_link_without_following_it(self):
+        with Root() as root:
+            root.add_task('T1')
+            notes = root.layout.owner / 'notes'
+            notes.write_text('Only the owner can read this.')
+            (root.layout.work / 'memory').symlink_to(notes)
+            root.model.push(say('done'))
+            call = run_task(root.layout, 'T1')
+            self.assertEqual((call['status'], call['version_before']), ('finished', 'V0001'))
+            kept, = root.layout.sealed.glob('*/legacy-work/memory')
+            self.assertEqual(kept.readlink(), notes)
+            self.assertEqual(notes.read_text(), 'Only the owner can read this.')
+            self.assertTrue(any(str(kept.relative_to(root.path)) in line for line in call['problems']))
+            self.assertTrue((root.layout.work / 'memory/status.json').is_file())
 
     def test_refusals_start_no_call(self):
         with Root() as root:
@@ -251,6 +280,14 @@ class MoreLabRuns(unittest.TestCase):
             # Codex had ended: the call keeps its status and usage, and says what was not done.
             self.assertEqual((second['status'], second['usage']['input_tokens']), ('finished', 0))
             self.assertTrue(any('KeyboardInterrupt' in line for line in second['problems']))
+            self.assertTrue(second['memory_collection_complete'])
+            self.assertEqual(second['memory_collection'], {'sessions': 'complete', 'proposals': 'not_requested',
+                                                          'results': 'interrupted'})
+            self.assertTrue(memory_ingest.eligible(second))
+            legacy = dict(second)
+            del legacy['memory_collection']
+            legacy['memory_collection_complete'] = False
+            self.assertTrue(memory_ingest.eligible(legacy))  # the recorded check was reached after proof collection
             # The collection left its sealed tree in the root and no work/: nothing runs until rsi recover has kept
             # the tree under sealed/ and put main's head back.
             with self.assertRaisesRegex(Refused, 'rsi recover'):
@@ -259,6 +296,100 @@ class MoreLabRuns(unittest.TestCase):
             root.model.push(say('ok'))
             self.assertEqual(run_task(root.layout, 'T1')['status'], 'finished')
             self.assertEqual((root.layout.work / 'left.txt').read_text(), 'what the interrupted run left')
+            self.assertTrue((root.layout.records / 'memory' / f'{second["id"]}.json').is_file())
+
+    def test_damaged_memory_preserves_work_and_the_no_memory_control(self):
+        with Root() as root:
+            root.add_task('T')
+            root.records.write_json('memory/R0001.json', {})
+            work = root.layout.work
+            (work / 'notes.md').write_text('keep me')
+            with self.assertRaisesRegex(Refused, 'no matching memory batch'):
+                run_task(root.layout, 'T')
+            self.assertEqual((work / 'notes.md').read_text(), 'keep me')
+            self.assertEqual(json.loads((work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+            with self.assertRaisesRegex(Refused, 'no matching memory batch'):
+                run_trial(root.layout, commit=root.store.head(), round_id='M0001', task_id='T')
+            self.assertEqual(root.records.calls(), [])
+
+            root.model.push(say('done'))
+            with mock.patch.object(memory_ingest, 'backfill', side_effect=AssertionError('none ran backfill')):
+                call = run_task(root.layout, 'T', memory='none')
+            self.assertEqual((call['status'], call['memory']['condition']), ('finished', 'none'))
+            self.assertFalse(call['problems'])
+            self.assertTrue(any('unavailable' in line for line in call['post_call_problems']))
+            work.rename(root.path / 'previous-work')
+            lines = []
+            recover(root.layout, lines)
+            self.assertTrue(any('restored' in line and 'unavailable' in line for line in lines))
+            self.assertEqual((work / 'notes.md').read_text(), 'keep me')
+            notices = []
+            version = rollback(root.layout, 'V0001', 'owner', notices=notices)
+            self.assertEqual(version, root.store.head())
+            self.assertTrue(any('unavailable' in line for line in notices))
+            self.assertEqual((work / 'AGENTS.md').read_text(), 'hello\n')
+            self.assertFalse((work / 'notes.md').exists())
+            self.assertEqual(json.loads((work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+
+    def test_failure_before_a_thread_starts_needs_no_registration(self):
+        with Root() as root:
+            root.add_task('T')
+            startup_failure = CallResult('failed', None, None, None, '', [])
+            with mock.patch('rsi.labrun.run_codex', return_value=startup_failure):
+                call = run_task(root.layout, 'T')
+            self.assertEqual((call['status'], call['memory_collection']['sessions']), ('failed', 'not_started'))
+            self.assertNotIn('post_call_problems', call)
+            self.assertEqual(memory_ingest.backfill(root.layout, [call['id']]), [])
+            info = memory_ingest.status(root.layout)
+            self.assertEqual((info['pending'], info['blocked_runs']), (0, []))
+
+    def test_each_live_task_reports_the_block_before_starting_codex(self):
+        with Root() as root:
+            root.add_task('T')
+            run = root.records.new_id('R')
+            root.records.start_call(run, {'purpose': 'task', 'task': 'T', 'thread_id': 'old'})
+            folder = root.records.call_dir(run) / 'sessions'
+            folder.mkdir()
+            (folder / 'old.jsonl').write_bytes(b'')
+            root.records.finish_call(run, {'status': 'finished'})
+            root.records.write_json(f'memory-failures/{run}.json', {'run': run, 'reason': 'TimeoutError: slow archive'})
+
+            def launch(*args, **kwargs):
+                self.assertIn(f'blocked for {run}: TimeoutError', sys.stderr.getvalue())
+                return CallResult('failed', None, None, None, '', [])
+
+            with mock.patch('rsi.labrun.run_codex', side_effect=launch) as launches:
+                for _ in range(2):
+                    code, _, error = cli_run('task', 'T', '--no-meta')
+                    self.assertEqual(code, 0, error)
+                    self.assertIn(f'rsi memory backfill {run}', error)
+            self.assertEqual(launches.call_count, 2)
+
+    def test_only_failed_session_collection_blocks_registration(self):
+        with Root() as root:
+            root.add_task('T')
+            (root.layout.work / 'codex').mkdir()
+            (root.layout.work / 'codex/settings.toml').write_text('[tool_servers.memory]\ncommand = "python3"\n')
+            for collection in ('collect_sessions', 'proposal_files.collect'):
+                with self.subTest(collection=collection):
+                    root.model.push(say('done'))
+                    with mock.patch('rsi.labrun.' + collection, side_effect=OSError('recording could not be copied')):
+                        call = run_task(root.layout, 'T')
+                    self.assertEqual(call['status'], 'finished')
+                    self.assertFalse(call['memory_collection_complete'])
+                    session_ok = collection == 'proposal_files.collect'
+                    self.assertEqual(memory_ingest.eligible(call), session_ok)
+                    legacy = dict(call)
+                    del legacy['memory_collection']
+                    self.assertEqual(memory_ingest.eligible(legacy), session_ok)
+                    report_path = root.layout.records / 'memory' / f'{call["id"]}.json'
+                    self.assertEqual(report_path.is_file(), session_ok)
+                    if session_ok:
+                        self.assertEqual(json.loads(report_path.read_bytes())['proposal_collection'], 'incomplete')
+                    else:
+                        self.assertIn(call['id'], memory_ingest.status(root.layout)['blocked_runs'])
+                        with self.assertRaisesRegex(ValueError, 'session archive'):
+                            memory_ingest.backfill(root.layout, [call['id']])
 
     def test_unusable_control_folders_never_block_a_run(self):
         with Root() as root:
@@ -447,7 +578,8 @@ class SealFirst(unittest.TestCase):
             self.assertEqual((root.layout.root / before['path'] / 'mine.txt').read_text(), 'an owner edit')
             self.assertEqual((after['call'], after['path']), (call['id'], f'sealed/{call["id"]}/work'))
             self.assertTrue((root.layout.root / after['path'] / 'notes' / 'n.md').is_file())
-            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'out'])   # main's head
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'memory', 'out'])
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'live')
             root.model.push(say('again'))
             second = run_task(root.layout, 'T1')
             self.assertEqual((second['status'], second['version_before']), ('finished', 'V0001'))
@@ -490,7 +622,7 @@ class SealFirst(unittest.TestCase):
                 with self.assertRaisesRegex(Refused, 'git checkout failed'): run_task(root.layout, 'T1')
             self.assertEqual((root.store.head(), (root.layout.work / 'mine.txt').read_text()),
                              ('V0002', 'an owner edit'))
-            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'mine.txt', 'out'])
+            self.assertEqual(sorted(os.listdir(root.layout.work)), ['.tmp', 'AGENTS.md', 'memory', 'mine.txt', 'out'])
             self.assertEqual((root.records.calls(), root.model.requests, leftovers(root)), ([], [], []))
 
     def test_an_oversize_file_with_a_long_chinese_name_never_reaches_a_version(self):

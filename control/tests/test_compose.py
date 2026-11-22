@@ -170,6 +170,14 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual((fs[root], fs[root + '/records'], fs[root + '/work'], fs[root + '/meta'],
                           fs[root + '/candidate']), ('deny', 'read', 'read', 'write', 'write'))
         self.assertEqual((c['features'], c['model_reasoning_effort']), ({'apps': False, 'plugins': False}, 'low'))
+        self.assertEqual(fs[str(self.layout.memory)], 'read')
+
+    def test_memory_uses_a_local_offline_server(self):
+        for table in ('url = "https://public.example/mcp"', 'command = "python3"\nnetwork = true'):
+            settings = self.settings('[tool_servers.memory]\n' + table + '\n')
+            config = lab_config(self.layout, self.envelope, settings, trial=False, resolve=no_lookup)
+            self.assertNotIn('memory', config['mcp_servers'])
+            self.assertIn('network off', tool_server_problems(self.envelope, settings, resolve=no_lookup)[0])
 
     @needs_codex
     def test_the_real_sandbox_accepts_the_flags(self):

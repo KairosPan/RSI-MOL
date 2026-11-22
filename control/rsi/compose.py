@@ -20,7 +20,7 @@ import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from rsi import programs
+from rsi import programs, proposal_files
 from rsi.paths import Layout, Refused
 from rsi.programs import NATIVE_TARGETS, TEMP_FOLDERS, inside as _inside, temp_folders  # noqa: F401 (kept names)
 from rsi.settings import EFFORTS, MODEL, ROLE, SETTINGS, Settings, is_workspace_path, show
@@ -166,7 +166,7 @@ def native_codex(layout: Layout) -> str:
 
 
 def _local_server(layout: Layout, workspace: Path, profile: str, name: str, server: dict, codex: str,
-                  permissions: dict) -> dict:
+                  permissions: dict, *, proposals: bool = False) -> dict:
     """A local tool server started through `codex sandbox` under the run's profile, or its _net variant when the
     server has network. Workspace paths in its command and arguments become absolute paths in this workspace.
     (load_settings has already left out a server whose paths leave the workspace.)
@@ -181,7 +181,16 @@ def _local_server(layout: Layout, workspace: Path, profile: str, name: str, serv
         command = str(workspace / os.path.normpath(command))
     args = [str(workspace / os.path.normpath(arg)) if is_workspace_path(arg, workspace) else arg
             for arg in server['args']]
-    if name == 'literature':
+    if name == 'memory':
+        # Only a managed live run can stage proposals. The snapshot itself stays read-only for this server.
+        permissions = copy.deepcopy(permissions)
+        rules = permissions[profile]['filesystem']
+        rules[str(workspace)] = 'read'
+        rules[str(layout.env)] = 'read'
+        rules.pop(str(layout.library), None)
+        if proposals:
+            rules[str(workspace / '.tmp' / proposal_files.DIRECTORY)] = 'write'
+    elif name == 'literature':
         # Poppler and Python only read env/. Keep this change private to the wrapper; the Lab can still install
         # packages. Trial's shared library is already read-only.
         permissions = copy.deepcopy(permissions)
@@ -194,6 +203,8 @@ def _local_server(layout: Layout, workspace: Path, profile: str, name: str, serv
     else:
         sandbox += ['-P', profile]
     in_sandbox = ['/usr/bin/env', 'PATH=' + _path(layout), 'TMPPREFIX=' + _tmpprefix(workspace)]
+    if name == 'memory' and proposals:
+        in_sandbox.append(proposal_files.ENABLE_ENV + '=1')
     if name == 'literature':
         # macOS's CA bundle is readable under :minimal. Homebrew OpenSSL's default certificate folder is not.
         in_sandbox.append('SSL_CERT_FILE=/etc/ssl/cert.pem')
@@ -296,11 +307,14 @@ def _local_address(text: str) -> bool:
                or form.is_reserved or form.is_unspecified or getattr(form, 'is_site_local', False) for form in forms)
 
 
-def _url_server_problems(envelope: dict, settings: Settings, resolve) -> dict[str, list[str]]:
+def _server_problems(envelope: dict, settings: Settings, resolve) -> dict[str, list[str]]:
     secrets = _tool_secrets(envelope)
     out = {}
     for name in sorted(settings.tool_servers):
         server = settings.tool_servers[name]
+        if name == 'memory' and ('url' in server or server.get('network')):
+            out[name] = [f'{SETTINGS}: the memory tool server must be a local server with network off']
+            continue
         if 'url' not in server:
             continue
         where, problems = f'{SETTINGS}: tool server {show(name)}', []
@@ -342,11 +356,11 @@ def tool_server_problems(envelope: dict, settings: Settings, *, resolve=socket.g
     """Problems of the tool servers reached by URL, one English line each, naming the server: a host that does not
     resolve, or resolves to any loopback, private, link-local, multicast, reserved or unspecified address; a bearer
     token whose variable the owner did not tie to exactly that host in rsi.tool_secrets."""
-    return [line for lines in _url_server_problems(envelope, settings, resolve).values() for line in lines]
+    return [line for lines in _server_problems(envelope, settings, resolve).values() for line in lines]
 
 
 def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: bool, interactive: bool = False,
-               resolve=socket.getaddrinfo, codex: str | None = None) -> dict:
+               resolve=socket.getaddrinfo, codex: str | None = None, proposals: bool = False) -> dict:
     """The complete Codex configuration of a Lab run in work/ (trial=False) or trial/ (trial=True).
 
     Disabled ids missing from the envelope are added to settings.problems (once each) and ignored. Tool servers
@@ -372,13 +386,14 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     for name, role in settings.roles.items():
         agents[name] = {'description': role['description'],
                         'config_file': str(role_folder(layout, trial=trial) / (name + '.toml'))}
-    refused = _url_server_problems(envelope, settings, resolve)
+    refused = _server_problems(envelope, settings, resolve)
     kept = {name: server for name, server in settings.tool_servers.items() if name not in refused}
     if any('url' not in server for server in kept.values()):
         codex = codex or native_codex(layout)
     permissions = profiles(layout, envelope)
     servers = {name: dict(server) if 'url' in server
-               else _local_server(layout, workspace, base, name, server, codex, permissions)
+               else _local_server(layout, workspace, base, name, server, codex, permissions,
+                                  proposals=proposals and not (trial or interactive))
                for name, server in kept.items()}
     config.update({
         'features': features,
@@ -401,6 +416,7 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
     there would be standing instructions Meta wrote for itself; its duties are the owner's, sent in the prompt.
     As in the Lab profiles, there is no entry for meta/.codex or candidate/.codex (see _filesystem)."""
     filesystem = {':minimal': 'read', str(layout.root): root_rule(), str(layout.records): 'read',
+                  str(layout.memory): 'read',
                   str(layout.work): 'read', str(layout.library): 'read', str(layout.env): 'read',
                   str(layout.meta): 'write', str(layout.candidate): 'write'}
     for folder in _tool_folders():

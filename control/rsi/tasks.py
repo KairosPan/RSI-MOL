@@ -72,6 +72,13 @@ def load_task(tasks: Path, task_id: str) -> Task:
     folder = Path(tasks) / task_id
     path = folder / TASK_FILE
     try:
+        # Directory lookup may ignore case. The stored task identity must use the owner's spelling.
+        names = os.listdir(tasks)
+        if task_id not in names:
+            match = next((name for name in sorted(names) if name.casefold() == task_id.casefold()), None)
+            if match is not None:
+                raise ValueError(f'Task IDs are case-sensitive. Use {match} for this task.')
+            raise FileNotFoundError
         text = path.read_bytes().decode('utf-8')
     except FileNotFoundError:
         raise ValueError(f'There is no task {task_id}: {path} does not exist.') from None
@@ -85,6 +92,16 @@ def load_task(tasks: Path, task_id: str) -> Task:
     check, inputs = folder / CHECK_FILE, folder / INPUT_FOLDER
     return Task(task_id, {name: sections[name] for name in SECTIONS}, folder,
                 check if check.is_file() else None, inputs if inputs.is_dir() else None)
+
+
+def same_task_directory(folder: Path, other: Path) -> bool:
+    """Confirm a historical case variant actually resolves to the same owner task directory."""
+    if folder.name.casefold() != other.name.casefold():
+        return False
+    try:
+        return folder.is_dir() and folder.samefile(other)
+    except FileNotFoundError:
+        return False
 
 
 def results_sentence(name: str) -> str:

@@ -229,6 +229,222 @@ class Replies(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for line in self.runtime.logfile.read_text().splitlines()]
 
+    def read_pages(self, manifest, **selection):
+        session = server.Session(Literature(self.runtime))
+        args = {'document_id': manifest['document_id'], **selection}
+        pages = []
+        while True:
+            result = session.tool_call('read_document', args)
+            self.assertLessEqual(len(server.encode(result)), server.NATIVE_RECEIPT_BYTES)
+            reply = json.loads(result['content'][0]['text'])
+            self.assertFalse(result['isError'], reply.get('errors'))
+            page = reply['data']
+            if pages:
+                self.assertEqual(pages[-1]['char_range'][1], page['char_range'][0])
+            self.assertGreater(page['char_range'][1], page['char_range'][0])
+            self.assertEqual(reply['continuation']['next_cursor'], page['next_cursor'])
+            pages.append(page)
+            if not page['next_cursor']:
+                return pages
+            args['cursor'] = page['next_cursor']
+
+    def test_read_cursor_delivers_each_fitting_block_whole(self):
+        paragraphs = [f'Method {n}: ' + '"中\\' * 72 for n in range(48)]
+        xml = '<article><body><sec>' + ''.join('<p>' + p + '</p>' for p in paragraphs) + '</sec></body></article>'
+        manifest = self.runtime.ingest(xml.encode(), 'application/xml', {})
+        for budget in (8000, 15000, 65536):
+            pages = self.read_pages(manifest, max_bytes=budget)
+            self.assertGreater(len(pages), 1)
+            self.assertEqual(''.join(p['text'] for p in pages), '\n\n'.join(paragraphs))
+            rows = [r for p in pages for r in p['passages']]
+            self.assertTrue(all(r['block_complete'] for r in rows))
+            self.assertEqual([r['locator'] for r in rows], [b['locator'] for b in manifest['blocks']])
+
+    def test_single_oversized_block_progresses_with_correct_utf8_byte_ranges(self):
+        text = '中"\\☃' * 6000
+        xml = '<article><body><p>' + text + '</p></body></article>'
+        metadata = {'license': 'License terms. ' * 3000, 'paper_ref': 'PMC123'}
+        manifest = self.runtime.ingest(xml.encode(), 'application/xml', metadata)
+        pages = self.read_pages(manifest, locator=manifest['blocks'][0]['locator'], max_bytes=65536)
+        self.assertGreater(len(pages), 1)
+        self.assertEqual(''.join(p['text'] for p in pages), text)
+        for page in pages:
+            row, = page['passages']
+            self.assertFalse(row['block_complete'])
+            self.assertEqual(row['source_metadata'], {'paper_ref': 'PMC123'})
+            self.assertEqual(row['omitted_source_metadata_fields'], ['license'])
+            low, high = row['byte_range']
+            self.assertEqual(text.encode()[low:high].decode(), page['text'])
+
+    def test_fixed_coverage_warnings_leave_room_for_a_readable_pdf_line(self):
+        source = self.runtime.ingest(PDF, 'application/pdf', {})
+        binding = {k: source[k] for k in ('document_id', 'document_version', 'source_sha256')}
+        line = '<page width="100" height="100"><line xMin="0" xMax="8" yMin="0" yMax="8">'
+        line += '<word xMin="0" xMax="8" yMin="0" yMax="8">Known</word></line></page>'
+        bbox = ('<doc>' + line + '<page width="100" height="100"/>' * 180 + '</doc>').encode()
+        parser_coverage = {'unread_pages': list(range(2, 182)), 'review_status': 'unreviewed',
+                           'limitations': ['x' * 30000], 'parser_notes': ['y' * 10000]}
+        manifest = self.runtime.ingest(bbox, 'application/vnd.rsi.poppler-bbox+xml',
+                                       {'derived_from': binding, 'extraction_coverage': parser_coverage})
+        page, = self.read_pages(manifest, locator=manifest['blocks'][0]['locator'])
+        row, = page['passages']
+        self.assertTrue(row['block_complete'])
+        self.assertEqual(row['text'], 'Known')
+        self.assertEqual(row['source_metadata']['derived_from'], binding)
+        extracted = row['source_metadata']['extraction_coverage']
+        self.assertEqual(extracted['review_status'], 'unreviewed')
+        self.assertEqual(extracted['omitted_limitations'], 1)
+        self.assertEqual(extracted['omitted_coverage_fields'], {'parser_notes': 1})
+        self.assertEqual(page['coverage']['extraction_status'], 'partial')
+        self.assertEqual(page['coverage']['omitted_limitations'], len(manifest['coverage']['limitations']) - 2)
+
+    def test_fixed_optional_metadata_does_not_hide_a_short_source_block(self):
+        metadata = {'license': 'Readable license text. ' * 2800, 'paper_ref': 'PMC123', 'provider': 'local'}
+        manifest = self.runtime.ingest(b'<article><body><p>Readable.</p></body></article>', 'application/xml', metadata)
+        page, = self.read_pages(manifest)
+        row, = page['passages']
+        self.assertEqual(row['text'], 'Readable.')
+        self.assertTrue(row['block_complete'])
+        self.assertEqual(row['source_metadata'], {'paper_ref': 'PMC123', 'provider': 'local'})
+        self.assertEqual(row['omitted_source_metadata_fields'], ['license'])
+
+    def test_unrepresentable_passage_metadata_allows_continued_text_without_an_invalid_receipt(self):
+        text = 'word ' * 1000 + 'end'
+        xml = '<article><body><p id="' + ('x' * 60000) + '">' + text + '</p></body></article>'
+        manifest = self.runtime.ingest(xml.encode(), 'application/xml', {})
+        pages = self.read_pages(manifest)
+        self.assertEqual(''.join(p['text'] for p in pages), text)
+        for page in pages:
+            self.assertEqual(page['passages'], [])
+            self.assertEqual(page['omitted_passage']['locator'], manifest['blocks'][0]['locator'])
+
+    def test_large_reading_index_keeps_its_acquisition_receipt(self):
+        data = {'document_id': 'doc_' + 'a' * 64, 'document_version': 'b' * 64, 'source_sha256': 'c' * 64,
+                'media_type': 'application/xml', 'content_scope': 'full_text', 'references': ['ref' * 200] * 100,
+                'sections': ['Methods'], 'pages': []}
+        response = {'status': 'ok', 'coverage': {'verified_paper_identifiers': ['doi']}, 'data': data,
+                    'provenance': {'provider': 'local'}, 'continuation': {}, 'errors': []}
+        reply = server.Session(Stub(self.runtime, response)).tool_call('acquire_fulltext', {'source_id': 'large'})
+        self.assertFalse(reply['isError'])
+        self.assertLessEqual(len(server.encode(reply)), server.NATIVE_RECEIPT_BYTES)
+        shown = json.loads(reply['content'][0]['text'])
+        self.assertEqual(shown['coverage'], response['coverage'])
+        self.assertEqual(shown['data']['omitted_reading_index_items'], {'references': 100, 'sections': 1, 'pages': 0})
+        for key in ('document_id', 'document_version', 'source_sha256', 'media_type', 'content_scope'):
+            self.assertEqual(shown['data'][key], data[key])
+
+    def test_oversized_paper_page_retains_all_identities_and_the_provider_cursor(self):
+        papers = [{'paper_id': f'europe_pmc:MED:{i}', 'provider': 'europe_pmc', 'pmid': str(i),
+                   'abstract': 'Large abstract. ' * 900, 'title': f'Paper {i}'} for i in range(8)]
+        continuation = {'next_cursor': 'next-complete-page', 'complete_for_query': False}
+        response = {'status': 'partial', 'data': {'papers': papers}, 'coverage': {'returned': 8},
+                    'continuation': continuation, 'provenance': {'provider': 'europe_pmc'}, 'errors': []}
+        for name in ('search_papers', 'get_citations'):
+            reply = server.Session(Stub(self.runtime, response)).tool_call(name, {})
+            shown = json.loads(reply['content'][0]['text'])
+            self.assertFalse(reply['isError'])
+            self.assertEqual(shown['continuation'], continuation)
+            self.assertEqual(shown['coverage'], response['coverage'])
+            returned = shown['data']['papers']
+            self.assertTrue(any(p['abstract'] == papers[0]['abstract'] for p in returned))
+            self.assertTrue(any('next_abstract_cursor' in p for p in returned))
+            for original, row in zip(papers, shown['data']['papers'], strict=True):
+                self.assertEqual(row['paper_id'], original['paper_id'])
+                self.assertTrue(row['abstract'])
+                self.assertTrue(original['abstract'].startswith(row['abstract']))
+            self.assertLessEqual(len(server.encode(reply)), server.NATIVE_RECEIPT_BYTES)
+
+    def test_abstract_can_be_read_to_the_end_without_mixing_provider_versions(self):
+        text = 'Multi-byte 中\"\\🌳' * 2400
+        paper = dict(paper_id='pubmed:1', provider='pubmed', title='Article', abstract=text,
+                     abstract_truncated=False, authors=['Author'], content_scope='abstract')
+        response = dict(status='ok', data={'paper': paper}, coverage={}, errors=[], continuation={}, provenance={})
+        session = server.Session(Stub(self.runtime, response))
+        args = {'provider': 'pubmed', 'paper_ref': paper['paper_id']}
+        full = ''
+        while True:
+            reply = session.tool_call('get_paper', args)
+            self.assertFalse(reply['isError'])
+            self.assertLessEqual(len(server.encode(server.encode(reply).decode())), 64 * 1024)
+            shown = json.loads(reply['content'][0]['text'])['data']['paper']
+            self.assertEqual(shown['abstract_range'][0], len(full))
+            full += shown['abstract']
+            self.assertEqual(shown['abstract_range'][1], len(full))
+            self.assertEqual(shown['authors'], paper['authors'])
+            if 'next_abstract_cursor' not in shown:
+                self.assertFalse(shown['abstract_truncated'])
+                break
+            args['abstract_cursor'] = shown['next_abstract_cursor']
+        self.assertEqual(full, text)
+        paper['abstract_truncated'] = True
+        last = session.tool_call('get_paper', args)
+        self.assertTrue(json.loads(last['content'][0]['text'])['data']['paper']['abstract_truncated'])
+        paper['abstract'] += 'Correction.'
+        self.assertTrue(session.tool_call('get_paper', args)['isError'])
+
+    def test_search_page_above_32_kib_keeps_its_abstracts_and_authors(self):
+        from seed.work.tools.memory import query
+
+        self.assertEqual((server.NATIVE_RECEIPT_BYTES, server.NATIVE_TEXT_BYTES),
+                         (query.NATIVE_RECEIPT_BYTES, query.NATIVE_TEXT_BYTES))
+        papers = [dict(paper_id=f'pubmed:{n}', provider='pubmed', abstract='Ordinary abstract. ' * 190,
+                       authors=['First author'], content_scope='abstract') for n in range(10)]
+        response = dict(status='ok', data={'papers': papers}, coverage={}, provenance={}, errors=[], continuation={})
+        reply = server.Session(Stub(self.runtime, response)).tool_call('search_papers', {})
+        self.assertGreater(len(server.encode(reply)), 32 * 1024)
+        self.assertEqual(json.loads(reply['content'][0]['text'])['data']['papers'], papers)
+
+    def test_default_read_delivers_a_large_single_block_whole(self):
+        text = 'Methods for this group. ' * 850
+        manifest = self.runtime.ingest(f'<article><body><p>{text}</p></body></article>'.encode(), 'application/xml', {})
+        page, = self.read_pages(manifest)
+        row, = page['passages']
+        self.assertEqual(row['text'], text.rstrip())
+        self.assertTrue(row['block_complete'])
+
+    def test_titles_that_exceed_a_page_can_be_retrieved_individually(self):
+        papers = [dict(paper_id=f'pubmed:{i}', provider='pubmed', title='文' * 4000 + str(i),
+                       abstract='一组摘要。' * 600, url='https://example.org/' + 'a' * 400) for i in range(10)]
+        cursor = {'next_cursor': 'next-provider-page', 'complete_for_query': False}
+        response = dict(status='partial', data={'papers': papers}, coverage={}, provenance={}, errors=[], continuation=cursor)
+        reply = server.Session(Stub(self.runtime, response)).tool_call('search_papers', {})
+        self.assertFalse(reply['isError'])
+        page = json.loads(reply['content'][0]['text'])
+        self.assertEqual(page['continuation'], cursor)
+        self.assertEqual(len(page['data']['papers']), len(papers))
+        self.assertTrue(any('title' in row.get('omitted_fields', []) for row in page['data']['papers']))
+        for row, paper in zip(page['data']['papers'], papers):
+            self.assertEqual(row['paper_id'], paper['paper_id'])
+            self.assertTrue(row['abstract'])
+            if 'title' in row:
+                self.assertEqual(row['title'], paper['title'])
+            else:
+                self.assertIn('title', row['omitted_fields'])
+            if len(row['abstract']) < len(paper['abstract']):
+                self.assertIn('next_abstract_cursor', row)
+        single = {**response, 'data': {'paper': papers[0]}}
+        reply = server.Session(Stub(self.runtime, single)).tool_call('get_paper', {'paper_ref': papers[0]['paper_id']})
+        self.assertEqual(json.loads(reply['content'][0]['text'])['data']['paper'], papers[0])
+
+    def test_broad_pdf_read_retains_line_boxes_and_locator_restores_word_boxes(self):
+        word = '<word xMin="5" xMax="15" yMin="10" yMax="25">Text</word>'
+        line = '<line xMin="5" xMax="90" yMin="10" yMax="25">' + word * 24 + '</line>'
+        bbox = ('<doc><page width="100" height="100">' + line * 40 + '</page></doc>').encode()
+        source = self.runtime.ingest(PDF, 'application/pdf', {})
+        binding = {k: source[k] for k in ('document_id', 'document_version', 'source_sha256')}
+        manifest = self.runtime.ingest(bbox, 'application/vnd.rsi.poppler-bbox+xml', {'derived_from': binding})
+        pages = self.read_pages(manifest)
+        rows = [r for p in pages for r in p['passages']]
+        self.assertEqual([r['locator'] for r in rows], [b['locator'] for b in manifest['blocks']])
+        self.assertTrue(all(r['block_complete'] for r in rows))
+        self.assertLessEqual(len(pages), 3)
+        first = rows[0]
+        self.assertEqual(first['source_locator']['omitted_word_boxes'], 24)
+        detail, = self.read_pages(manifest, locator=first['locator'])
+        coords = detail['passages'][0]['source_locator']
+        self.assertEqual(len(coords['words']), 24)
+        self.assertEqual(first['source_locator']['bbox'], coords['bbox'])
+
     def test_a_replaced_reply_keeps_its_sources_hosts_and_archived_document(self):
         provenance = {'provider': 'europe_pmc', 'attempt_count': 2, 'download_hosts': ['files.example.org'],
                       'requests': [{'url': 'https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=x'}]}
