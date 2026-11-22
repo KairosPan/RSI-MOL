@@ -221,14 +221,46 @@ class MemorySnapshot(unittest.TestCase):
         self.state.objects[3]['content'].update(provider='openalex', paper_ref='W456')
         work, _ = self.place()
         queries = ['MED:123', 'europe_pmc:MED:123', 'pubmed:123', 'W456', 'https://openalex.org/W456',
-                   '10.1/oa', 'methods section', 'MED:999', 'pubmed:999', 'W999', 'section', '000007', 'med',
+                   '10.1/oa', 'methods section', 'W999', 'MED:999', 'pubmed:999', 'section', '000007', 'med',
                    'passage_' + 'f' * 64]
         results = self.values(work, [('recall_passages', {'query': query}) for query in queries])
-        for result, expected in zip(results[:7], [['doc_a']] * 3 + [['doc_b']] * 3 + [['doc_b', 'doc_a']]):
+        for result, expected in zip(results[:8], [['doc_a']] * 3 + [['doc_b']] * 3 + [['doc_b', 'doc_a']] * 2):
             self.assertEqual([d['document_id'] for d in result['results'][0]['deliveries']], expected)
-        self.assertTrue(all(r['results'] == [] for r in results[7:]))
+        self.assertTrue(all(r['results'] == [] for r in results[8:]))
         for result in self.values(work, [('lookup_sources', {'query': key}) for key in ('MED:123', 'W456')]):
             self.assertEqual([r['type'] for r in result['results']], ['paper', 'acquisition', 'passage'])
+
+    def test_unknown_provider_shorthand_matches_literal_text_and_titles(self):
+        self.state.objects[0]['content']['title'] = 'W12 paper on PAT:marker'
+        self.state.objects[-1]['content']['text'] = 'W303 and w1118. MED:label, not MED separated from 303.'
+        work, _ = self.place()
+        queries = ['W303', 'W1118', 'med:LABEL', 'W30', 'MED:303', 'PAT:label',
+                   'openalex:W303', 'https://openalex.org/w1118', 'europe_pmc:MED:label']
+        for tool in ('recall_passages', 'recall_objects'):
+            responses = self.values(work, [(tool, {'query': q}) for q in queries])
+            for query, response in zip(queries, responses):
+                ids = [row.get('object', row)['id'] for row in response['results']]
+                self.assertEqual(ids, ['paragraph'] if query in queries[:3] else [], (tool, query))
+        queries = ['w12', 'PAT:MARKER', 'W1', 'med:marker', 'https://openalex.org/W12', 'europe_pmc:pat:marker']
+        titles = self.values(work, [('lookup_sources', {'query': q}) for q in queries])
+        for query, response in zip(queries, titles):
+            types = [row['type'] for row in response['results']]
+            self.assertEqual(types, ['paper', 'acquisition', 'passage'] if query in queries[:2] else [], query)
+        title, missing = self.values(work, [('recall_passages', {'query': 'W303', 'paper': p}) for p in ('W12', 'W303')])
+        self.assertEqual([d['document_id'] for d in title['results'][0]['deliveries']], ['doc_a'])
+        self.assertEqual(missing['results'], [])
+
+    def test_acquisition_or_delivery_shorthand_precedes_literal_title_and_text(self):
+        self.state.objects[0]['content']['title'] = 'W303 and PAT:marker appear in this unrelated title'
+        self.state.objects[3]['content']['paper_ref'] = 'openalex:W303'
+        self.state.deliveries[-2]['paper_ref'] = 'europe_pmc:PAT:marker'
+        self.state.objects[-1]['content']['text'] = 'Unrelated mentions of W303 and PAT:marker.'
+        work, _ = self.place()
+        for query, doc, types in [('W303', 'doc_b', ['acquisition', 'passage']), ('PAT:marker', 'doc_a', ['passage'])]:
+            sources, passages = self.values(work, [('lookup_sources', {'query': query}), ('recall_passages', {'query': query})])
+            self.assertEqual([r['type'] for r in sources['results']], types)
+            for row in (sources['results'][-1], passages['results'][0]):
+                self.assertEqual([d['document_id'] for d in row['deliveries']], [doc])
 
     def test_none_has_only_status_and_caps_apply_to_whole_projected_revisions(self):
         work, meta = self.place('none')

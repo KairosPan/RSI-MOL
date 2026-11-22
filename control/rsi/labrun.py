@@ -647,13 +647,13 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
              end: dict, problems: list[str]) -> tuple[Path, Settings] | None:
     """Collect the call and prepare the owner's next workspace in private staging before finalizing the record."""
     collection = end['memory_collection']
-    collection['sessions'] = 'collecting'
     session_problems = []
     if result.thread_id is not None:
+        collection['sessions'] = 'collecting'
         with _problem(session_problems, 'Could not copy the session records'):
             end['subagent_threads'] = collect_sessions(layout.lab_home, result.thread_id, call_dir / 'sessions',
                                                         problems=session_problems)
-    collection['sessions'] = 'complete' if result.thread_id and not session_problems else 'incomplete'
+        collection['sessions'] = 'incomplete' if session_problems else 'complete'
     problems.extend(session_problems)
     context = {**run.context, 'call': call_id}
     with _root(layout) as root_fd:

@@ -165,6 +165,24 @@ class Ledger(unittest.TestCase):
         self.assertEqual(report['reasons'], {'invalid invocation_id': 1})
         self.assertEqual(report['delivery_count'], 1)
 
+    def test_threadless_startup_failures_need_no_registration_in_old_records(self):
+        failed = self.call(None, status='failed', thread_id=None, memory_collection_complete=False,
+                           memory_collection={'sessions': 'incomplete', 'proposals': 'not_requested', 'results': 'finished'})
+        timed_out = self.call(None, status='timed_out', thread_id=None)
+        # Evidence of a session still warrants a diagnostic, even when the lead ID is missing.
+        orphan_archive = self.call([], status='failed', thread_id=None)
+        missing_archive = self.call(None, status='failed')
+        with_evidence = self.call([self.event(1, 'read_document', {'passages': [self.row]})], status='failed')
+        self.assertEqual(ingest.backfill(self.layout, [failed, timed_out]), [])
+        report, = ingest.backfill(self.layout)
+        self.assertEqual((report['run'], report['deliveries']), (with_evidence, {'passage': 1}))
+        expected = [orphan_archive, missing_archive]
+        info = ingest.status(self.layout)
+        self.assertEqual(info['pending'], len(expected))
+        self.assertEqual(info['blocked_runs'], expected)
+        self.assertEqual(set(info['blocked_reasons']), set(expected))
+        self.assertEqual(set(ledger.load(self.layout).reports), {with_evidence})
+
     def test_legacy_collection_uses_provable_stages_and_keeps_the_committed_batch(self):
         evidence = self.event(1, 'read_document', {'passages': [self.row]})
         interrupted = ['Interrupted while collecting the results (KeyboardInterrupt); the remaining steps were not done']

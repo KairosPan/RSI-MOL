@@ -14,6 +14,7 @@ NATIVE_RECEIPT_BYTES = 32 * 1024
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 RECENT_DELIVERIES = 3
 ID_FIELDS = ('paper_id', 'doi', 'pmid', 'pmcid')
+PROVIDER_SHORTHAND = re.compile(r'w\d+|(?:med|pmc|ppr|agr|pat|cba):[a-z0-9._-]+')
 
 
 def encode(value):
@@ -22,10 +23,9 @@ def encode(value):
 
 def normalized(value):
     key = str(value or '').strip().casefold()
-    # These provider-relative IDs have unambiguous namespaces, even before a paper is indexed.
-    if re.fullmatch(r'(?:med|pmc|ppr|agr|pat|cba):[a-z0-9._-]+', key):
-        return 'europe_pmc:' + key
-    openalex = re.fullmatch(r'(?:https?://openalex\.org/)?(w\d+)', key)
+    if PROVIDER_SHORTHAND.fullmatch(key):
+        return ('europe_pmc:' if ':' in key else 'openalex:') + key
+    openalex = re.fullmatch(r'https?://openalex\.org/(w\d+)', key)
     if openalex:
         return 'openalex:' + openalex[1]
     if re.fullmatch(r'[0-9a-f]{40}', key):
@@ -38,13 +38,6 @@ def normalized(value):
         if key.startswith(prefix):
             return key[len(prefix):].strip()
     return key
-
-
-def source_identifier(query):
-    key = normalized(query)
-    return bool(re.fullmatch(r'(?:europe_pmc|openalex|semantic_scholar|unpaywall):\S+|'
-                             r'10\.\d+/\S+|doc_[\w-]+|pmc\d+', key)
-                or re.fullmatch(r'(?:pmid|pubmed):\s*\d+', query.strip(), re.I))
 
 
 # In these scripts whitespace is not a reliable word boundary. Keep adjacent pairs
@@ -90,6 +83,16 @@ def word_forms(word):
 def lexical_score(query_forms, text):
     terms = {form for word in words(text, query=False) for form in word_forms(word)}
     return sum(not group.isdisjoint(terms) for group in query_forms)
+
+
+def text_matcher(query, *, literal=False):
+    """Return the number of terms and a scorer. Treat ambiguous short IDs as one literal token."""
+    raw = query.strip().casefold()
+    if literal or PROVIDER_SHORTHAND.fullmatch(raw):
+        pattern = re.compile(r'(?<!\w)' + re.escape(raw) + r'(?!\w)')
+        return 1, lambda text: int(bool(pattern.search(text.casefold())))
+    forms = [word_forms(w) for w in words(query, query=True)]
+    return len(forms), lambda text: lexical_score(forms, text)
 
 
 def passage_text(content):
@@ -247,7 +250,7 @@ class Snapshot:
         self.by_identifier = defaultdict(list)
         self.paper_refs = {}
         self.paper_records = {}
-        self.delivery_identifiers = set()
+        self.source_identifiers = set()
         self.challengers = defaultdict(list)
         paper_history = defaultdict(list)
         if self.status['condition'] != 'none':
@@ -279,13 +282,15 @@ class Snapshot:
                 self.index_paper(row, paper_history[obj['id']])
             elif kind == 'acquisition':
                 self.acquisitions.append(row)
+                self.source_identifiers.update((self.request(content), normalized(content.get('document_id'))))
                 if all(doc_key(content)):
                     self.by_doc[doc_key(content)].append(row)
                     self.by_hash[content['source_sha256']].append(row)
             elif kind == 'passage':
                 self.passages.append(row)
-                self.delivery_identifiers.update(value for d in row['deliveries']
-                                                 for value in (normalized(d.get('document_id')), self.request(d)) if value)
+                for d in row['deliveries']:
+                    self.source_identifiers.update((self.request(d), normalized(d.get('document_id'))))
+        self.source_identifiers.discard('')
 
     def index_paper(self, head, history):
         """Fill unreported identifiers using compatible observations from this snapshot."""
@@ -367,13 +372,23 @@ class Snapshot:
                 found[row['object']['id']] = row
         return found
 
+    def source_query(self, query, key):
+        if key in self.by_identifier or key in self.source_identifiers:
+            return True
+        raw = query.strip().casefold()
+        if PROVIDER_SHORTHAND.fullmatch(raw):
+            return False
+        return bool(re.fullmatch(r'(?:europe_pmc|openalex|semantic_scholar|unpaywall):\S+|'
+                                 r'10\.\d+/\S+|doc_[\w-]+|pmc\d+', key)
+                    or re.fullmatch(r'(?:pmid|pubmed):\s*\d+', raw))
+
     def candidates(self, query, *, allow_title=True):
         key = normalized(query)
         papers = list(self.by_identifier.get(key, []))
-        if allow_title and not papers and key and not source_identifier(query):
-            terms = [word_forms(w) for w in words(query, query=True)]
+        if allow_title and key and not self.source_query(query, key):
+            count, score = text_matcher(query)
             papers = [row for row in self.latest.values() if row['object']['content']['type'] == 'paper'
-                      and terms and lexical_score(terms, row['object']['content'].get('title') or '') == len(terms)]
+                      and count and score(row['object']['content'].get('title') or '') == count]
         refs = {ref for p in papers for ref in self.paper_refs[p['object']['id']]}
         if key:
             refs.add(key)
@@ -480,9 +495,8 @@ class Snapshot:
 
     def recall_objects(self, query, kind=None):
         key = normalized(query)
-        terms = [word_forms(w) for w in words(query, query=True)]
-        source_query = source_identifier(query) or key in self.by_identifier or key in self.delivery_identifiers
-        literal = re.compile(r'(?<!\w)' + re.escape(query.strip().casefold()) + r'(?!\w)') if source_query else None
+        source_query = self.source_query(query, key)
+        _, score = text_matcher(query, literal=source_query)
         matches = []
         for row in self.latest.values():
             obj = row['object']
@@ -494,9 +508,9 @@ class Snapshot:
             if source_query:
                 # Namespace expansion is for identity comparisons, never for full-text keywords.
                 exact = exact or key in {self.request(obj['content']), normalized(obj['content'].get('document_id'))}
-                lexical = int(bool(literal.search(text)))
             else:
-                lexical = lexical_score(terms, ' '.join([obj['id'], obj['origin']['task'], text]))
+                text = ' '.join([obj['id'], obj['origin']['task'], text])
+            lexical = score(text)
             if exact or lexical:
                 challenge = any(ref['relation'] == 'challenges' for field in ('source_refs', 'object_refs')
                                 for ref in obj.get(field, ()))
@@ -528,9 +542,9 @@ class Snapshot:
 
     def recall(self, query, paper, source_sha256, task):
         key = normalized(query)
-        terms = [word_forms(w) for w in words(query, query=True)]
-        papers, refs, acquisitions = self.candidates(query, allow_title=False)
-        source_query = bool(papers or acquisitions or key in self.delivery_identifiers or source_identifier(query))
+        _, score = text_matcher(query)
+        _, refs, acquisitions = self.candidates(query, allow_title=False)
+        source_query = self.source_query(query, key)
         passage_address = re.fullmatch(r'(?:passage_)?[0-9a-f]{64}', key)
         filters = [(refs, acquisitions)] if source_query else []
         if paper:
@@ -548,7 +562,7 @@ class Snapshot:
             exact = source_query or key in (normalized(obj['id']), normalized(content['source_sha256']))
             if passage_address and not exact:
                 continue
-            lexical = 0 if source_query else lexical_score(terms, passage_text(content))
+            lexical = 0 if source_query else score(passage_text(content))
             if lexical or exact:
                 rank = (exact, lexical, len({d['task'] for d in kept}), kept[-1]['at'], kept[-1]['seq'], obj['id'])
                 matches.append((rank, row, kept, sources))

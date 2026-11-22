@@ -331,6 +331,11 @@ def eligible(call, *, explain=False):
         raise ValueError('Invalid memory metadata in call record')
     if memory.get('condition', 'live') != 'live':
         return False
+    # Codex can fail or time out before starting a thread. Older collectors marked this as incomplete.
+    if call['status'] != 'finished' and call.get('thread_id') is None and not call.get('subagent_threads'):
+        files = call.get('files', {})
+        if isinstance(files, dict) and not any(path.partition('/')[0] == 'sessions' for path in files):
+            return False
     reason = _session_problem(call)
     if reason and explain:
         raise _UncertifiedSession(reason)

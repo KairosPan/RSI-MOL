@@ -10,6 +10,7 @@ from rsi.paths import Layout, Refused
 # Released templates eligible for a versioned upgrade.
 PREVIOUS_TEMPLATE_HASHES = {
     'tools/memory/query.py': {
+        '78b6f1a05e73ae35db02d851bb6e8c536a563903683d87e583d2eb3fce020ff4',
         '44790f30a9a0f477bce2f21e6fa3082d0f1ee565d2101a9e973dbce15b0517a8',
         '2bec02410796d92ef11c5fa932b7d07b4adf7e632289fb0858fa263345a473ce',
         '73c14c6591606dd73b8fd825b61e1e589108d5b1336c9eaa53c3cd4a1ca604b1',

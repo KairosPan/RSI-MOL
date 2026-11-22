@@ -66,8 +66,9 @@ snapshot into the manual workspace. The installer preserves local memory instruc
 reader and skill templates. On an installation using Literature, run `./rsi install-literature` to update the
 Literature service's paged receipts as well, then run `./rsi check`. Live tasks backfill pending records automatically.
 `./rsi memory status` lists blocked runs and their reasons. If a recorded session file was lost or changed,
-restore the exact file and retry with `./rsi memory backfill <run-id>`. If the run record cannot establish that
-session collection finished, repeat the task. A missing proposal attachment still allows the controller to
+restore the exact file and retry with `./rsi memory backfill <run-id>`. A task that failed before creating a
+thread has no session to register. If a session started and the run record cannot establish that collection
+finished, repeat the task. A missing proposal attachment still allows the controller to
 register verified literature from a complete session.
 
 Use the task directory's exact spelling. Named trials exclude same-task evidence and interpretations, including

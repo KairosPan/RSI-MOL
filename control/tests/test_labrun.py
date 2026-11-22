@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from rsi import labrun, memory_ingest, workspace
-from rsi.codexrun import codex_version
+from rsi.codexrun import CallResult, codex_version
 from rsi.init import recover
 from rsi.labrun import run_task, run_trial
 from rsi.meta import rollback
@@ -329,6 +329,18 @@ class MoreLabRuns(unittest.TestCase):
             self.assertEqual((work / 'AGENTS.md').read_text(), 'hello\n')
             self.assertFalse((work / 'notes.md').exists())
             self.assertEqual(json.loads((work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+
+    def test_failure_before_a_thread_starts_needs_no_registration(self):
+        with Root() as root:
+            root.add_task('T')
+            startup_failure = CallResult('failed', None, None, None, '', [])
+            with mock.patch('rsi.labrun.run_codex', return_value=startup_failure):
+                call = run_task(root.layout, 'T')
+            self.assertEqual((call['status'], call['memory_collection']['sessions']), ('failed', 'not_started'))
+            self.assertNotIn('post_call_problems', call)
+            self.assertEqual(memory_ingest.backfill(root.layout, [call['id']]), [])
+            info = memory_ingest.status(root.layout)
+            self.assertEqual((info['pending'], info['blocked_runs']), (0, []))
 
     def test_only_failed_session_collection_blocks_registration(self):
         with Root() as root:
