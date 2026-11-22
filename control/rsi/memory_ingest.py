@@ -1,10 +1,12 @@
 """Register literature evidence and checked, explicitly attributed interpretations in a single run batch."""
 from collections import Counter, defaultdict
 import hashlib
+import json
 import re
 import time
 
 from rsi import memory_proposals, memory_store as ledger
+from rsi.memory_history import read
 from rsi.memory_receipts import deadline_check, native_calls, original_problem, service_source, session_paths
 from rsi.paths import Layout
 from rsi.records import Records
@@ -88,6 +90,8 @@ def _paper(row):
     paper_id, provider = _string(row, 'paper_id'), _string(row, 'provider')
     if not paper_id.startswith(provider + ':') or not paper_id[len(provider) + 1:]:
         raise ValueError('invalid source paper ID')
+    if 'title' in _strings(row.get('omitted_fields', []), 'omitted_fields'):
+        raise ValueError('paper title omitted from receipt; retrieve the individual paper with get_paper')
     body = {k: _string(row, k, 8192, optional=True) for k in ('doi', 'pmid', 'pmcid', 'title')}
     year = row.get('year')
     if year is not None and type(year) not in (str, int):
@@ -155,13 +159,13 @@ def _acquisition(run, args, rec, original):
     return [run, rec['invocation_id']], body, {}
 
 
-def _earlier_papers(state, run):
+def _earlier_papers(state, run, withdrawn):
     """Find the metadata in effect before this run, even if earlier batches were backfilled out of order."""
     before = int(run[1:])
     latest = {}
     for d in state.deliveries:
         ident = d['id']
-        if not ident.startswith('paper_'):
+        if not ident.startswith('paper_') or (ident, d['revision']) in withdrawn:
             continue
         delivered = int(d['run'][1:]), d['seq'], d['revision']
         if delivered[0] < before and (ident not in latest or delivered > latest[ident]):
@@ -177,8 +181,18 @@ class _Registration:
         self.deadline = time.monotonic() + TIME_LIMIT
         self.source = service_source(layout, call)
         self.rows = []
-        self.latest = {v['id']: v for v in state.objects}
-        self.earlier_papers = _earlier_papers(state, call['id'])
+        self.withdrawn = {(e['id'], e['revision']) for e in state.owner_events if e['type'] == 'withdrawn'}
+        self.latest = {}  # Includes withdrawals, for monotonic revision numbers and ownership.
+        self.active = {}
+        self.withdrawn_evidence = defaultdict(dict)
+        for obj in state.objects:
+            ident = obj['id']
+            self.latest[ident] = obj
+            if (ident, obj['revision']) not in self.withdrawn:
+                self.active[ident] = obj
+            elif obj['kind'] == 'evidence':
+                self.withdrawn_evidence[ident][ledger.digest(obj['content'])] = obj
+        self.earlier_papers = _earlier_papers(state, call['id'], self.withdrawn)
         self.rejections = []
         self.reasons = Counter()
         self.accepted = Counter()
@@ -202,17 +216,21 @@ class _Registration:
         subtype = content['type']
         ident = subtype + '_' + ledger.digest(key)
         last_registered = self.latest.get(ident)
-        prior = self.earlier_papers.get(ident) if subtype == 'paper' else last_registered
-        if prior is None and last_registered and last_registered['content'] == content:
-            # A later run already delivered these same bytes. Preserve its immutable revision pin.
-            prior = last_registered
+        prior = self.earlier_papers.get(ident) if subtype == 'paper' else self.active.get(ident)
         if prior and subtype == 'passage' and prior['content'] != content:
             raise ValueError('conflicting text or coordinates at the same passage address')
-        new = not prior or prior['content'] != content
+        observed = prior if prior and prior['content'] == content else None
+        if observed is None and ident in self.withdrawn_evidence:
+            # Redelivery of exactly the withdrawn content is a receipt for that same revision.
+            observed = self.withdrawn_evidence[ident].get(ledger.digest(content))
+        if observed is None and prior is None and last_registered and last_registered['content'] == content:
+            # A later run already delivered these same bytes. Preserve its immutable revision pin.
+            observed = last_registered
+        new = observed is None
         if new:
             rev = last_registered['revision'] + 1 if last_registered else 1
         else:
-            rev = prior['revision']
+            rev = observed['revision']
         body = {**delivery, **extra, 'id': ident, 'revision': rev}
         size = len(ledger.encode(body)) + (len(ledger.encode(content)) if new else 0)
         if self.bytes + size > MAX_TOTAL or sum(self.accepted.values()) >= MAX_ITEMS:
@@ -220,15 +238,18 @@ class _Registration:
         self.bytes += size
         if new:
             origin = {k: delivery[k] for k in ('run', 'task', 'version')}
+            superseded = last_registered if subtype == 'passage' else prior
             obj = {'schema_version': 'rsi_mol_memory_v1', 'id': ident, 'kind': 'evidence', 'revision': rev,
-                   'supersedes': prior['revision'] if prior else None, 'content': content, 'origin': origin,
+                   'supersedes': superseded['revision'] if superseded else None, 'content': content, 'origin': origin,
                    'question_ids': [], 'source_refs': [], 'object_refs': [], 'authority': 'receipt'}
             obj['record_sha256'] = ledger.digest(obj)
             self.latest[ident] = obj
+            self.active[ident] = obj
             self.rows.append(('object', obj))
             self.created[subtype] += 1
-        if subtype == 'paper':
-            self.earlier_papers[ident] = obj if new else prior
+            observed = obj
+        if subtype == 'paper' and (ident, rev) not in self.withdrawn:
+            self.earlier_papers[ident] = observed
         self.rows.append(('delivery', body))
         self.accepted[subtype] += 1
         return body
@@ -269,7 +290,7 @@ class _Registration:
                         delivery = self.add(*result, base)
                         if pending and result[1]['type'] == 'passage' and isinstance(native_id, str):
                             # Only a successfully staged delivery can support a current-run citation.
-                            current[thread, native_id].append(delivery)
+                            current[thread, native_id].append((delivery, result[1]))
                         within_call.add(signature)
                 except (ValueError, TypeError, AttributeError, RecursionError) as exc:
                     self.reject(str(exc)[:180], invocation_id=rec['invocation_id'], row=index)
@@ -346,29 +367,48 @@ def _calls(layout):
     return Records(layout.records).calls() if layout.records.is_dir() else []
 
 
-def backfill(layout: Layout, run_ids=None):
-    """Register eligible calls in run order. Explicitly requested, already registered calls are idempotent."""
+class BlockedRegistrations(ValueError):
+    def __init__(self, reasons):
+        self.notices = [f'Memory registration blocked for {run}: {reason}' for run, reason in reasons.items()]
+        super().__init__('; '.join(self.notices))
+
+
+def _recorded_failure(layout, run):
+    path = f'records/memory-failures/{run}.json'
+    try:
+        record = json.loads(read(layout.root, path, 64 << 10))
+        if isinstance(record, dict) and record.get('run') == run and isinstance(record.get('reason'), str):
+            return f'{record["reason"]}. Retry with rsi memory backfill {run}'
+    except FileNotFoundError:
+        return None
+    except (ValueError, OSError, RecursionError):
+        pass
+    return f'Could not read the registration failure in {path}. Retry with rsi memory backfill {run}'
+
+
+def registration_reports(layout: Layout, run_ids=None):
+    """Yield committed reports in order, then report any runs that remain blocked."""
     state = ledger.load(layout)
     calls = _calls(layout)
     requested = set(run_ids or [])
     unknown = requested - {call['id'] for call in calls}
     if unknown:
         raise ValueError(f'Unknown registration run: {", ".join(sorted(unknown))}')
-    reports, failures = [], []
+    failures = {}
     if not requested:
         for owner in sorted(state.missing_owner_reports, key=lambda key: state.owner_reports[key]['version_after']):
-            reports.append(ledger.finish_report(layout, state, owner))
+            yield ledger.finish_report(layout, state, owner)
     for call in calls:
         run = call['id']
         if requested and run not in requested:
             continue
         if run in state.reports:
             if run in state.missing_reports or requested:
-                reports.append(ledger.finish_report(layout, state, run))
+                yield ledger.finish_report(layout, state, run)
         else:
-            failure_path = f'memory-failures/{run}.json'
-            previously_failed = (layout.records / failure_path).is_file()
-            if previously_failed and not requested:
+            previous = _recorded_failure(layout, run)
+            if previous and not requested:
+                failures[run] = previous
                 continue
             try:
                 if not eligible(call, explain=True):
@@ -376,23 +416,24 @@ def backfill(layout: Layout, run_ids=None):
                 registration = _Registration(layout, state, call)
                 summary = registration.prepare()
             except _UncertifiedSession as error:
-                if requested:
-                    failures.append(f'{run}: {error}; a new task run is needed for a new archive')
+                failures[run] = f'{error}. A new task run is needed for a new archive'
                 continue
             except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
                 reason = f'{type(error).__name__}: {error}'
-                if isinstance(error, (FileNotFoundError, ValueError, TypeError, KeyError, RecursionError)):
-                    # An immutable archive needs owner repair. A named backfill can retry it.
-                    if not previously_failed:
-                        Records(layout.records).write_json(failure_path, {'run': run, 'reason': reason})
-                    reason += f' (after repairing the archive, run rsi memory backfill {run})'
-                failures.append(f'{run}: {reason}')
+                # This failure belongs to a single run, including a session read that hit its deadline.
+                # A named retry bypasses the marker. A published report always takes precedence.
+                if not previous:
+                    Records(layout.records).write_json(f'memory-failures/{run}.json', {'run': run, 'reason': reason})
+                failures[run] = f'{reason}. Retry with rsi memory backfill {run}'
                 continue
             # Publication and report writes affect shared state. Let recovery re-read the chain on any failure.
-            reports.append(ledger.publish(layout, state, run, registration.rows, summary))
+            yield ledger.publish(layout, state, run, registration.rows, summary)
     if failures:
-        raise ValueError('Could not register the following runs: ' + '; '.join(failures))
-    return reports
+        raise BlockedRegistrations(failures)
+
+
+def backfill(layout: Layout, run_ids=None):
+    return list(registration_reports(layout, run_ids))
 
 
 def status(layout: Layout):
@@ -401,7 +442,6 @@ def status(layout: Layout):
               for kind in (*ledger.TYPES, *memory_proposals.CONTENT_FIELDS)}
     blocked_reasons = {}
     pending = set(state.missing_reports)
-    failure_folder = layout.records / 'memory-failures'
     for call in _calls(layout):
         run = call['id']
         if run in state.reports:
@@ -409,8 +449,11 @@ def status(layout: Layout):
         try:
             if not eligible(call, explain=True):
                 continue
-            if (failure_folder / f'{run}.json').is_file():
-                blocked_reasons[run] = f'See the archived registration failure in records/memory-failures/{run}.json'
+            failure = _recorded_failure(layout, run)
+            if failure:
+                blocked_reasons[run] = failure
+        except _UncertifiedSession as error:
+            blocked_reasons[run] = f'{error}. A new task run is needed for a new archive'
         except (ValueError, KeyError, TypeError) as error:
             blocked_reasons[run] = str(error)
         pending.add(run)

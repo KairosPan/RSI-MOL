@@ -12,7 +12,7 @@ from rsi.tasks import same_task_directory
 
 SNAPSHOT_BYTES = 16 * 1024 * 1024
 STATUS_RESERVE = 1024
-PROJECTION_VERSION = 4
+PROJECTION_VERSION = 5
 
 
 def _encode(value: dict) -> bytes:
@@ -94,10 +94,12 @@ def _freshness(reasons):
     return {'freshness': level, 'freshness_reasons': sorted(reasons)}
 
 
-def _annotate_freshness(rows, owner_events, unavailable, check_original, revision_order):
+def _annotate_freshness(rows, owner_events, unavailable, check_original, revision_order, withdrawn, projection_version):
     """Compute status after selection. Each citation inherits the health of its pinned delivery."""
     newest = {}
     for key in rows:
+        if projection_version >= 5 and key in withdrawn:
+            continue
         previous = newest.get(key[0])
         if previous is None or revision_order(key) > revision_order(previous):
             newest[key[0]] = key
@@ -109,7 +111,6 @@ def _annotate_freshness(rows, owner_events, unavailable, check_original, revisio
             if check_original(sha):
                 unavailable.add(sha)
     changed = {e['source_sha256'] for e in owner_events if e['type'] == 'source_changed'}
-    withdrawn = {(e['id'], e['revision']) for e in owner_events if e['type'] == 'withdrawn'}
 
     def source_reasons(sha):
         reasons = set()
@@ -123,7 +124,7 @@ def _annotate_freshness(rows, owner_events, unavailable, check_original, revisio
     for key, row in rows.items():  # dependencies precede their dependents in the ledger
         obj = row['object']
         reasons = source_reasons(obj['content'].get('source_sha256'))
-        if newest[key[0]] != key:
+        if newest.get(key[0], key) != key and (projection_version < 5 or key not in withdrawn):
             reasons.add('newer_visible_revision')
         if key in withdrawn:
             reasons.add('withdrawn')
@@ -212,10 +213,14 @@ def _project(state, condition: str, task: str | None, budget: int, *, unavailabl
             parents = sum(bool(d.get('derived_from')) for d in row['deliveries'])
             sizes[key] += FRESHNESS_RESERVE * (1 + parents)
     ordered = sorted(rows, key=ranks.__getitem__, reverse=True)
-    selected_keys = _select(ordered, dependencies, sizes, budget)
+    owner_events = getattr(state, 'owner_events', ())
+    withdrawn = {(e['id'], e['revision']) for e in owner_events if e['type'] == 'withdrawn'}
+    # Admit live revisions first. Exact dependencies can still bring their withdrawn revisions with them.
+    admission = sorted(ordered, key=withdrawn.__contains__) if projection_version >= 5 and withdrawn else ordered
+    selected_keys = _select(admission, dependencies, sizes, budget)
     if unavailable is not None:
         visible = {key: row for key, row in rows.items() if key in selected_keys}
-        _annotate_freshness(visible, getattr(state, 'owner_events', ()), unavailable, check_original, revision_order)
+        _annotate_freshness(visible, owner_events, unavailable, check_original, revision_order, withdrawn, projection_version)
     selected = []
     for key in ordered:
         row = rows[key]
@@ -269,7 +274,9 @@ def place_snapshot(layout: Layout, staged_work: Path, condition: str = 'live', t
     digest = hashlib.sha256()
     (folder / 'status.json').write_bytes(header)
     digest.update(b'status.json\0' + header)
-    if condition != 'none':
+    # Older readers require this file for every non-empty snapshot. Its absence makes
+    # a failed manual refresh visible even to readers that predate "unavailable".
+    if status['condition'] in ('live', 'trial'):
         digest.update(b'evidence.jsonl\0')
         with (folder / 'evidence.jsonl').open('xb') as stream:
             for row in rows:

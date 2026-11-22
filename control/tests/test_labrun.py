@@ -19,6 +19,7 @@ from rsi.paths import Refused
 from rsi.sessions import collect_sessions
 from rsi.versions import VersionStore
 from tests.support import PASS_CHECK, Root, needs_codex, plant_programs
+from tests.test_cli import run as cli_run
 from tests.test_workspace import DEPTH, deny, few_open_files
 
 
@@ -341,6 +342,28 @@ class MoreLabRuns(unittest.TestCase):
             self.assertEqual(memory_ingest.backfill(root.layout, [call['id']]), [])
             info = memory_ingest.status(root.layout)
             self.assertEqual((info['pending'], info['blocked_runs']), (0, []))
+
+    def test_each_live_task_reports_the_block_before_starting_codex(self):
+        with Root() as root:
+            root.add_task('T')
+            run = root.records.new_id('R')
+            root.records.start_call(run, {'purpose': 'task', 'task': 'T', 'thread_id': 'old'})
+            folder = root.records.call_dir(run) / 'sessions'
+            folder.mkdir()
+            (folder / 'old.jsonl').write_bytes(b'')
+            root.records.finish_call(run, {'status': 'finished'})
+            root.records.write_json(f'memory-failures/{run}.json', {'run': run, 'reason': 'TimeoutError: slow archive'})
+
+            def launch(*args, **kwargs):
+                self.assertIn(f'blocked for {run}: TimeoutError', sys.stderr.getvalue())
+                return CallResult('failed', None, None, None, '', [])
+
+            with mock.patch('rsi.labrun.run_codex', side_effect=launch) as launches:
+                for _ in range(2):
+                    code, _, error = cli_run('task', 'T', '--no-meta')
+                    self.assertEqual(code, 0, error)
+                    self.assertIn(f'rsi memory backfill {run}', error)
+            self.assertEqual(launches.call_count, 2)
 
     def test_only_failed_session_collection_blocks_registration(self):
         with Root() as root:

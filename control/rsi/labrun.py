@@ -428,7 +428,8 @@ def _restore_work(layout: Layout, records: Records, store: VersionStore, root_fd
 
 # The two runs.
 
-def run_task(layout: Layout, task_id: str, *, memory: str = 'live', resolve=socket.getaddrinfo) -> dict:
+def run_task(layout: Layout, task_id: str, *, memory: str = 'live', resolve=socket.getaddrinfo,
+             on_memory_notice=None) -> dict:
     """Run a task in work/ and return its finished call record. Refused or ValueError before any call.
 
     resolve looks up the hosts of URL tool servers (socket.getaddrinfo; tests pass a stand-in)."""
@@ -447,7 +448,13 @@ def run_task(layout: Layout, task_id: str, *, memory: str = 'live', resolve=sock
         notes, skill_lines = [], []
         if memory == 'live':
             with _problem(notes, 'Could not finish pending memory registrations before the task'):
-                memory_ingest.backfill(layout)
+                try:
+                    memory_ingest.backfill(layout)
+                except memory_ingest.BlockedRegistrations as error:
+                    notes.extend(error.notices)
+                    if on_memory_notice:
+                        for line in error.notices:
+                            on_memory_notice(line)
         _take_work(layout, records, store, root_fd, calls, context, notes)
         try:
             with _refusing('The version store cannot be used'):
@@ -781,8 +788,8 @@ def rename_in(staged: Path, root_fd: int, name: str) -> None:
 
 
 def move_in(layout: Layout, records: Records, root_fd: int, staged: Path, name: str, context: dict,
-            problems: list[str]) -> None:
-    _move_in(layout, records, root_fd, staged, name, context, problems, manual=name == 'work')
+            problems: list[str]) -> dict | None:
+    return _move_in(layout, records, root_fd, staged, name, context, problems, manual=name == 'work')
 
 
 def dispose(layout: Layout, records: Records, root_fd: int, entry: str, name: str, label: str, reasons: list[str],

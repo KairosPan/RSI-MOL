@@ -9,7 +9,7 @@ import sys
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from query import DEFAULT_BYTES, NATIVE_RECEIPT_BYTES, Snapshot, bounded, encode, exact_page
+from query import DEFAULT_BYTES, NATIVE_RECEIPT_BYTES, Snapshot, bounded, challenge_address, encode, exact_page
 
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 MAX_REQUEST = 64 * 1024
@@ -17,7 +17,8 @@ MAX_PROPOSALS = 64
 TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 4096}
 # Older callers request up to 16 MiB; accept those requests and apply the receipt cap.
 BYTES = {'type': 'integer', 'minimum': 64, 'maximum': 16 << 20,
-         'description': 'Maximum UTF-8 result bytes. The escaped MCP receipt is also capped at 32 KiB. '
+         'description': 'Maximum UTF-8 result bytes. The MCP receipt is capped at 48 KiB and its native '
+                        'JSON-wrapped representation must fit 64 KiB. '
                         'Whole items that do not fit count as omitted.'}
 OFFSET = {'type': 'integer', 'minimum': 0}
 SEARCH = {'query': TEXT, 'max_bytes': BYTES, 'offset': OFFSET}
@@ -67,9 +68,12 @@ TOOLS = {
     'get_evidence': spec('Get a memory object and its visible deliveries. Omit revision for the latest visible '
                          'version. Select a historical delivery by source_run, document_id, document_version or '
                          'invocation_id. Follow next_delivery_offset for older deliveries and next_object_offset '
-                         'for the rest of a large revision.', {'id': TEXT, 'revision': {'type': 'integer', 'minimum': 1},
+                         'for the rest of a large revision. Set counterevidence_offset to page through challenge '
+                         'addresses and their challenged revisions; pass next_offset to continue this list.',
+                         {'id': TEXT, 'revision': {'type': 'integer', 'minimum': 1},
                          'source_run': TEXT, 'document_id': TEXT, 'document_version': TEXT, 'invocation_id': TEXT,
-                         'delivery_offset': OFFSET, 'object_offset': OFFSET, 'max_bytes': BYTES}, ['id']),
+                         'delivery_offset': OFFSET, 'object_offset': OFFSET, 'counterevidence_offset': OFFSET,
+                         'max_bytes': BYTES}, ['id']),
     'recall_judgments': spec('Retrieve historical judgments with their applicable scope and evidence.',
                              SEARCH, ['query']),
     'recall_objects': spec('Search visible memory objects, optionally by kind, with freshness and supporting or '
@@ -211,7 +215,16 @@ class Server:
                 address['run'] = args['source_run']
             items = self.snapshot.get_evidence(args['id'], args.get('revision'), address=address,
                                                delivery_offset=args.get('delivery_offset', 0))
-            return exact_page(items, args.get('max_bytes', NATIVE_RECEIPT_BYTES), args.get('object_offset'))
+            limit = args.get('max_bytes', NATIVE_RECEIPT_BYTES)
+            if 'counterevidence_offset' in args:
+                if 'object_offset' in args:
+                    raise ValueError('Select either object parts or challenge addresses in one request')
+                addresses = ({'challenge': challenge_address(c)} for item in items for c in item.get('counterevidence', ()))
+                page = bounded(addresses, limit, offset=args['counterevidence_offset'])
+                if not page['results'] and page['omitted']:
+                    raise ValueError('Increase max_bytes to fit a challenge address and its continuation')
+                return page
+            return exact_page(items, limit, args.get('object_offset'))
         return bounded(items, args.get('max_bytes', DEFAULT_BYTES), offset=args.get('offset', 0))
 
     def handle(self, message):

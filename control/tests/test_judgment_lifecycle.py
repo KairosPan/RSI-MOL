@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 
 from rsi.labrun import run_task, run_trial
+from rsi.memory_history import timeline
 from rsi.memory_ingest import verify
 from rsi.mockmodel import run_js, say
 from tests.support import Root, needs_codex
@@ -96,6 +97,18 @@ class JudgmentLifecycle(unittest.TestCase):
             report = json.loads((root.layout.records / 'memory' / (author['id'] + '.json')).read_bytes())
             self.assertEqual(report['objects'].get('judgment'), 1, report)
             self.assertEqual(report['objects'].get('question'), 1)
+            # Check sealed native completions from the installed Codex, including the
+            # historical read used for the proposed judgment, above the previous cap.
+            for call, tool in ((archive, 'read_document'), (author, 'recall_passages')):
+                sizes = []
+                for _, _, _, item, _ in timeline(root.layout, call):
+                    if item['tool'] == tool:
+                        reply = item['result']
+                        self.assertFalse(reply.get('isError'))
+                        self.assertIn('data' if tool == 'read_document' else 'results',
+                                      json.loads(reply['content'][0]['text']))
+                        sizes.append(len(json.dumps(reply, ensure_ascii=False, separators=(',', ':')).encode()))
+                self.assertGreater(max(sizes), 32 * 1024, tool)
             sealed, = [name for name in author['files'] if name.startswith('proposals/')]
             proposal_bytes = (root.records.call_dir(author['id']) / sealed).read_bytes()
             self.assertEqual(hashlib.sha256(proposal_bytes).hexdigest(), author['files'][sealed])

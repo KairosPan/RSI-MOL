@@ -7,10 +7,11 @@ from itertools import chain
 
 NOTICE = ('Historical text returned by the literature server. The original file hash was checked. '
           'This passage has not been independently checked against the original.')
-DEFAULT_BYTES = 24 * 1024
-# Native Codex sessions have truncated MCP results around 50 KB. Size the escaped
-# MCP envelope with headroom, including when a caller supplies an older, larger budget.
-NATIVE_RECEIPT_BYTES = 32 * 1024
+# R0010 recorded a 51,040-byte MCP result intact. Codex caps the JSON-wrapped
+# native result at 64 KiB. Reserve space for its wrapper even for escape-heavy text.
+NATIVE_RECEIPT_BYTES = 48 * 1024
+NATIVE_TEXT_BYTES = 64 * 1024 - 256
+DEFAULT_BYTES = NATIVE_RECEIPT_BYTES
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024
 RECENT_DELIVERIES = 3
 ID_FIELDS = ('paper_id', 'doi', 'pmid', 'pmcid')
@@ -106,6 +107,10 @@ def doc_key(doc):
     return tuple(doc.get(k) for k in ('document_id', 'document_version', 'source_sha256'))
 
 
+def challenge_address(challenge):
+    return {key: value for key, value in challenge.items() if key != 'content'}
+
+
 def result_views(item):
     """Expand interpretations when there is room. Their own exact revision carries all outbound pins."""
     yield item
@@ -119,21 +124,25 @@ def result_views(item):
     summary['omitted_details'] = counts
     challengers = item.get('counterevidence', ())
     if challengers:
-        summary['counterevidence'] = [{k: v for k, v in row.items() if k != 'content'} for row in challengers]
+        summary['counterevidence'] = [challenge_address(row) for row in challengers]
     yield summary
     # Incoming challenges are unbounded. If even their addresses do not all fit,
     # keep the highest-ranked ones and disclose exactly how many addresses are absent.
     while len(summary.get('counterevidence', ())) > 0:
         keep = len(summary['counterevidence']) // 2
         summary = {**summary, 'counterevidence': summary['counterevidence'][:keep],
+                   'next_counterevidence_offset': keep,
                    'omitted_details': {**counts, 'counterevidence_addresses': len(challengers) - keep}}
         yield summary
 
 
 def fits(payload, limit):
     raw = encode(payload)
-    return len(raw) <= limit and len(encode({'content': [{'type': 'text', 'text': raw.decode()}],
-                                             'isError': False})) <= NATIVE_RECEIPT_BYTES
+    if len(raw) > limit:
+        return False
+    wire = encode({'content': [{'type': 'text', 'text': raw.decode()}], 'isError': False})
+    return (len(wire) <= NATIVE_RECEIPT_BYTES
+            and len(wire) + wire.count(b'"') + wire.count(b'\\') <= NATIVE_TEXT_BYTES)
 
 
 def exact_pointer(item):
@@ -156,7 +165,9 @@ def bounded(items, limit, offset=None):
     first_pointer = None
     empty = encode({'results': [], 'omitted': 0})
     payload_bytes = len(empty)
-    receipt_bytes = len(encode({'content': [{'type': 'text', 'text': empty.decode()}], 'isError': False}))
+    wire = encode({'content': [{'type': 'text', 'text': empty.decode()}], 'isError': False})
+    receipt_bytes = len(wire)
+    native_bytes = len(wire) + wire.count(b'"') + wire.count(b'\\')
     for index, item in enumerate(items):
         if offset is not None:
             if index < offset:
@@ -172,11 +183,15 @@ def bounded(items, limit, offset=None):
         for view in views:
             raw = encode(view)
             added = len(raw) + bool(results)
-            escaped = added + raw.count(b'"') + raw.count(b'\\')
-            if payload_bytes + added <= limit and receipt_bytes + escaped <= NATIVE_RECEIPT_BYTES:
+            escapes = raw.count(b'"') + raw.count(b'\\')
+            escaped = added + escapes
+            twice_escaped = added + 3 * escapes
+            if (payload_bytes + added <= limit and receipt_bytes + escaped <= NATIVE_RECEIPT_BYTES
+                    and native_bytes + twice_escaped <= NATIVE_TEXT_BYTES):
                 results.append(view)
                 payload_bytes += added
                 receipt_bytes += escaped
+                native_bytes += twice_escaped
                 break
         else:
             omitted += 1
@@ -212,6 +227,16 @@ def exact_page(items, limit, offset):
     for key in ('next_delivery_offset', 'freshness', 'freshness_reasons', 'notice', 'passage_verification'):
         if key in item:
             row[key] = item[key]
+    challenges = item.get('counterevidence') if offset == 0 else None
+    if challenges:
+        preview = {'counterevidence': [challenge_address(challenges[0])]}
+        if len(challenges) > 1:
+            preview.update(next_counterevidence_offset=1, omitted_details={'counterevidence_addresses': len(challenges) - 1})
+        # Keep a discoverable first challenge alongside the canonical object text. If its
+        # address cannot fit, direct the caller to the separately pageable list.
+        part['text'] = canonical[:1]
+        probe = {'results': [{**row, **preview}], 'omitted': 0, 'next_object_offset': len(canonical)}
+        row.update(preview if fits(probe, limit) else {'next_counterevidence_offset': 0})
     length = min(len(canonical) - offset, limit, NATIVE_RECEIPT_BYTES)
     while length:
         end = offset + length
@@ -222,7 +247,7 @@ def exact_page(items, limit, offset):
         if fits(page, limit):
             return page
         length //= 2
-    return {'results': [], 'omitted': 1}
+    return {'results': [], 'omitted': 1, **({'next_counterevidence_offset': 0} if challenges else {})}
 
 
 def recent_deliveries(deliveries, offset=0):
@@ -253,7 +278,7 @@ class Snapshot:
         self.source_identifiers = set()
         self.challengers = defaultdict(list)
         paper_history = defaultdict(list)
-        if self.status['condition'] != 'none':
+        if self.status['condition'] not in ('none', 'unavailable'):
             with (folder / 'evidence.jsonl').open('rb') as stream:
                 data = stream.read(MAX_SNAPSHOT_BYTES + 1)
             if len(data) > MAX_SNAPSHOT_BYTES:
@@ -262,22 +287,30 @@ class Snapshot:
                 row = json.loads(line)
                 obj = row['object']
                 self.versions[obj['id'], obj['revision']] = row
+                if 'withdrawn' in row.get('freshness_reasons', ()):
+                    continue
                 if obj['content']['type'] == 'paper':
                     paper_history[obj['id']].append(row)
-                # A late backfill can give older paper metadata a larger revision number.
-                if obj['content']['type'] == 'paper' and 'newer_visible_revision' in row.get('freshness_reasons', ()):
-                    continue
+                    if 'newer_visible_revision' in row.get('freshness_reasons', ()):
+                        continue
                 latest = self.latest.get(obj['id'])
                 if latest is None or latest['object']['revision'] < obj['revision']:
                     self.latest[obj['id']] = row
+        # Older projections marked all surviving versions stale when the newest
+        # paper was withdrawn. Recover its predecessor by visible delivery order.
+        for ident, history in paper_history.items():
+            if ident not in self.latest:
+                self.latest[ident] = max(history, key=self.paper_order)
         for row in self.latest.values():
             obj = row['object']
             content = obj['content']
             kind = content['type']
-            challenged = {(ref['id'], ref['revision']) for ref in obj.get('object_refs', ())
-                          if ref['relation'] == 'challenges'}
-            for target in challenged:
-                self.challengers[target].append(row)
+            challenged = defaultdict(set)
+            for ref in obj.get('object_refs', ()):
+                if ref['relation'] == 'challenges':
+                    challenged[ref['id']].add(ref['revision'])
+            for ident, revisions in challenged.items():
+                self.challengers[ident].append((sorted(revisions), row))
             if kind == 'paper':
                 self.index_paper(row, paper_history[obj['id']])
             elif kind == 'acquisition':
@@ -292,18 +325,19 @@ class Snapshot:
                     self.source_identifiers.update((self.request(d), normalized(d.get('document_id'))))
         self.source_identifiers.discard('')
 
+    @staticmethod
+    def paper_order(row):
+        d = row['deliveries'][-1]
+        return int(d['run'][1:]), d['at'], d['seq']
+
     def index_paper(self, head, history):
         """Fill unreported identifiers using compatible observations from this snapshot."""
-        def order(row):
-            d = row['deliveries'][-1]
-            return int(d['run'][1:]), d['at'], d['seq']
-
         ident = head['object']['id']
-        head_order = order(head)
+        head_order = self.paper_order(head)
         known = {}
         records = []
-        for row in sorted(history, key=order, reverse=True):
-            if order(row) > head_order or (row is not head and 'withdrawn' in row.get('freshness_reasons', ())):
+        for row in sorted(history, key=self.paper_order, reverse=True):
+            if self.paper_order(row) > head_order:
                 continue
             obj = row['object']
             reported = {k: normalized(obj['content'][k]) for k in ID_FIELDS if obj['content'].get(k)}
@@ -483,11 +517,18 @@ class Snapshot:
                 item['evidence'].append({'reference': ref, 'passage': target['object']['content'],
                                          'passage_verification': 'not_independently_checked', 'notice': NOTICE,
                                          **self.citation_freshness(target, ref)})
-        challengers = self.challengers.get((evidence_id, row['object']['revision']), ())
+        # A challenge to an earlier revision is context for the new revision.
+        # Retain its actual pins, including when one challenger names several revisions.
+        target_revision = row['object']['revision']
+        challengers = []
+        for revisions, other in self.challengers.get(evidence_id, ()):
+            addressed = [rev for rev in revisions if rev <= target_revision]
+            if addressed:
+                challengers.append({**{k: other['object'][k] for k in ('id', 'revision', 'kind', 'content')},
+                                    'challenged_revisions': addressed, **self.freshness(other)})
         if challengers:
-            item['counterevidence'] = [
-                {**{k: other['object'][k] for k in ('id', 'revision', 'kind', 'content')}, **self.freshness(other)}
-                for other in sorted(challengers, key=lambda r: r.get('freshness') != 'needs_review')]
+            item['counterevidence'] = sorted(challengers, key=lambda r: (
+                target_revision not in r['challenged_revisions'], r.get('freshness') != 'needs_review'))
         return [item]
 
     def recall_judgments(self, query):

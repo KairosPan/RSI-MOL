@@ -112,8 +112,7 @@ def _proofs(reg, rows, current):
     for item, native in timed_completions(events):
         thread, tool = native['thread'], item['tool']
         if item['server'] == 'literature':
-            for d in current.get((thread, item['id']), ()):
-                content = reg.latest[d['id']]['content']
+            for d, content in current.get((thread, item['id']), ()):
                 address = (d['document_id'], d['document_version'], content['source_sha256'], content['locator'])
                 reads['literature', d['invocation_id']].append({**native, 'address': address, 'text': content['text'],
                         'source_run': d['run'], 'id': d['id'], 'revision': d['revision']})
@@ -198,9 +197,11 @@ def _object_reference(ref, ident, reads, write, history_error):
     return {**ref, 'thread': match['thread'], 'call_id': match['call_id']}
 
 
-def _object(ident, kind, prior, origin, content, *, sources=(), parents=(), questions=(), authority='model_interpretation'):
+def _object(reg, ident, kind, origin, content, *, sources=(), parents=(), questions=(), authority='model_interpretation'):
+    last = reg.latest.get(ident)
+    prior = reg.active.get(ident) or last
     obj = {'schema_version': 'rsi_mol_memory_v1', 'id': ident, 'kind': kind,
-           'revision': prior['revision'] + 1 if prior else 1, 'supersedes': prior['revision'] if prior else None,
+           'revision': last['revision'] + 1 if last else 1, 'supersedes': prior['revision'] if prior else None,
            'content': {'type': kind, **content}, 'origin': origin, 'question_ids': list(questions),
            'object_refs': list(parents), 'source_refs': list(sources),
            'authority': authority}
@@ -231,10 +232,13 @@ def _question_parent(reg, requested, parents, origin, question_id):
         return requested, []
     require(requested == reg.call['task'], 'subquestion requires an exact object reference read in this run')
     require(_text(reg.call.get('task_goal'), 65536), 'missing task question')
-    question = reg.latest.get(question_id)
+    question = reg.active.get(question_id)
+    if question is None or question['content']['text'] != reg.call['task_goal']:
+        # Preserve a withdrawal if this task is still running the exact latest recorded goal.
+        question = reg.latest.get(question_id)
     created = []
     if question is None or question['content']['text'] != reg.call['task_goal']:
-        question = _object(question_id, 'question', question, origin, {'text': reg.call['task_goal']},
+        question = _object(reg, question_id, 'question', origin, {'text': reg.call['task_goal']},
                            authority='task_contract')
         created.append(question)
     if not any(r['id'] == question_id and r['revision'] == question['revision'] for r in parents):
@@ -259,7 +263,8 @@ def _objects(reg, args, reads, write, history_error, contract):
         require(content['outcome'] in OUTCOMES, 'unknown method experience outcome')
     prior = reg.latest.get(ident)
     authors, roots, default_root = contract
-    require((prior['revision'] if prior else 0) == expected, f'expected {kind} revision differs from the ledger')
+    active = reg.active.get(ident)
+    require((active['revision'] if active else 0) == expected, f'expected {kind} revision differs from the ledger')
     require(not prior or (prior['kind'] == kind and prior.get('authority') == 'model_interpretation' and
                           prior['origin']['task'] in authors), f'{kind} belongs to a different task or authority')
     source_refs, object_refs = args.get('source_refs', []), args.get('object_refs', [])
@@ -274,7 +279,7 @@ def _objects(reg, args, reads, write, history_error, contract):
     root = next((key for key in prior['question_ids'] if key in roots), default_root) if prior else default_root
     question_id, objects = _question_parent(reg, args['question_id'], parents, origin, root)
     content['support_status'] = 'pending_review'
-    objects.append(_object(ident, kind, prior, origin, content, sources=refs, parents=parents, questions=[question_id]))
+    objects.append(_object(reg, ident, kind, origin, content, sources=refs, parents=parents, questions=[question_id]))
     return objects
 
 
@@ -293,6 +298,7 @@ def _append(reg, pid, write, objects, max_bytes, max_items):
     reg.bytes += size
     for obj in objects:
         reg.latest[obj['id']] = obj
+        reg.active[obj['id']] = obj
         reg.created[obj['kind']] += 1
         reg.accepted[obj['kind']] += 1
 

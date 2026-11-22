@@ -48,12 +48,17 @@ def tool(description, required, **properties):
 
 TOOLS = {
     'list_providers': tool('List the five literature sources and their local readiness.', ''),
-    'search_papers': tool('Search for candidate papers. Metadata and abstracts alone do not establish a claim.',
+    'search_papers': tool('Search for candidate papers. Continue a shortened abstract with get_paper using its '
+                          'provider, paper_id as paper_ref and next_abstract_cursor as abstract_cursor. '
+                          'Look up an individual paper for omitted_fields. Metadata and abstracts alone '
+                          'do not establish a claim.',
                           'query', query=TEXT, provider=NATIVE_PROVIDER, cursor=CURSOR, limit=LIMIT,
                           filters={'type': 'object'}),
-    'get_paper': tool('Resolve a paper identifier and its source locations.', 'paper_ref',
-                      paper_ref=TEXT, provider=NATIVE_PROVIDER),
-    'get_citations': tool('List references or citing papers. An edge does not establish support.',
+    'get_paper': tool('Resolve a paper identifier and its source locations. Pass next_abstract_cursor as '
+                      'abstract_cursor for more text from a shortened abstract.', 'paper_ref',
+                      paper_ref=TEXT, provider=NATIVE_PROVIDER, abstract_cursor={'type': 'string', 'maxLength': 100}),
+    'get_citations': tool('List references or citing papers. Continue a shortened abstract with get_paper using '
+                          'its provider, paper_id and next_abstract_cursor. An edge does not establish support.',
                           'paper_ref direction',
                           provider=NATIVE_PROVIDER, paper_ref=TEXT, direction=choice('references', 'citing'),
                           cursor=CURSOR, limit=LIMIT),
@@ -64,6 +69,7 @@ TOOLS = {
     'read_document': tool('Read consecutive passages with their exact ranges. Follow next_cursor to continue. '
                           'A block larger than the page has block_complete=false. For an oversized coverage '
                           'list, omitted_limitations counts entries available in build_reading_package. '
+                          'For omitted_word_boxes read the individual block locator to see word coordinates. '
                           'If even one passage address cannot fit, omitted_passage identifies a text-only range.',
                           'document_id', document_id=DOC, document_version=DOC, locator=TEXT, cursor=CURSOR,
                           max_bytes=BYTES),
@@ -432,7 +438,7 @@ class Literature:
             if args.get('document_version', manifest['document_version']) != manifest['document_version']:
                 raise ValueError('The requested document version does not match the original')
             return local(store.read(document_id, locator=args.get('locator'), cursor=args.get('cursor'),
-                                    max_bytes=args.get('max_bytes', 8000))), None
+                                    max_bytes=args.get('max_bytes', 32768))), None
         if name == 'build_reading_package':
             if args.get('provider', 'local') == 'local':
                 return local(store.reading_package(document_id)), None

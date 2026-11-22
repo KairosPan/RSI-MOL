@@ -93,8 +93,13 @@ class MemorySnapshot(unittest.TestCase):
         shutil.copytree(SEED / 'tools' / 'memory', work / 'tools' / 'memory')
         notices = []
         with patch('rsi.memory_snapshot.memory_store.load', side_effect=KeyError('missing ledger field')):
-            place_snapshot(self.layout, work, manual_problems=notices)
+            meta = place_snapshot(self.layout, work, manual_problems=notices)
         self.assertIn('missing ledger field', notices[0])
+        # Released readers open this file for every condition except "none".
+        # An empty file would let them report a successful search with no matches.
+        self.assertFalse((work / 'memory/evidence.jsonl').exists())
+        header = (work / 'memory/status.json').read_bytes()
+        self.assertEqual(meta['fingerprint'], hashlib.sha256(b'status.json\0' + header).hexdigest())
         status, lookup = self.mcp(work, [('memory_status', {}), ('lookup_sources', {'query': 'paper'})])
         self.assertFalse(status['isError'])
         self.assertEqual(json.loads(status['content'][0]['text'])['condition'], 'unavailable')
@@ -543,7 +548,7 @@ class MemorySnapshot(unittest.TestCase):
             self.assertEqual([(r['id'], r['revision']) for r in row['counterevidence']], [('derived', 1)])
             self.assertEqual(list(returned_objects(name, reply, {('J', 1): encode(obj)})), [('J', 1)])
         tiny, = self.values(work, [('get_evidence', {'id': 'J', 'max_bytes': 64})])
-        self.assertEqual(tiny, {'results': [], 'omitted': 1})
+        self.assertEqual(tiny, {'results': [], 'omitted': 1, 'next_counterevidence_offset': 0})
 
     def test_trial_drops_authored_revisions_hidden_aliases_and_transitive_dependents(self):
         self.add_judgments()
@@ -623,19 +628,45 @@ class MemorySnapshot(unittest.TestCase):
         self.state.objects.append(dict(question, revision=2, supersedes=1, origin=dict(question['origin'], task='T')))
         self.state.deliveries.append(receipt('Q', 2, 18, 'T', 'R18'))
         self.state.owner_events = [{'type': 'withdrawn', 'id': 'Q', 'revision': 2, 'seq': 19}]
-        # All originals available. A visible later question revises the pin even though the pin's own bytes are intact.
+        # A withdrawn later question no longer makes the valid earlier pin stale.
         def views(condition):
             _, rows = _project(self.state, condition, 'T', 1 << 20, unavailable=set())
             return {(r['object']['id'], r['object']['revision']): r for r in rows}
         live = views('live')
         self.assertEqual(live['Q', 2]['freshness'], 'unavailable')
-        self.assertEqual(live['J', 1]['freshness_reasons'], ['dependency_needs_review'])
+        self.assertEqual(live['J', 1]['freshness'], 'current')
         trial = views('trial')
         for key in [('Q', 1), ('paragraph', 1), ('J', 1)]:
             self.assertEqual(trial[key]['freshness'], 'current')
         self.assertNotIn(('Q', 2), trial)
         self.state.owner_events.append({'type': 'withdrawn', 'id': 'Q', 'revision': 1, 'seq': 20})
         self.assertEqual(views('trial')['J', 1]['freshness'], 'unavailable')
+
+    def test_withdrawal_restores_paper_identifiers_and_preserves_the_pinned_revision(self):
+        self.state.owner_events = [{'type': 'withdrawn', 'id': 'paper', 'revision': 2, 'seq': 20}]
+        self.state.reports['R3'] = {'version_after': self.state.version}
+        # Actual projection-4 fingerprint of this withdrawal before the fallback rule changed.
+        old = trusted_rows(self.state, dict(condition='live', version=20, projection_version=4,
+                           unavailable_sources=[], fingerprint='7760de5f6fc18ad79c62579221e3bfe8016023caaad25205b1ff5996b6b6769a'))
+        previous = next(r for r in old if r['object']['id'] == 'paper' and r['object']['revision'] == 1)
+        self.assertEqual(previous['freshness_reasons'], ['newer_visible_revision'])
+        work, memory = self.place('live')
+        trusted_rows(self.state, memory)
+        current, pinned, right, wrong = self.values(work, [('get_evidence', {'id': 'paper'}),
+            ('get_evidence', {'id': 'paper', 'revision': 2}), ('lookup_sources', {'query': '10.1/alpha'}),
+            ('lookup_sources', {'query': '10.1/secret'})])
+        current, = current['results']
+        self.assertEqual((current['object']['revision'], current['freshness']), (1, 'current'))
+        self.assertEqual([r['type'] for r in right['results']], ['paper', 'acquisition', 'passage'])
+        self.assertFalse(wrong['results'])
+        self.assertEqual(pinned['results'][0]['freshness_reasons'], ['withdrawn'])
+        self.state.owner_events.append(dict(type='withdrawn', id='paper', revision=1, seq=21))
+        work, _ = self.place('live', name='all-withdrawn')
+        current, search, exact = self.values(work, [('get_evidence', {'id': 'paper'}),
+            ('recall_objects', {'query': 'Memory paper'}), ('get_evidence', {'id': 'paper', 'revision': 1})])
+        self.assertFalse(current['results'])
+        self.assertNotIn('paper', [r['object']['id'] for r in search['results']])
+        self.assertEqual(exact['results'][0]['freshness_reasons'], ['withdrawn'])
 
     def test_source_changes_and_unavailable_parent_propagate_and_replay_after_restoration(self):
         self.add_judgments()
@@ -691,6 +722,53 @@ class MemorySnapshot(unittest.TestCase):
         self.assertEqual(pin['reference'], {'id': 'J', 'revision': 1, 'relation': 'challenges'})
         self.assertEqual(pin['object'], linked['results'][0]['object'])
         self.assertEqual([o['id'] for o in linked['results'][0]['counterevidence']], ['D'])
+
+    def test_new_judgment_discloses_challenges_and_their_original_target_revisions(self):
+        self.add_judgments()
+        target = next(o for o in self.state.objects if o['id'] == 'J')
+        pin = {'id': 'J', 'revision': 1, 'relation': 'challenges'}
+        self.state.objects.append(dict(target, revision=2, supersedes=1))
+        self.state.deliveries.append(receipt('J', 2, 18, 'B', 'R18'))
+        for n, (name, task, refs) in enumerate([('old', 'A', [pin]), ('both', 'A', [pin, dict(pin, revision=2)]),
+                                                ('hidden', 'T', [pin])], 19):
+            self.state.objects.append(dict(target, id=name, object_refs=refs, question_ids=[], source_refs=[],
+                                           origin=dict(target['origin'], task=task)))
+            self.state.deliveries.append(receipt(name, 1, n, task, 'R' + str(n)))
+        work, _ = self.place('trial', 'T')
+        current, exact, recall = self.values(work, [('get_evidence', {'id': 'J'}),
+            ('get_evidence', {'id': 'J', 'revision': 1}), ('recall_judgments', {'query': 'J'})])
+        active, = current['results']
+        self.assertEqual(active['object']['revision'], 2)
+        self.assertEqual([(r['id'], r['challenged_revisions']) for r in active['counterevidence']],
+                         [('both', [1, 2]), ('old', [1])])
+        self.assertIn(active, recall['results'])
+        former, = exact['results']
+        self.assertEqual({r['id']: r['challenged_revisions'] for r in former['counterevidence']}, {'old': [1], 'both': [1]})
+        # Canonical object pages expose a compact first challenge and a path to every remaining pin.
+        from rsi.memory_history import returned_objects
+        from rsi.memory_store import encode
+        quote = 'q' * 3900
+        next(o for o in self.state.objects if o['id'] == 'paragraph')['content']['text'] += quote
+        large = next(o for o in self.state.objects if o['id'] == 'J' and o['revision'] == 2)
+        large['source_refs'] = [dict(target['source_refs'][0], quote=quote) for _ in range(14)]
+        work, _ = self.place('trial', 'T', name='oversized-judgment')
+        trusted = {(r['object']['id'], r['object']['revision']): encode(r['object']) for r in
+                   map(json.loads, (work / 'memory/evidence.jsonl').read_bytes().splitlines())}
+        target = {'id': 'J', 'revision': 2}
+        part, = self.values(work, [('get_evidence', target)])
+        fragment, = part['results']
+        self.assertGreater(part['next_object_offset'], 0)
+        self.assertEqual(fragment['object_part']['offset'], 0)
+        self.assertEqual(fragment['counterevidence'][0]['challenged_revisions'], [1, 2])
+        self.assertEqual(fragment['omitted_details']['counterevidence_addresses'], 1)
+        more, = self.values(work, [('get_evidence', {**target, 'counterevidence_offset': fragment['next_counterevidence_offset']})])
+        self.assertEqual(more['results'][0]['challenge']['id'], 'old')
+        self.assertEqual(more['results'][0]['challenge']['challenged_revisions'], [1])
+        self.assertEqual(list(returned_objects('get_evidence', more, trusted)), [])
+        # A small list page can resume without repeating a challenge or consuming object-part credit.
+        first, = self.values(work, [('get_evidence', {**target, 'counterevidence_offset': 0, 'max_bytes': 233})])
+        self.assertEqual(first['next_offset'], 1)
+        self.assertEqual(first['results'][0]['challenge']['id'], 'both')
 
     def test_review_precedes_more_recent_healthy_matches(self):
         self.add_judgments()

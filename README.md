@@ -42,6 +42,12 @@ New workspaces include the local `literature` MCP server. For an existing instal
 Europe PMC, PubMed/PMC, OpenAlex and Asta searches, full-text reading and citation lookup. Poppler extracts
 PDF text and renders individual pages. The server uses the Codex network proxy independently of Lab commands.
 
+Search and citation pages keep the provider's paper order and page cursor. If a long abstract is shortened,
+continue it with `get_paper`, passing the same provider, its `paper_id` as `paper_ref`, and its
+`next_abstract_cursor` as `abstract_cursor`. If `omitted_fields` includes `title`, call `get_paper`
+to obtain the title for registration. A broad PDF read can return line coordinates alone so more
+complete lines fit. When it reports `omitted_word_boxes`, read a line by its block locator for word coordinates.
+
 The shared library keeps each original in `library/objects/sha256/` and its reading manifest and text in
 `library/documents/`. Trial runs can read those originals. Each managed run with the service enabled gets a
 `literature.jsonl` attachment in its record. For the Stage L acceptance task, run
@@ -65,16 +71,18 @@ On an existing installation, run `./rsi memory backfill` followed by `./rsi inst
 snapshot into the manual workspace. The installer preserves local memory instructions and upgrades recognized
 reader and skill templates. On an installation using Literature, run `./rsi install-literature` to update the
 Literature service's paged receipts as well, then run `./rsi check`. Live tasks backfill pending records automatically.
-`./rsi memory status` lists blocked runs and their reasons. If a recorded session file was lost or changed,
-restore the exact file and retry with `./rsi memory backfill <run-id>`. A task that failed before creating a
+`./rsi status` names runs blocked during registration. `./rsi memory status` gives the reason for each.
+After correcting a read error or timeout, retry with `./rsi memory backfill <run-id>`. If a recorded session
+file was lost or changed, restore the exact file first. A task that failed before creating a
 thread has no session to register. If a session started and the run record cannot establish that collection
 finished, repeat the task. A missing proposal attachment still allows the controller to
 register verified literature from a complete session.
 
 Use the task directory's exact spelling. Named trials exclude same-task evidence and interpretations, including
 historical spellings and dependent revisions. `./rsi task <id> --no-meta --memory none` uses an empty snapshot
-without reading the ledger. When the ledger cannot be verified, the manual workspace can still be restored and
-its `memory_status` reports `unavailable`. See the [design](docs/design-memory.md).
+without reading the ledger. When the ledger cannot be verified, Meta stops before its first model call.
+The restored manual workspace records `unavailable` in `memory/status.json`. Older readers may report a
+missing evidence file when queried in this state. See the [design](docs/design-memory.md).
 
 On the installation holding the archived ledger, sessions and originals, compare the two completed runs with
 `python3 -B tasks/paired-validation-followup/audit.py records/runs/R0015 records/runs/R0016`. The audit
@@ -94,6 +102,13 @@ New snapshots carry review status down the chain of references. A changed source
 marks dependent interpretations `needs_review`. A missing original or withdrawn revision makes its pinned
 references `unavailable`. The owner commands above return an independent registration receipt. An open
 task keeps its starting snapshot. Run `./rsi install-memory` to refresh the manual workspace.
+
+After withdrawal, the default read selects the latest visible revision that is still active. An exact read
+by ID and revision can inspect the withdrawn text and its status. If an incorrect passage occupied a
+locator, withdraw that revision and read the corrected passage through Literature in a new live task.
+When a judgment changes, its reader still shows challenges to earlier revisions and identifies which
+revision each challenge addressed. For a large judgment, pass `next_counterevidence_offset` to
+`get_evidence` as `counterevidence_offset`, then use each page's `next_offset` to continue.
 
 To replay both types of passage citation in a temporary ledger on that installation, run
 `python3 -B tasks/paired-validation-followup/replay_judgment.py` and repeat it with `--current-literature`.

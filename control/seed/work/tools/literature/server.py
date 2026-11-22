@@ -11,6 +11,7 @@ import sys
 # installed it in env/; block the import before anything can make it, so the upstream modules stay unchanged.
 sys.modules['pypdf'] = None
 
+import hashlib  # noqa: E402
 import json  # noqa: E402
 import uuid  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -24,7 +25,10 @@ MAX_MESSAGE = 256 * 1024
 KEPT_DATA = ('document_id', 'document_version', 'source_sha256')     # what a replaced reply keeps of its data
 MEMORY_EVIDENCE_TOOLS = ('read_document', 'find_passages', 'get_paper', 'search_papers', 'get_citations',
                          'acquire_fulltext')
-NATIVE_RECEIPT_BYTES = 32 * 1024
+# Keep the independently installable memory reader and literature server under the
+# same native record limits, including JSON wrapping of an escape-heavy MCP result.
+NATIVE_RECEIPT_BYTES = 48 * 1024
+NATIVE_TEXT_BYTES = 64 * 1024 - 256
 
 
 def encode(value):
@@ -37,7 +41,9 @@ def text_result(response, invocation_id):
 
 
 def fits_receipt(response, invocation_id):
-    return len(encode(text_result(response, invocation_id))) <= NATIVE_RECEIPT_BYTES
+    wire = encode(text_result(response, invocation_id))
+    return (len(wire) <= NATIVE_RECEIPT_BYTES
+            and len(wire) + wire.count(b'"') + wire.count(b'\\') <= NATIVE_TEXT_BYTES)
 
 
 def read_coverage(coverage):
@@ -76,6 +82,18 @@ def read_page(store, response, invocation_id):
 
     coverage = read_coverage(data['coverage'])
     data = {**data, 'coverage': coverage}
+    if len(passages) > 1:
+        # The normalized PDF stores all word boxes. On an oversized multi-line
+        # page keep each line's coordinates; a read of its locator returns the words.
+        compact = []
+        for row in passages:
+            location = row.get('source_locator')
+            if isinstance(location, dict) and location.get('words'):
+                line = {k: v for k, v in location.items() if k != 'words'}
+                row = {**row, 'source_locator': {**line, 'omitted_word_boxes': len(location['words'])}}
+            compact.append(row)
+        passages = compact
+        data = {**data, 'passages': passages}
     # The store repeats the same document metadata on every passage. An optional
     # title, license or extraction report can itself exceed a complete receipt.
     # Preserve the actual paper/source binding and the parent of any derivation.
@@ -152,6 +170,82 @@ def read_page(store, response, invocation_id):
     return page
 
 
+def paper_page(name, response, invocation_id, cursor):
+    """Keep the provider page and cursor intact, shortening individual abstracts only as necessary."""
+    if response['status'] not in ('ok', 'partial') or (not cursor and fits_receipt(response, invocation_id)):
+        return response
+    key = 'paper' if name == 'get_paper' else 'papers'
+    papers = [response['data'][key]] if key == 'paper' else response['data'][key]
+    rows = [dict(paper) for paper in papers]
+    page = {**response, 'data': {**response['data'], key: rows[0] if key == 'paper' else rows}}
+    abstracts = [(i, p['abstract']) for i, p in enumerate(papers) if p.get('abstract')]
+    digests = {i: hashlib.sha256(encode([papers[i]['paper_id'], text])).hexdigest() for i, text in abstracts}
+    start = 0
+    if cursor:
+        digest, _, offset = cursor.partition(':')
+        if (not offset.isascii() or not offset.isdecimal() or digest != digests.get(0)
+                or not 0 < int(offset) < len(papers[0]['abstract'])):
+            raise DocumentError('invalid_cursor', 'The abstract cursor does not match this paper and text. '
+                                                   'Call get_paper again without the cursor.')
+        start = int(offset)
+
+    def show(i, text, length):
+        end = min(len(text), start + length)
+        row = rows[i]
+        row['abstract'] = text[start:end]
+        if start or end < len(text):
+            row.update(abstract_truncated=bool(papers[i].get('abstract_truncated') or end < len(text)),
+                       abstract_range=[start, end], abstract_length=len(text))
+            if end < len(text):
+                row['next_abstract_cursor'] = f'{digests[i]}:{end}'
+            else:
+                row.pop('next_abstract_cursor', None)
+        else:
+            for field in ('abstract_range', 'abstract_length', 'next_abstract_cursor', 'abstract_truncated'):
+                row.pop(field, None)
+            if 'abstract_truncated' in papers[i]:
+                row['abstract_truncated'] = papers[i]['abstract_truncated']
+
+    # Reserve a readable excerpt for every paper. Spend remaining space on whole
+    # abstracts, shortest first; ties retain the provider's relevance ordering.
+    preview = 160
+    for i, text in abstracts:
+        show(i, text, preview)
+    if not fits_receipt(page, invocation_id):
+        keep = {'paper_id', 'provider', 'provider_id', 'doi', 'pmid', 'pmcid', 'year',
+                'abstract', 'abstract_truncated', 'content_scope'}
+        # Keep titles longest. If they alone overflow, omit entire fields so the
+        # registrar never treats a clipped title as a new paper observation.
+        optional = sorted((field == 'title', field == 'url', -len(encode(value)), i, field)
+                          for i, paper in enumerate(papers) for field, value in paper.items() if field not in keep)
+        for _, _, _, i, field in optional:
+            if rows[i].pop(field) not in (None, '', [], {}):
+                rows[i].setdefault('omitted_fields', []).append(field)
+            if fits_receipt(page, invocation_id):
+                break
+        while preview > 1 and not fits_receipt(page, invocation_id):
+            preview = max(1, preview // 2)
+            for i, text in abstracts:
+                show(i, text, preview)
+    for i, text in sorted(abstracts, key=lambda entry: len(encode(entry[1]))):
+        length = len(text) - start
+        if length <= preview:
+            continue
+        show(i, text, length)
+        if fits_receipt(page, invocation_id):
+            continue
+        low, high = preview, length - 1
+        while low < high:
+            mid = (low + high + 1) // 2
+            show(i, text, mid)
+            if fits_receipt(page, invocation_id):
+                low = mid
+            else:
+                high = mid - 1
+        show(i, text, low)
+    return page
+
+
 def compact_metadata(name, response):
     """Keep the same acquired document or the complete provider page and its original cursor."""
     if response['status'] not in ('ok', 'partial'):
@@ -165,17 +259,6 @@ def compact_metadata(name, response):
                 omitted[key] = len(data.pop(key))
         if omitted:
             data['omitted_reading_index_items'] = omitted
-    elif name in ('get_paper', 'search_papers', 'get_citations'):
-        key = 'paper' if name == 'get_paper' else 'papers'
-        papers = [data[key]] if key == 'paper' else data[key]
-        fields = ('paper_id', 'provider', 'provider_id', 'title', 'doi', 'pmid', 'pmcid', 'year', 'url')
-        summaries = []
-        for paper in papers:
-            summary = {k: paper[k] for k in fields if k in paper}
-            summary.update(content_scope='metadata', omitted_fields=sorted(paper.keys() - fields - {'content_scope'}))
-            summaries.append(summary)
-        data[key] = summaries[0] if key == 'paper' else summaries
-        return {**response, 'data': data, 'coverage': {**response['coverage'], 'content_scope': 'metadata'}}
     return {**response, 'data': data}
 
 
@@ -218,7 +301,9 @@ class Session:
         image = None
         try:
             response, image = self.service.call(name, args, invocation_id)
-            if name == 'read_document':
+            if name in ('get_paper', 'search_papers', 'get_citations'):
+                response = paper_page(name, response, invocation_id, args.get('abstract_cursor'))
+            elif name == 'read_document':
                 response = read_page(self.service.runtime.store, response, invocation_id)
             elif name == 'find_passages':
                 budget = args.get('max_bytes', 8000)

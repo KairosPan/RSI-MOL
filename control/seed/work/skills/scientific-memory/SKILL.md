@@ -31,6 +31,12 @@ requires a fresh read, pass the document ID, version and locator to `read_docume
 Use `recall_judgments` for judgments and `recall_objects` to search all kinds or filter by kind.
 Read the scope, freshness, supporting and challenging references. Check the original or reassess
 the interpretation when a result is marked `needs_review` or `unavailable`.
+For a challenge, check `challenged_revisions` to see which revisions it addressed. When the
+result gives `next_counterevidence_offset`, pass it as `counterevidence_offset` to `get_evidence`
+with the target ID and revision. In this list each `challenge` gives the challenger's ID and
+revision; pass `next_offset` as `counterevidence_offset` to continue. Read the challenger itself
+with its ID and revision before citing it. To inspect a withdrawn revision, pass its revision
+number to `get_evidence`.
 If `omitted_details` is present, the object still contains its exact source and object references.
 Use `get_evidence` with their IDs and revisions to inspect the linked material separately.
 
@@ -53,8 +59,9 @@ In managed live tasks, `propose_memory` accepts the following kinds and fields.
 
 For method experience, choose `improved`, `degraded`, `unchanged` or `failed`. An empty scope means
 the applicable conditions are unknown. Give the current task ID as `question_id`, or retrieve a
-subquestion and pin its ID and revision in `object_refs`. Set `expected_revision` to zero when
-creating an object, or to the current revision when updating one your task created.
+subquestion and pin its ID and revision in `object_refs`. When updating an object your task created,
+set `expected_revision` to its current unwithdrawn revision. Use zero for a new object or when
+all its revisions have been withdrawn.
 
 Each interpretation other than a question needs at least one reference. For a previously retrieved
 question or interpretation, provide its exact `id`, `revision` and `relation` in `object_refs`.

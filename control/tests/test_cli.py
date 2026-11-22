@@ -522,6 +522,33 @@ class Commands(unittest.TestCase):
             self.assertEqual(len(root.records.calls()), 1); self.assertFalse((root.layout.records / 'rounds').exists())
 
     @needs_codex
+    def test_corrupt_memory_refuses_automatic_and_manual_meta_before_a_call(self):
+        with Root() as root:
+            root.add_task('T1')
+            root.records.write_json('memory/R0010.json', {})
+            root.model.push(say('lab done'), say(decision('no_change')))
+            code, out, _ = run('task', 'T1', '--memory', 'none')
+            self.assertEqual(code, 0)
+            self.assertIn('No Meta round was run', out)
+            self.assertIn('no matching memory batch', out)
+
+            notes = root.layout.work / 'notes.md'
+            notes.write_text('owner edit')
+            code, out, err = run('meta')
+            self.assertEqual(code, 3)
+            self.assertIn('no matching memory batch', out + err)
+            self.assertEqual(notes.read_text(), 'owner edit')
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
+            self.assertEqual(len(root.model.requests), 1)
+            self.assertEqual([c['purpose'] for c in root.records.calls()], ['task'])
+            self.assertFalse((root.layout.records / 'rounds').exists())
+
+            (root.layout.records / 'memory/R0010.json').unlink()
+            self.assertEqual(run('meta')[0], 0)
+            self.assertEqual([c['purpose'] for c in root.records.calls()], ['task', 'meta'])
+            self.assertEqual(json.loads((root.layout.work / 'memory/status.json').read_bytes())['condition'], 'live')
+
+    @needs_codex
     def test_meta_command_takes_every_task_call_no_round_had(self):
         with Root() as root:
             root.add_task('T1')

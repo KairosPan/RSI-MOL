@@ -398,6 +398,8 @@ def _status(layout: Layout, as_json: bool) -> int:
     else:
         lines.append(f'Memory: version {memory["version"]}, {sum(memory["counts"].values())} objects, '
                      f'{memory["pending"]} runs awaiting registration')
+        for run, reason in memory['blocked_reasons'].items():
+            lines.append(f'  Memory registration blocked for {safe(run, ID_CHARS)}: {safe(reason)}')
     if state['versions']:
         lines.append('Recent versions: ' + '; '.join(
             f'{safe(entry["version"], ID_CHARS)} ({safe(entry["author"], ID_CHARS)})' for entry in state['versions']))
@@ -483,7 +485,7 @@ def _check(layout: Layout) -> int:
 def _task(layout: Layout, task: str, meta: bool, memory: str = 'live') -> int:
     with _validating():
         load_task(layout.tasks, task)           # an unknown task or a bad id: refused before anything runs
-    call = run_task(layout, task, memory=memory)
+    call = run_task(layout, task, memory=memory, on_memory_notice=_error)
     _print(_call_lines(layout, call))
     if meta:                                    # the task run is done: its exit code is 0 whatever the round does
         try:
@@ -574,7 +576,19 @@ def _memory(layout: Layout, action: str, values: list[str]) -> int:
     elif action == 'verify':
         result = memory_ingest.verify(layout)
     elif action == 'backfill':
-        result = memory_ingest.backfill(layout, values or None)
+        reports = []
+        try:
+            reports.extend(memory_ingest.registration_reports(layout, values or None))
+        except memory_ingest.BlockedRegistrations as error:
+            print(json.dumps(reports, ensure_ascii=True, indent=2), flush=True)
+            for line in error.notices:
+                _error(line)
+            return 1
+        except (OSError, ValueError, RuntimeError):
+            if reports:
+                print(json.dumps(reports, ensure_ascii=True, indent=2), flush=True)
+            raise
+        result = reports
     elif action == 'show':
         with _validating():
             result = memory_store.show(layout, values[0])

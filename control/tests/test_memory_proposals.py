@@ -300,6 +300,62 @@ class Proposals(unittest.TestCase):
         proof, = obj['source_refs']
         self.assertEqual((proof['historical_invocation'], proof['call_id']), ('original-read', 'native-read'))
 
+    def test_withdrawn_latest_judgment_uses_active_revision_for_optimistic_updates(self):
+        self.record([self.read, self.write(1)], {1: self.args})
+        edit = dict(self.args, expected_revision=1, statement='Revised interpretation.')
+        self.record([self.read, self.write(2, edit)], {2: edit})
+        ident = self.args['id']
+        ledger.record_owner_action(self.layout, 'withdrawn', {'id': ident, 'revision': 2})
+        stale = dict(edit, expected_revision=2)
+        report = self.record([self.read, self.write(3, stale), self.write(4, edit)], {3: stale, 4: edit})
+        self.assertEqual(report['reasons'], {'expected judgment revision differs from the ledger': 1})
+        obj = ledger.show(self.layout, ident)['versions'][-1]
+        self.assertEqual((obj['revision'], obj['supersedes']), (3, 1))
+        for revision in (1, 3):
+            ledger.record_owner_action(self.layout, 'withdrawn', {'id': ident, 'revision': revision})
+        other = dict(self.args, question_id='another')
+        rejected = self.record([self.read, self.write(5, other)], {5: other}, task='another')
+        self.assertIn('judgment belongs to a different task or authority', rejected['reasons'])
+        restored = self.record([self.read, self.write(6)], {6: self.args})
+        self.assertEqual(restored['objects'], {'judgment': 1})
+        self.assertEqual(ledger.show(self.layout, ident)['versions'][-1]['revision'], 4)
+
+    def test_withdrawn_passage_can_be_corrected_and_both_native_reads_keep_their_text(self):
+        from seed.work.tools.memory.query import Snapshot
+
+        wrong, bad_ref = self.literature(self.passage(text='False passage.'))
+        correct, good_ref = self.literature(self.passage(), 'b' * 32, native_id='correct')
+        initial = dict(self.args, source_refs=[bad_ref])
+        self.record([wrong, self.write(1, initial)], {1: initial})
+        refused = self.record([correct], {})
+        conflict = 'conflicting text or coordinates at the same passage address'
+        self.assertEqual(refused['reasons'], {conflict: 1})
+        pin, = ledger.show(self.layout, initial['id'])['versions'][0]['source_refs']
+        ledger.record_owner_action(self.layout, 'withdrawn', {'id': pin['id'], 'revision': 1})
+        # The first receipt repeats the withdrawn bytes. The next receipt corrects them in this same run.
+        accepted = dict(self.args, id='judgment_corrected', source_refs=[good_ref])
+        mixed = dict(self.args, id='judgment_mixed', source_refs=[dict(bad_ref, quote=good_ref['quote'])])
+        report = self.record([wrong, correct, self.write(2, mixed), self.write(3, accepted)], {2: mixed, 3: accepted})
+        self.assertEqual(report['objects'], {'passage': 1, 'judgment': 1})
+        self.assertIn('quotation does not occur verbatim in the returned evidence', report['reasons'])
+        self.assertEqual(ledger.show(self.layout, accepted['id'])['versions'][0]['source_refs'][0]['revision'], 2)
+        history = ledger.show(self.layout, pin['id'])
+        self.assertEqual([(o['revision'], o['supersedes'], o['content']['text']) for o in history['versions']],
+                         [(1, None, bad_ref['quote']), (2, 1, good_ref['quote'])])
+        self.assertEqual([d['revision'] for d in history['deliveries']], [1, 1, 2])
+        again = self.record([wrong, correct], {})
+        self.assertEqual(again['deliveries'], {'passage': 1})
+        self.assertEqual(again['reasons'], {conflict: 1})
+        work = self.layout.root / 'corrected'
+        work.mkdir()
+        place_snapshot(self.layout, work)
+        snapshot = Snapshot(work / 'memory')
+        for key, revision, level in [(pin['id'], None, 'current'), (pin['id'], 1, 'unavailable'),
+                                     (initial['id'], None, 'unavailable'), (accepted['id'], None, 'current')]:
+            row, = snapshot.get_evidence(key, revision)
+            self.assertEqual(row['freshness'], level)
+        self.assertEqual(snapshot.get_evidence(pin['id'], None)[0]['object']['revision'], 2)
+
     def test_single_submission_failures_leave_other_judgments_intact(self):
         bad_args = [dict(self.args, id='judgment_bad', source_refs=[dict(self.ref, **changes)]) for changes in
                     ({'quote': 'altered quote'}, {'document_id': 'other-doc'}, {'revision': 2}, {'source_run': 'R0009'})]

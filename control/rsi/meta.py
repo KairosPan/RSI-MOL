@@ -833,9 +833,11 @@ def run_round(layout: Layout, trigger: list[str], *, resolve=socket.getaddrinfo)
                 base = store.resolve(version)
                 staged, _ = stage(layout, store, version)
             with refusing('The staged workspace could not be moved into work/'):
-                move_in(layout, records, root_fd, staged, 'work', context, problems)
+                memory = move_in(layout, records, root_fd, staged, 'work', context, problems)
         except Refused as refused:
             raise Refused(f'{refused}{restore_work(layout, records, store, root_fd, context)}') from None
+        if memory['condition'] == 'unavailable':
+            raise Refused('Cannot start a Meta round. ' + '; '.join(problems))
         with refusing('The candidate could not be prepared'):
             _put_candidate(layout, records, store, root_fd, base, None, context, problems)
         round_id = records.new_id('M')

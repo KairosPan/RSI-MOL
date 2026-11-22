@@ -20,6 +20,7 @@ from rsi.versions import VersionStore
 from seed.work.tools.literature.rsi_literature.providers import ProviderClient
 from seed.work.tools.memory.query import Snapshot
 from tests.support import Root, needs_codex
+from tests.test_cli import run as cli_run
 from tests.test_literature_server import ARTICLE, DRIVER, SEED
 
 
@@ -101,6 +102,57 @@ class Ledger(unittest.TestCase):
         self.assertEqual(report['objects'], {})
         self.assertEqual(ledger.load(self.layout).deliveries[-1]['revision'], 1)
 
+    def test_redelivery_after_a_paper_withdrawal_preserves_both_pins(self):
+        def observe(doi):
+            paper = dict(paper_id='archive:42', provider='archive', doi=doi)
+            run = self.call([self.event(1, 'get_paper', {'paper': paper})])
+            ingest.backfill(self.layout, [run])
+        ident = 'paper_' + ledger.digest('archive:42')
+        observe('10.9/right')
+        observe('10.9/wrong')
+        ledger.record_owner_action(self.layout, 'withdrawn', {'id': ident, 'revision': 2})
+        for doi in ('10.9/right', '10.9/wrong', '10.9/updated', '10.9/wrong'):
+            observe(doi)
+        history = ledger.show(self.layout, ident)
+        self.assertEqual([d['revision'] for d in history['deliveries']], [1, 2, 1, 2, 3, 2])
+        self.assertEqual([o['supersedes'] for o in history['versions']], [None, 1, 1])
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.get_evidence(ident, None)[0]['object']['revision'], 3)
+        self.assertEqual(list(snapshot.lookup('10.9/wrong')), [])
+
+    def test_compacted_search_titles_do_not_supersede_observed_titles(self):
+        from tests.test_literature_transport import Runtime, Stub, server
+
+        self.layout.work.mkdir()
+        runtime = Runtime(self.layout.work)
+        papers = [dict(provider='pubmed', paper_id=f'pubmed:{n}', title=f'Experiment{n} ' + '文' * 2000,
+                       abstract='Background. ' * 180) for n in range(10)]
+        papers.append(dict(provider='pubmed', paper_id='pubmed:11', title=None))
+        response = dict(status='ok', data={'papers': papers}, coverage={}, errors=[], provenance={}, continuation={})
+        reply = server.Session(Stub(runtime, response)).tool_call('search_papers', {})
+        self.assertFalse(reply['isError'])
+        data = json.loads(reply['content'][0]['text'])['data']
+        omitted = [i for i, row in enumerate(data['papers']) if 'title' in row.get('omitted_fields', [])]
+        self.assertGreaterEqual(len(omitted), 2)
+        known, later = (papers[i] for i in omitted[:2])
+        self.call([self.event(1, 'get_paper', {'paper': known})])
+        self.call([self.event(2, 'search_papers', data)])
+        _, report = ingest.backfill(self.layout)
+        self.assertEqual(report['reasons'], {
+            'paper title omitted from receipt; retrieve the individual paper with get_paper': len(omitted)})
+        self.assertEqual(report['deliveries'], {'paper': len(papers) - len(omitted)})
+        snapshot = self.snapshot()
+        found, = snapshot.lookup(known['title'].split()[0])
+        self.assertEqual((found['object']['revision'], found['object']['content']['title']), (1, known['title']))
+        self.assertEqual(list(snapshot.lookup(later['paper_id'])), [])
+        untitled, = snapshot.lookup('pubmed:11')
+        self.assertIsNone(untitled['object']['content']['title'])
+        self.call([self.event(3, 'get_paper', {'paper': later})])
+        recovered, = ingest.backfill(self.layout)
+        self.assertEqual(recovered['objects'], {'paper': 1})
+        obj, = ledger.show(self.layout, 'paper_' + ledger.digest(later['paper_id']))['versions']
+        self.assertEqual(obj['content']['title'], later['title'])
+
     def test_source_with_no_fulltext_locations_is_retrievable_as_an_acquisition_attempt(self):
         ref = '10.1234/example'
         paper = {'source': 'MED', 'id': '123', 'doi': ref, 'title': 'A paper'}
@@ -152,11 +204,41 @@ class Ledger(unittest.TestCase):
         self.assertEqual(ingest.status(self.layout)['blocked_runs'], [bad])
         self.assertEqual(ledger.load(self.layout).reports.keys(), {healthy})
         archived.write_bytes(original)
-        self.assertEqual(ingest.backfill(self.layout), [])
+        with self.assertRaisesRegex(ingest.BlockedRegistrations, bad + '.*checksum mismatch'):
+            ingest.backfill(self.layout)
         report, = ingest.backfill(self.layout, [bad])
         self.assertEqual(report['run'], bad)
         self.assertEqual(ingest.status(self.layout)['blocked_runs'], [])
         self.assertEqual(ingest.verify(self.layout)['runs'], 2)
+
+    def test_timed_out_registration_stays_visible_without_automatic_retries(self):
+        slow = self.call([])
+        good = self.call([self.event(1, 'read_document', {'passages': [self.row]})])
+        prepare = ingest._Registration.prepare
+
+        def slow_archive(reg):
+            if reg.call['id'] == slow:
+                reg.deadline = 0
+            return prepare(reg)
+
+        with mock.patch.dict(os.environ, RSI_ROOT=str(self.layout.root)):
+            with mock.patch.object(ingest._Registration, 'prepare', slow_archive):
+                code, output, error = cli_run('memory', 'backfill')
+            self.assertEqual(code, 1)
+            self.assertEqual([r['run'] for r in json.loads(output)], [good])
+            self.assertIn(f'{slow}: TimeoutError', error)
+            with mock.patch.object(ingest._Registration, 'prepare', side_effect=AssertionError('retried')):
+                code, output, error = cli_run('memory', 'backfill')
+            self.assertEqual((code, json.loads(output)), (1, []))
+            self.assertIn(f'rsi memory backfill {slow}', error)
+            code, output, _ = cli_run('status')
+            self.assertEqual(code, 0)
+            self.assertIn(f'blocked for {slow}: TimeoutError', output)
+            self.assertEqual(ingest.status(self.layout)['blocked_runs'], [slow])
+            code, output, error = cli_run('memory', 'backfill', slow)
+            self.assertEqual((code, error), (0, ''))
+            self.assertEqual([r['run'] for r in json.loads(output)], [slow])
+            self.assertEqual(ingest.status(self.layout)['blocked_runs'], [])
 
     def test_only_string_invocation_ids_are_registered(self):
         self.call([self.event(1, 'read_document', {'passages': [self.row]}, invocation_id=10**31),
@@ -174,7 +256,9 @@ class Ledger(unittest.TestCase):
         missing_archive = self.call(None, status='failed')
         with_evidence = self.call([self.event(1, 'read_document', {'passages': [self.row]})], status='failed')
         self.assertEqual(ingest.backfill(self.layout, [failed, timed_out]), [])
-        report, = ingest.backfill(self.layout)
+        with self.assertRaisesRegex(ingest.BlockedRegistrations, orphan_archive + '.*' + missing_archive):
+            ingest.backfill(self.layout)
+        report = ledger.load(self.layout).reports[with_evidence]
         self.assertEqual((report['run'], report['deliveries']), (with_evidence, {'passage': 1}))
         expected = [orphan_archive, missing_archive]
         info = ingest.status(self.layout)
@@ -192,7 +276,8 @@ class Ledger(unittest.TestCase):
         late = self.call([evidence], memory_collection_complete=False, problems=interrupted, check={'passed': False})
         report, = ingest.backfill(self.layout, [usable])
         self.assertEqual((report['deliveries'], report['proposal_collection']), ({'passage': 1}, 'incomplete'))
-        self.assertEqual([r['run'] for r in ingest.backfill(self.layout)], [late])
+        with self.assertRaisesRegex(ingest.BlockedRegistrations, ambiguous):
+            ingest.backfill(self.layout)
         info = ingest.status(self.layout)
         self.assertEqual(info['blocked_runs'], [ambiguous])
         self.assertIn('legacy record', info['blocked_reasons'][ambiguous])
