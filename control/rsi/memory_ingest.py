@@ -276,39 +276,65 @@ class _Registration:
         memory_proposals.register(self, pending or (), current, MAX_TOTAL, MAX_ITEMS)
         summary = {'service': self.source, 'objects': dict(self.created), 'deliveries': dict(self.accepted),
                    'delivery_count': sum(self.accepted.values()), 'reasons': dict(self.reasons), 'rejected': self.rejections}
+        proposal_state = _proposal_collection(self.call)
+        if proposal_state not in ('complete', 'not_requested'):
+            summary['proposal_collection'] = proposal_state
         deadline_check(self.deadline)
         return summary
 
 
-def _legacy_collection_incomplete(problems):
-    for line in problems:
-        if not isinstance(line, str):
-            continue
-        if line.startswith(('Interrupted while collecting the results (', 'Could not copy the session record',
-                            'Missing session archive for thread ', 'Memory proposals could not be collected:')):
-            return True
-        if line.startswith('Proposal ') and ' could not be collected: ' in line:
-            reason = line.partition(' could not be collected: ')[2]
-            if reason not in ('expected a bounded single-link regular file', 'file changed while opening',
-                              'file changed while copying'):
-                return True
-    return False
+def _proposal_collection(call):
+    if 'memory_collection' in call:
+        return call['memory_collection']['proposals']
+    problems = [line for line in call.get('problems') or () if isinstance(line, str)]
+    if any(line.startswith('Memory proposals could not be collected:') for line in problems):
+        return 'incomplete'
+    if any(line.startswith(('Proposal ', 'Unexpected entry in the proposal directory:')) for line in problems):
+        return 'partial'
+    return 'complete' if 'proposal_workspace' in call else 'not_requested'
 
 
-def eligible(call):
+class _UncertifiedSession(ValueError):
+    """The sealed call itself cannot certify complete sessions, regardless of the files currently on disk."""
+
+
+def _session_problem(call):
+    stages = call.get('memory_collection')
+    if stages is not None:
+        if not isinstance(stages, dict) or stages.get('sessions') != 'complete':
+            return 'the controller did not complete session archive collection'
+    else:
+        problems = [line for line in call.get('problems') or () if isinstance(line, str)]
+        for line in problems:
+            if line.startswith(('Could not copy the session record', 'Missing session archive for thread ')):
+                return 'incomplete session archive: ' + line
+        interrupted = any(line.startswith('Interrupted while collecting the results (') for line in problems)
+        if interrupted or call.get('memory_collection_complete') is False:
+            # These later steps can only be reached after collect_sessions returned. A partial copy
+            # can have a valid call.json checksum in older records, so filenames and hashes alone do not suffice.
+            passed_sessions = ((interrupted and isinstance(call.get('check'), dict))
+                               or _proposal_collection(call) in ('partial', 'incomplete'))
+            if not passed_sessions:
+                return 'the legacy record does not establish that session archive collection finished'
+    paths = session_paths(call)
+    expected = {call.get('thread_id'), *(call.get('subagent_threads') or [])} - {None}
+    if not call.get('thread_id') or not paths or {thread for _, thread, _ in paths} != expected:
+        return 'the sealed session archive manifest does not cover all expected threads'
+    return None
+
+
+def eligible(call, *, explain=False):
     if call.get('purpose') != 'task' or call.get('status') not in ('finished', 'failed', 'timed_out'):
         return False
     memory = call.get('memory') or {}
     if not isinstance(memory, dict):
         raise ValueError('Invalid memory metadata in call record')
-    if memory.get('condition', 'live') != 'live' or call.get('memory_collection_complete') is False:
+    if memory.get('condition', 'live') != 'live':
         return False
-    # Older records expose proof collection failures only through their problems and attachment manifest.
-    if 'memory_collection_complete' not in call and _legacy_collection_incomplete(call.get('problems') or ()):
-        return False
-    paths = session_paths(call)
-    expected = {call.get('thread_id'), *(call.get('subagent_threads') or [])} - {None}
-    return bool(paths) and {thread for _, thread, _ in paths} == expected
+    reason = _session_problem(call)
+    if reason and explain:
+        raise _UncertifiedSession(reason)
+    return reason is None
 
 
 def _calls(layout):
@@ -340,10 +366,14 @@ def backfill(layout: Layout, run_ids=None):
             if previously_failed and not requested:
                 continue
             try:
-                if not eligible(call):
+                if not eligible(call, explain=True):
                     continue
                 registration = _Registration(layout, state, call)
                 summary = registration.prepare()
+            except _UncertifiedSession as error:
+                if requested:
+                    failures.append(f'{run}: {error}; a new task run is needed for a new archive')
+                continue
             except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
                 reason = f'{type(error).__name__}: {error}'
                 if isinstance(error, (FileNotFoundError, ValueError, TypeError, KeyError, RecursionError)):
@@ -364,7 +394,7 @@ def status(layout: Layout):
     state = ledger.load(layout)
     counts = {kind: len({o['id'] for o in state.objects if o['content']['type'] == kind})
               for kind in (*ledger.TYPES, *memory_proposals.CONTENT_FIELDS)}
-    blocked = []
+    blocked_reasons = {}
     pending = set(state.missing_reports)
     failure_folder = layout.records / 'memory-failures'
     for call in _calls(layout):
@@ -372,16 +402,15 @@ def status(layout: Layout):
         if run in state.reports:
             continue
         try:
-            if not eligible(call):
+            if not eligible(call, explain=True):
                 continue
-            failed = (failure_folder / f'{run}.json').is_file()
-        except (ValueError, KeyError, TypeError):
-            failed = True
+            if (failure_folder / f'{run}.json').is_file():
+                blocked_reasons[run] = f'See the archived registration failure in records/memory-failures/{run}.json'
+        except (ValueError, KeyError, TypeError) as error:
+            blocked_reasons[run] = str(error)
         pending.add(run)
-        if failed:
-            blocked.append(run)
     return {'version': state.version, 'counts': counts, 'deliveries': len(state.deliveries), 'pending': len(pending),
-            'blocked_runs': blocked,
+            'blocked_runs': list(blocked_reasons), 'blocked_reasons': blocked_reasons,
             'owner_actions': len(state.owner_events), 'pending_owner_reports': len(state.missing_owner_reports),
             'recent': [{k: r[k] for k in ('run', 'version_after', 'delivery_count')} for r in list(state.reports.values())[-5:]]}
 

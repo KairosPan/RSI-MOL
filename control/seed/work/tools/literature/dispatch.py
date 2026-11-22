@@ -61,7 +61,10 @@ TOOLS = {
                              'Read the returned document_id for quotable passages.', '',
                              paper_ref=TEXT, source_id=DOC, provider=choice(*NATIVE, 'local'),
                              preferred_format=choice('xml', 'pdf')),
-    'read_document': tool('Return exact source passages with their versions, locations, ranges and next cursor.',
+    'read_document': tool('Read consecutive passages with their exact ranges. Follow next_cursor to continue. '
+                          'A block larger than the page has block_complete=false. For an oversized coverage '
+                          'list, omitted_limitations counts entries available in build_reading_package. '
+                          'If even one passage address cannot fit, omitted_passage identifies a text-only range.',
                           'document_id', document_id=DOC, document_version=DOC, locator=TEXT, cursor=CURSOR,
                           max_bytes=BYTES),
     'find_passages': tool('Find matching passages in registered documents, with source locations.',

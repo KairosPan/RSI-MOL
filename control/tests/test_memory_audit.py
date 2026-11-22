@@ -92,6 +92,33 @@ class MemoryAudit(unittest.TestCase):
         self.assertFalse(result['passed'])
         self.assertEqual(result['live']['citations'][0]['observed'], 'literature')
 
+    def test_paged_historical_quote_requires_a_complete_authenticated_read_in_one_thread(self):
+        canonical = store.encode(self.obj).decode()
+        cut = len(canonical) // 2
+        def chunk(lo, hi, number, text=None):
+            part = dict(id='P1', revision=1, offset=lo, total_chars=len(canonical),
+                        text=canonical[lo:hi] if text is None else text)
+            body = {'results': [{'object_part': part, 'deliveries': [self.delivery]}], 'omitted': 0}
+            if hi != len(canonical):
+                body['next_object_offset'] = hi
+            item = returned('memory', 'get_evidence', number, body)
+            return dict(item, arguments=dict(id='P1', revision=1, object_offset=lo))
+        first, last = chunk(0, cut, 1), chunk(cut, len(canonical), 2)
+        baseline = self.record('none', 'R0020', 'tree', [], [])
+        live = self.record('live', 'R0021', 'tree', [first, last], [dict(self.citation, delivery_source='memory')])
+        report = AUDIT['audit'](baseline, live)
+        self.assertTrue(report['passed'])
+        receipt, = report['live']['citations'][0]['memory_receipts']
+        self.assertEqual((receipt['call_id'], receipt['source_run']), ('native-2', SOURCE))
+
+        rows = [{'object': self.obj, 'deliveries': [self.delivery]}]
+        wrong = chunk(0, cut, 3, text='X' + canonical[1:cut])
+        for events in ([('lead', last)], [('lead', last), ('lead', first)], [('lead', first), ('child', last)],
+                       [('lead', wrong), ('lead', last)]):
+            with self.subTest(events=[(t, i['id']) for t, i in events]):
+                _, verified, _ = AUDIT['receipts'](events, rows)
+                self.assertFalse(verified)
+
     def test_provenance_is_separate_from_receipt_and_tree_must_match(self):
         baseline = self.record('none', 'R0020', 'oldtree', [self.literature], [dict(self.citation, delivery_source='literature')])
         item = returned('memory', 'recall_passages', 3, {'results': [self.memory_row]})
@@ -141,7 +168,7 @@ class MemoryAudit(unittest.TestCase):
             for n, segment in enumerate([part(0, 8), right]):
                 payload = {'status': 'ok', 'data': {'passages': [segment]}, 'invocation_id': str(n)}
                 events.append(('child', returned('literature', 'read_document', n, payload)))
-            _, _, lit = AUDIT['receipts'](events, {})
+            _, _, lit = AUDIT['receipts'](events, [])
             return AUDIT['compare_citations']([row], {key: [source]}, lit)[0]
         for start in (7, 8):
             with self.subTest(start=start):

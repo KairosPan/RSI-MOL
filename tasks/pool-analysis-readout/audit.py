@@ -9,8 +9,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'control'))
-from rsi.memory_history import (ADDRESS, attachment, passage_index, read, require, returned_memory,
+from rsi.memory_history import (ADDRESS, ObjectPartReads, attachment, passage_index, read, require, returned_memory,
                                 returned_objects, timeline, trusted_rows)
+from rsi.memory_proposals import read_before_proposal, timed_completions
 from rsi.memory_receipts import session_lines, session_paths
 from rsi.memory_store import encode, load
 from rsi.paths import Layout
@@ -32,6 +33,28 @@ def response(item):
     return body if isinstance(body, dict) else {}
 
 
+def native_reads(call, rows):
+    items, reads, proposal_starts = {}, {}, {}
+    parts = ObjectPartReads(rows)
+
+    def events():
+        for event in timeline(LAYOUT, call, include_proposal_starts=True):
+            _, _, thread, item, payload = event
+            if payload['type'] == 'item_completed':
+                items[thread, item['id']] = item
+            yield event
+
+    for item, native in timed_completions(events()):
+        key = native['thread'], item['id']
+        if item['server'] == 'memory':
+            if item['tool'] == 'propose_memory':
+                proposal_starts[key] = native
+            else:
+                value, pages = parts.verify(item, response(item), native)
+                reads[key] = value, pages
+    return items, reads, proposal_starts
+
+
 def run(state, run_id, task, output):
     require(CALL_ID.fullmatch(run_id), 'Expected an R-number')
     raw = read(ROOT, f'records/runs/{run_id}/call.json', 2 << 20)
@@ -39,7 +62,7 @@ def run(state, run_id, task, output):
     require((call['id'], call['task'], call['purpose']) == (run_id, task, 'task'), f'Expected {task} task run')
     require(call['memory']['condition'] == 'live', 'Expected live memory')
     rows = trusted_rows(state, call['memory'])
-    items = {(thread, item['id']): item for _, _, thread, item, _ in timeline(LAYOUT, call)}
+    items, reads, proposal_starts = native_reads(call, rows)
     participants = {path: dict(thread=thread, provider=None, models=set(), session_sha256=sha)
                     for path, thread, sha in session_paths(call)}
     for path, thread, _, line in session_lines(LAYOUT, call):
@@ -62,10 +85,10 @@ def run(state, run_id, task, output):
                    participants=participants, output=output, output_sha256=call['files'].get(output), tool_calls=dict(counts),
                    eligible=(call['status'] == 'finished' and bool(memo.strip()) and (check or {}).get('passed', True)
                              and bool(participants) and all(p['provider'] == 'openai' and p['models'] for p in participants)))
-    return call, rows, items, memo, summary
+    return call, rows, items, reads, proposal_starts, memo, summary
 
 
-def verify_source(ref, items, passages, revisions):
+def verify_source(ref, items, passages, revisions, reads, proposal_start):
     key = ref['id'], ref['revision']
     block = revisions[key]['content']
     address = tuple(ref[k] for k in ADDRESS)
@@ -80,6 +103,10 @@ def verify_source(ref, items, passages, revisions):
                        p.get('block_complete') is True and tuple(p.get(k) for k in ADDRESS) == address
                        and p.get('text') == block['text'] for p in body.get('data', {}).get('passages', [])))
     else:
+        body, pages = reads.get((ref['thread'], ref['call_id']), ({}, ()))
+        if pages:
+            require(proposal_start and all(read_before_proposal(page, proposal_start) for page in pages),
+                    'Incomplete verified object read before the proposal')
         matches = item['server'] == 'memory' and any(
             found == address and (m['id'], m['revision']) == key and quote in m['text']
             and m['source_run'] == ref['source_run'] and m['historical_invocation'] == ref['historical_invocation']
@@ -89,7 +116,7 @@ def verify_source(ref, items, passages, revisions):
 
 
 def author(state, run_id):
-    call, rows, items, _, result = run(state, run_id, 'pool-analysis-protocol', 'out/plan.md')
+    call, rows, items, reads, starts, _, result = run(state, run_id, 'pool-analysis-protocol', 'out/plan.md')
     revisions = {(o['id'], o['revision']): o for o in state.objects}
     passages = passage_index(rows)
     judgments = []
@@ -106,7 +133,8 @@ def author(state, run_id):
         content = obj['content']
         require(args['kind'] == 'judgment' and args['id'] == key[0] and args['expected_revision'] + 1 == key[1]
                 and all(content[k] == args[k] for k in ('statement', 'scope')), 'Registered judgment differs from proposal')
-        refs = [verify_source(ref, items, passages, revisions) for ref in obj['source_refs']]
+        refs = [verify_source(ref, items, passages, revisions, reads, starts.get((delivery['thread'], delivery['call_id'])))
+                for ref in obj['source_refs']]
         judgments.append(dict(id=key[0], revision=key[1], statement=content['statement'], scope=content['scope'],
                               support_status=content['support_status'], source_refs=refs,
                               proposal_call=delivery['call_id'], proposal_id=pid,
@@ -127,7 +155,7 @@ def audit(first, second=None):
         result['outcome'] = 'review_author_before_readout' if eligible else 'author_gate_unmet'
         return result
     require(CALL_ID.fullmatch(second) and int(second[1:]) > int(first[1:]), 'Expected subsequent readout run')
-    call, rows, items, memo, b = run(state, second, 'pool-analysis-readout', 'out/analysis.md')
+    call, rows, items, reads, _, memo, b = run(state, second, 'pool-analysis-readout', 'out/analysis.md')
     require(call['memory']['version'] >= state.reports[first]['version_after'], 'Readout started before author registration')
     targets = {}
     for row in rows:
@@ -139,11 +167,11 @@ def audit(first, second=None):
     require(not any(identity in prompt for identity, _ in eligible), 'Readout prompt supplied an author judgment ID')
     cited = {(m[1], int(m[2])) for m in BIB.finditer(memo)}
     matches = []
-    for (thread, cid), item in items.items():
-        if item['server'] == 'memory':
-            for identity, revision in returned_objects(item['tool'], response(item), targets):
-                matches.append(dict(id=identity, revision=revision, thread=thread, call_id=cid,
-                                    tool=item['tool'], cited_in_memo=(identity, revision) in cited))
+    for (thread, cid), (body, _) in reads.items():
+        tool = items[thread, cid]['tool']
+        for identity, revision in returned_objects(tool, body, targets):
+            matches.append(dict(id=identity, revision=revision, thread=thread, call_id=cid,
+                                tool=tool, cited_in_memo=(identity, revision) in cited))
     b.update(native_retrievals=matches, cited_judgments=sorted(cited))
     result['readout'] = b
     result['same_starting_tree'] = bool(a['tree']) and a['tree'] == b['tree']

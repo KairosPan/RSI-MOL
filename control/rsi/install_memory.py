@@ -10,18 +10,21 @@ from rsi.paths import Layout, Refused
 # Released templates eligible for a versioned upgrade.
 PREVIOUS_TEMPLATE_HASHES = {
     'tools/memory/query.py': {
+        '44790f30a9a0f477bce2f21e6fa3082d0f1ee565d2101a9e973dbce15b0517a8',
         '2bec02410796d92ef11c5fa932b7d07b4adf7e632289fb0858fa263345a473ce',
         '73c14c6591606dd73b8fd825b61e1e589108d5b1336c9eaa53c3cd4a1ca604b1',
         'b19a5c57040dbe020a3028e15fb6844ec0d27bf9b86d20cc39f2f8f8152215f7',
         '654fcd548e1e0d7554f8a1f15b08c4055488e0b83afbda9858910843c58a172c',
     },
     'tools/memory/server.py': {
+        '54064b893cacd97eadd1cecceb254ab39e85c7c1db31cc43531cd5250b307b8a',
         'fd8027c3f0c305540ef4f51313d3ee5b9541aadb3cef18f9a587cc13da578fb1',
         'bb9c460e67eee77937abc22003d587f48d0f1b585970d70c4d5c2043615bf055',
         '7f3a2921f6630e6bc4215059696b038fc875d69466bb683ee35d7fb7743c11ab',
         'f0abb1664efac87fca892f15a26a4fffd9aed7818073d6c1ca58423388ee0105',
     },
     'skills/scientific-memory/SKILL.md': {
+        'fdc5abe161eb6d9cd1e5abcc15f23e1241e0adc2a1260f917ec81df74a72f541',
         'f5170261e0c6d3d8672c618375a5dfee8bda8e01074dde5297c971c894614775',
         'ffa143fbc8e353c40a410a9a179744146a87da839e910f900e73902d3f16a199',
         'b995423358a7e32f0d1e97c8485f8fddcfbc7d6096f904bb832fa101f1ca5b4b',

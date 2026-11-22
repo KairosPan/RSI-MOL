@@ -65,8 +65,10 @@ On an existing installation, run `./rsi memory backfill` followed by `./rsi inst
 snapshot into the manual workspace. The installer preserves local memory instructions and upgrades recognized
 reader and skill templates. On an installation using Literature, run `./rsi install-literature` to update the
 Literature service's paged receipts as well, then run `./rsi check`. Live tasks backfill pending records automatically.
-If an archived session needs repair, `./rsi memory status` lists its run under `blocked_runs`. After the repair,
-retry that run with `./rsi memory backfill <run-id>`.
+`./rsi memory status` lists blocked runs and their reasons. If a recorded session file was lost or changed,
+restore the exact file and retry with `./rsi memory backfill <run-id>`. If the run record cannot establish that
+session collection finished, repeat the task. A missing proposal attachment still allows the controller to
+register verified literature from a complete session.
 
 Use the task directory's exact spelling. Named trials exclude same-task evidence and interpretations, including
 historical spellings and dependent revisions. `./rsi task <id> --no-meta --memory none` uses an empty snapshot
@@ -82,6 +84,10 @@ investigations and method experience. Cite a retrieved object by ID and revision
 address and exact quote. For a complete passage first read in that run, include `delivery_source="literature"`
 and the service's `invocation_id`. The controller checks the read and commits the evidence and accepted
 proposals in the same batch. Later tasks can use `recall_objects` or `recall_judgments` to retrieve them.
+
+Searches return `next_offset` when more results fit on another page. Pass it as `offset` with the same query.
+Use `get_evidence` with the object ID and revision to read a large result or select an older delivery by its
+source run and document version. For a paged object, read all parts in one thread before citing it.
 
 New snapshots carry review status down the chain of references. A changed source or a superseded citation
 marks dependent interpretations `needs_review`. A missing original or withdrawn revision makes its pinned

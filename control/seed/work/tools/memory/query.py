@@ -3,6 +3,7 @@
 import json
 import re
 from collections import defaultdict
+from itertools import chain
 
 NOTICE = ('Historical text returned by the literature server. The original file hash was checked. '
           'This passage has not been independently checked against the original.')
@@ -41,8 +42,61 @@ def normalized(value):
 
 def source_identifier(query):
     key = normalized(query)
-    return bool(re.fullmatch(r'[a-z][\w.-]*:\S+|10\.\d+/\S+|doc_[\w-]+|pmc\d+|\d{1,12}', key)
-                or query.strip().casefold().startswith(('doi:', 'pmid:', 'pmcid:', 'pubmed:')))
+    return bool(re.fullmatch(r'(?:europe_pmc|openalex|semantic_scholar|unpaywall):\S+|'
+                             r'10\.\d+/\S+|doc_[\w-]+|pmc\d+', key)
+                or re.fullmatch(r'(?:pmid|pubmed):\s*\d+', query.strip(), re.I))
+
+
+# In these scripts whitespace is not a reliable word boundary. Keep adjacent pairs
+# within each run, including Thai combining marks, without forming pairs across punctuation.
+UNSPACED = re.compile(r'[\u3041-\u3096\u3099-\u309f\u30a1-\u30fa\u30fc-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff'
+                      r'\U00020000-\U0002fa1f\U00030000-\U000323af\u0e01-\u0e3a\u0e40-\u0e4e]+')
+WORDS = re.compile(r'[^\W_]+')
+ROOT_HEADINGS = {'body', 'abstract', 'title', 'document', 'references', 'back matter', 'untitled section'}
+
+
+def words(text, *, query):
+    text = text.casefold()
+    tokens = set(WORDS.findall(UNSPACED.sub(' ', text)))
+    for match in UNSPACED.finditer(text):
+        run = match[0]
+        tokens.update(run[i:i + 2] for i in range(len(run) - 1))
+        if not query or len(run) == 1:
+            tokens.update(run)
+    return tokens
+
+
+def word_forms(word):
+    """Share conservative English inflections, without matching arbitrary substrings."""
+    forms = {word}
+    if not (word.isascii() and word.isalpha() and len(word) >= 4):
+        return forms
+    singular = word
+    if len(word) >= 6 and word.endswith('ies'):
+        singular = word[:-3] + 'y'
+    elif len(word) >= 5 and word.endswith('s') and not word.endswith(('ss', 'us', 'is')):
+        singular = word[:-1]
+    forms.add(singular)
+    for suffix in ('ment', 'ing', 'ed'):
+        base = singular.removesuffix(suffix)
+        if base != singular and len(base) >= 4:
+            forms.add(base)
+            if suffix in ('ing', 'ed'):
+                forms.add(base + 'e')
+            break
+    return forms
+
+
+def lexical_score(query_forms, text):
+    terms = {form for word in words(text, query=False) for form in word_forms(word)}
+    return sum(not group.isdisjoint(terms) for group in query_forms)
+
+
+def passage_text(content):
+    headings = content.get('section_path', ())
+    if headings and (headings[0].casefold() in ROOT_HEADINGS or re.fullmatch(r'Page \d+', headings[0])):
+        headings = headings[1:]
+    return ' '.join([*(h for h in headings if h != 'Untitled section'), content['text']])
 
 
 def doc_key(doc):
@@ -73,39 +127,108 @@ def result_views(item):
         yield summary
 
 
-def bounded(items, limit):
-    """Keep complete rows within both the requested JSON budget and the escaped MCP receipt budget."""
-    empty = encode({'results': [], 'omitted': 0})
-    size = len(empty)
-    wire = len(encode({'content': [{'type': 'text', 'text': empty.decode()}], 'isError': False}))
-    result, sizes = [], []
+def fits(payload, limit):
+    raw = encode(payload)
+    return len(raw) <= limit and len(encode({'content': [{'type': 'text', 'text': raw.decode()}],
+                                             'isError': False})) <= NATIVE_RECEIPT_BYTES
+
+
+def exact_pointer(item):
+    obj = item.get('object', item)
+    if 'id' not in obj or 'revision' not in obj:
+        return None
+    args = {'id': obj['id'], 'revision': obj['revision']}
+    if 'object' not in item and item.get('deliveries'):
+        # Preserve the source match when a filtered passage search points at a shared block.
+        d = item['deliveries'][0]
+        args.update({k: d[k] for k in ('document_id', 'document_version', 'invocation_id') if k in d})
+        args['source_run'] = d['run']
+    return {'get_evidence': args}
+
+
+def bounded(items, limit, offset=None):
+    """A search page is a contiguous slice of the frozen ranking, including exact-read pointers."""
+    results = []
     omitted = 0
-    for item in items:
-        for view in result_views(item):
+    first_pointer = None
+    empty = encode({'results': [], 'omitted': 0})
+    payload_bytes = len(empty)
+    receipt_bytes = len(encode({'content': [{'type': 'text', 'text': empty.decode()}], 'isError': False}))
+    for index, item in enumerate(items):
+        if offset is not None:
+            if index < offset:
+                continue
+            if omitted:
+                omitted += 1
+                continue
+            if index == offset:
+                first_pointer = exact_pointer(item)
+        views = result_views(item)
+        if index == offset and first_pointer:
+            views = chain(views, (first_pointer,))
+        for view in views:
             raw = encode(view)
-            extra = len(raw) + int(bool(result))
-            # The item is already JSON. Quotes and backslashes are escaped again
-            # when it becomes the text of an MCP content block.
-            escaped = extra + raw.count(b'"') + raw.count(b'\\')
-            if size + extra <= limit and wire + escaped <= NATIVE_RECEIPT_BYTES:
-                result.append(view)
-                sizes.append((extra, escaped))
-                size += extra
-                wire += escaped
+            added = len(raw) + bool(results)
+            escaped = added + raw.count(b'"') + raw.count(b'\\')
+            if payload_bytes + added <= limit and receipt_bytes + escaped <= NATIVE_RECEIPT_BYTES:
+                results.append(view)
+                payload_bytes += added
+                receipt_bytes += escaped
                 break
         else:
             omitted += 1
-    while result and len(str(omitted)) - 1 > min(limit - size, NATIVE_RECEIPT_BYTES - wire):
-        result.pop()
-        extra, escaped = sizes.pop()
-        size -= extra
-        wire -= escaped
+    while True:
+        page = {'results': results, 'omitted': omitted}
+        if offset is not None and omitted and results:
+            page['next_offset'] = offset + len(results)
+        if not results or fits(page, limit):
+            return page
+        if len(results) == 1 and first_pointer and results[0] != first_pointer:
+            results[0] = first_pointer
+            continue
+        results.pop()
         omitted += 1
-    return {'results': result, 'omitted': omitted}
 
 
-def recent_deliveries(deliveries):
-    return {'deliveries': list(reversed(deliveries[-RECENT_DELIVERIES:])), 'delivery_count': len(deliveries)}
+def exact_page(items, limit, offset):
+    if offset is None or not items:
+        page = bounded(items, limit)
+        if page['results'] or not items:
+            return page
+        offset = 0
+    item, = items
+    obj = item['object']
+    canonical = json.dumps(obj, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(',', ':'))
+    if offset >= len(canonical):
+        raise ValueError('object_offset is outside this revision')
+    # Keep both the exact revision and its selected passage delivery available for receipt replay.
+    part = {'id': obj['id'], 'revision': obj['revision'], 'offset': offset, 'total_chars': len(canonical)}
+    fields = ('run', 'document_id', 'document_version', 'invocation_id')
+    row = {'object_part': part, 'deliveries': [{k: d[k] for k in fields if k in d} for d in item['deliveries']],
+           'delivery_count': item['delivery_count']}
+    for key in ('next_delivery_offset', 'freshness', 'freshness_reasons', 'notice', 'passage_verification'):
+        if key in item:
+            row[key] = item[key]
+    length = min(len(canonical) - offset, limit, NATIVE_RECEIPT_BYTES)
+    while length:
+        end = offset + length
+        part['text'] = canonical[offset:end]
+        page = {'results': [row], 'omitted': 0}
+        if end < len(canonical):
+            page['next_object_offset'] = end
+        if fits(page, limit):
+            return page
+        length //= 2
+    return {'results': [], 'omitted': 1}
+
+
+def recent_deliveries(deliveries, offset=0):
+    end = max(0, len(deliveries) - offset)
+    page = {'deliveries': list(reversed(deliveries[max(0, end - RECENT_DELIVERIES):end])),
+            'delivery_count': len(deliveries)}
+    if end > RECENT_DELIVERIES:
+        page['next_delivery_offset'] = offset + RECENT_DELIVERIES
+    return page
 
 
 class Snapshot:
@@ -248,8 +371,9 @@ class Snapshot:
         key = normalized(query)
         papers = list(self.by_identifier.get(key, []))
         if allow_title and not papers and key and not source_identifier(query):
+            terms = [word_forms(w) for w in words(query, query=True)]
             papers = [row for row in self.latest.values() if row['object']['content']['type'] == 'paper'
-                      and key in normalized(row['object']['content'].get('title'))]
+                      and terms and lexical_score(terms, row['object']['content'].get('title') or '') == len(terms)]
         refs = {ref for p in papers for ref in self.paper_refs[p['object']['id']]}
         if key:
             refs.add(key)
@@ -261,9 +385,11 @@ class Snapshot:
                 acquisitions[obj['id']] = row
         return papers, refs, acquisitions
 
-    def selected_deliveries(self, row, task=None, filters=()):
+    def selected_deliveries(self, row, task=None, filters=(), address=None):
         deliveries, sources = [], {}
         for d in row['deliveries']:
+            if address and any(d.get(k) != v for k, v in address.items()):
+                continue
             if task and d['task'] != task:
                 continue
             links = self.acquisitions_for(d, row['object']['content'])
@@ -309,15 +435,22 @@ class Snapshot:
                 return self.freshness(d if 'freshness' in d else passage)
         raise ValueError('Citation delivery absent from snapshot')
 
-    def get_evidence(self, evidence_id, revision):
+    def get_evidence(self, evidence_id, revision, *, address=None, delivery_offset=0):
         row = self.latest.get(evidence_id) if revision is None else self.versions.get((evidence_id, revision))
         if row is None:
             return []
-        item = {**row, **recent_deliveries(row['deliveries'])}
         kind = row['object']['content']['type']
+        deliveries = row['deliveries']
         if kind == 'passage':
-            payload = self.passage(row, *self.selected_deliveries(row))
-            item.update({k: payload[k] for k in ('sources', 'notice', 'passage_verification')})
+            deliveries, sources = self.selected_deliveries(row, address=address)
+        elif address:
+            deliveries = [d for d in deliveries if all(d.get(k) == v for k, v in address.items())]
+        if (address and not deliveries) or (delivery_offset and delivery_offset >= len(deliveries)):
+            return []
+        item = {**row, **recent_deliveries(deliveries, delivery_offset)}
+        if kind == 'passage':
+            item.update(sources=[self.attribution(r) for r in sources.values()], notice=NOTICE,
+                        passage_verification='not_independently_checked', **self.delivery_freshness(row, deliveries))
         elif kind == 'acquisition':
             item['attribution'] = self.attribution(row)
         elif row['object']['kind'] != 'evidence':
@@ -347,20 +480,27 @@ class Snapshot:
 
     def recall_objects(self, query, kind=None):
         key = normalized(query)
-        words = set(re.findall(r'[^\W_]+', key))
+        terms = [word_forms(w) for w in words(query, query=True)]
+        source_query = source_identifier(query) or key in self.by_identifier or key in self.delivery_identifiers
+        literal = re.compile(r'(?<!\w)' + re.escape(query.strip().casefold()) + r'(?!\w)') if source_query else None
         matches = []
         for row in self.latest.values():
             obj = row['object']
             if kind and obj['kind'] != kind:
                 continue
             text = ' '.join(v for v in obj['content'].values() if isinstance(v, str)).casefold()
-            identifiers = set(re.findall(r'[^\W_]+', (obj['id'] + ' ' + obj['origin']['task']).casefold()))
-            exact = key == normalized(obj['id'])
-            lexical = sum(word in text or word in identifiers for word in words)
+            paper_match = key in self.paper_refs.get(obj['id'], ())
+            exact = key == normalized(obj['id']) or paper_match
+            if source_query:
+                # Namespace expansion is for identity comparisons, never for full-text keywords.
+                exact = exact or key in {self.request(obj['content']), normalized(obj['content'].get('document_id'))}
+                lexical = int(bool(literal.search(text)))
+            else:
+                lexical = lexical_score(terms, ' '.join([obj['id'], obj['origin']['task'], text]))
             if exact or lexical:
                 challenge = any(ref['relation'] == 'challenges' for field in ('source_refs', 'object_refs')
                                 for ref in obj.get(field, ()))
-                rank = (exact, row.get('freshness') == 'needs_review', challenge, lexical,
+                rank = (exact, paper_match, row.get('freshness') == 'needs_review', challenge, lexical,
                         row['deliveries'][-1]['at'], row['deliveries'][-1]['seq'], obj['id'])
                 matches.append((rank, obj['id']))
         for _, identity in sorted(matches, reverse=True):
@@ -388,7 +528,7 @@ class Snapshot:
 
     def recall(self, query, paper, source_sha256, task):
         key = normalized(query)
-        words = set(re.findall(r'[^\W_]+', query.casefold()))
+        terms = [word_forms(w) for w in words(query, query=True)]
         papers, refs, acquisitions = self.candidates(query, allow_title=False)
         source_query = bool(papers or acquisitions or key in self.delivery_identifiers or source_identifier(query))
         passage_address = re.fullmatch(r'(?:passage_)?[0-9a-f]{64}', key)
@@ -408,8 +548,7 @@ class Snapshot:
             exact = source_query or key in (normalized(obj['id']), normalized(content['source_sha256']))
             if passage_address and not exact:
                 continue
-            text = ' '.join([*content.get('section_path', ()), content['text']]).casefold()
-            lexical = len(words.intersection(re.findall(r'[^\W_]+', text)))
+            lexical = 0 if source_query else lexical_score(terms, passage_text(content))
             if lexical or exact:
                 rank = (exact, lexical, len({d['task'] for d in kept}), kept[-1]['at'], kept[-1]['seq'], obj['id'])
                 matches.append((rank, row, kept, sources))

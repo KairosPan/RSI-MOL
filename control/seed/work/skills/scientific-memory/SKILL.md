@@ -10,10 +10,17 @@ A `none` snapshot contains no historical evidence.
 Before delegating literature research or acquiring a paper, call `lookup_sources` with its
 DOI, PMID, PMCID, provider identifier, document ID or title. Check which request and source record
 link the paper to a document. Different papers may share an original file. Use the verification
-and conflict fields when judging the match. Narrow the query when whole results were omitted.
-Use `get_evidence` for a specific ID and revision. Reads show up to three recent deliveries and
-their total count. The tool caps the full MCP receipt at 32 KiB so the native session can record it.
-If a whole passage cannot fit, read the original by document and locator before citing it.
+and conflict fields when judging the match. When a search returns `next_offset`, repeat it with
+the same query and filters and pass that value as `offset`. A result containing `get_evidence`
+gives the arguments for retrieving that revision.
+
+Use `get_evidence` for a specific ID and revision. It shows up to three deliveries at a time.
+Pass its `next_delivery_offset` as `delivery_offset` for older deliveries, or select a delivery
+by `source_run`, `document_id`, `document_version` and/or `invocation_id`.
+When a large revision is split into `object_part` results, read each part in the same thread,
+starting at zero. Repeat the exact request with the returned `next_object_offset` as
+`object_offset` until there is no continuation. The parts contain successive characters of the
+revision's JSON. Read all parts before citing the object or its passage.
 
 Cite a passage using the evidence ID and revision, source run, document ID and version, original
 SHA-256, locator and an exact quote. Identify whether it was returned by memory, read by the

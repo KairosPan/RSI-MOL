@@ -229,6 +229,95 @@ class Replies(unittest.TestCase):
     def rows(self):
         return [json.loads(line) for line in self.runtime.logfile.read_text().splitlines()]
 
+    def read_pages(self, manifest, **selection):
+        session = server.Session(Literature(self.runtime))
+        args = {'document_id': manifest['document_id'], **selection}
+        pages = []
+        while True:
+            result = session.tool_call('read_document', args)
+            self.assertLessEqual(len(server.encode(result)), server.NATIVE_RECEIPT_BYTES)
+            reply = json.loads(result['content'][0]['text'])
+            self.assertFalse(result['isError'], reply.get('errors'))
+            page = reply['data']
+            if pages:
+                self.assertEqual(pages[-1]['char_range'][1], page['char_range'][0])
+            self.assertGreater(page['char_range'][1], page['char_range'][0])
+            self.assertEqual(reply['continuation']['next_cursor'], page['next_cursor'])
+            pages.append(page)
+            if not page['next_cursor']:
+                return pages
+            args['cursor'] = page['next_cursor']
+
+    def test_read_cursor_delivers_each_fitting_block_whole(self):
+        paragraphs = [f'Method {n}: ' + '"中\\' * 72 for n in range(48)]
+        xml = '<article><body><sec>' + ''.join('<p>' + p + '</p>' for p in paragraphs) + '</sec></body></article>'
+        manifest = self.runtime.ingest(xml.encode(), 'application/xml', {})
+        for budget in (8000, 15000, 65536):
+            pages = self.read_pages(manifest, max_bytes=budget)
+            self.assertGreater(len(pages), 1)
+            self.assertEqual(''.join(p['text'] for p in pages), '\n\n'.join(paragraphs))
+            rows = [r for p in pages for r in p['passages']]
+            self.assertTrue(all(r['block_complete'] for r in rows))
+            self.assertEqual([r['locator'] for r in rows], [b['locator'] for b in manifest['blocks']])
+
+    def test_single_oversized_block_progresses_with_correct_utf8_byte_ranges(self):
+        text = '中"\\☃' * 6000
+        xml = '<article><body><p>' + text + '</p></body></article>'
+        metadata = {'license': 'License terms. ' * 3000, 'paper_ref': 'PMC123'}
+        manifest = self.runtime.ingest(xml.encode(), 'application/xml', metadata)
+        pages = self.read_pages(manifest, locator=manifest['blocks'][0]['locator'], max_bytes=65536)
+        self.assertGreater(len(pages), 1)
+        self.assertEqual(''.join(p['text'] for p in pages), text)
+        for page in pages:
+            row, = page['passages']
+            self.assertFalse(row['block_complete'])
+            self.assertEqual(row['source_metadata'], {'paper_ref': 'PMC123'})
+            self.assertEqual(row['omitted_source_metadata_fields'], ['license'])
+            low, high = row['byte_range']
+            self.assertEqual(text.encode()[low:high].decode(), page['text'])
+
+    def test_fixed_coverage_warnings_leave_room_for_a_readable_pdf_line(self):
+        source = self.runtime.ingest(PDF, 'application/pdf', {})
+        binding = {k: source[k] for k in ('document_id', 'document_version', 'source_sha256')}
+        line = '<page width="100" height="100"><line xMin="0" xMax="8" yMin="0" yMax="8">'
+        line += '<word xMin="0" xMax="8" yMin="0" yMax="8">Known</word></line></page>'
+        bbox = ('<doc>' + line + '<page width="100" height="100"/>' * 180 + '</doc>').encode()
+        parser_coverage = {'unread_pages': list(range(2, 182)), 'review_status': 'unreviewed',
+                           'limitations': ['x' * 30000], 'parser_notes': ['y' * 10000]}
+        manifest = self.runtime.ingest(bbox, 'application/vnd.rsi.poppler-bbox+xml',
+                                       {'derived_from': binding, 'extraction_coverage': parser_coverage})
+        page, = self.read_pages(manifest, locator=manifest['blocks'][0]['locator'])
+        row, = page['passages']
+        self.assertTrue(row['block_complete'])
+        self.assertEqual(row['text'], 'Known')
+        self.assertEqual(row['source_metadata']['derived_from'], binding)
+        extracted = row['source_metadata']['extraction_coverage']
+        self.assertEqual(extracted['review_status'], 'unreviewed')
+        self.assertEqual(extracted['omitted_limitations'], 1)
+        self.assertEqual(extracted['omitted_coverage_fields'], {'parser_notes': 1})
+        self.assertEqual(page['coverage']['extraction_status'], 'partial')
+        self.assertEqual(page['coverage']['omitted_limitations'], len(manifest['coverage']['limitations']) - 2)
+
+    def test_fixed_optional_metadata_does_not_hide_a_short_source_block(self):
+        metadata = {'license': 'Readable license text. ' * 1800, 'paper_ref': 'PMC123', 'provider': 'local'}
+        manifest = self.runtime.ingest(b'<article><body><p>Readable.</p></body></article>', 'application/xml', metadata)
+        page, = self.read_pages(manifest)
+        row, = page['passages']
+        self.assertEqual(row['text'], 'Readable.')
+        self.assertTrue(row['block_complete'])
+        self.assertEqual(row['source_metadata'], {'paper_ref': 'PMC123', 'provider': 'local'})
+        self.assertEqual(row['omitted_source_metadata_fields'], ['license'])
+
+    def test_unrepresentable_passage_metadata_allows_continued_text_without_an_invalid_receipt(self):
+        text = 'word ' * 1000 + 'end'
+        xml = '<article><body><p id="' + ('x' * 40000) + '">' + text + '</p></body></article>'
+        manifest = self.runtime.ingest(xml.encode(), 'application/xml', {})
+        pages = self.read_pages(manifest)
+        self.assertEqual(''.join(p['text'] for p in pages), text)
+        for page in pages:
+            self.assertEqual(page['passages'], [])
+            self.assertEqual(page['omitted_passage']['locator'], manifest['blocks'][0]['locator'])
+
     def test_large_reading_index_keeps_its_acquisition_receipt(self):
         data = {'document_id': 'doc_' + 'a' * 64, 'document_version': 'b' * 64, 'source_sha256': 'c' * 64,
                 'media_type': 'application/xml', 'content_scope': 'full_text', 'references': ['ref' * 200] * 60,

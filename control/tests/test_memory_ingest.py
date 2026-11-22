@@ -47,7 +47,7 @@ class Ledger(unittest.TestCase):
         return {'type': 'event_msg', 'timestamp': f'2026-01-01T01:00:{index:02d}Z',
                 'payload': {'type': 'item_completed', 'thread_id': 'lead', 'item': item}}
 
-    def call(self, events, *, status='finished', purpose='task', task='T1', memory=None, child=None):
+    def call(self, events, *, status='finished', purpose='task', task='T1', memory=None, child=None, **end):
         run = self.records.new_id('R')
         fields = {'purpose': purpose, 'task': task, 'version_before': 'V0001', 'thread_id': 'lead',
                   'subagent_threads': ['child'] if child is not None else []}
@@ -59,7 +59,7 @@ class Ledger(unittest.TestCase):
         for tid, rows in [('lead', events), ('child', child)]:
             if rows is not None:
                 (folder / f'rollout-{tid}.jsonl').write_bytes(b''.join(ledger.encode(v) + b'\n' for v in rows))
-        self.records.finish_call(run, {'status': status})
+        self.records.finish_call(run, {'status': status, **end})
         return run
 
     def snapshot(self, condition='live', task=None):
@@ -165,6 +165,27 @@ class Ledger(unittest.TestCase):
         self.assertEqual(report['reasons'], {'invalid invocation_id': 1})
         self.assertEqual(report['delivery_count'], 1)
 
+    def test_legacy_collection_uses_provable_stages_and_keeps_the_committed_batch(self):
+        evidence = self.event(1, 'read_document', {'passages': [self.row]})
+        interrupted = ['Interrupted while collecting the results (KeyboardInterrupt); the remaining steps were not done']
+        ambiguous = self.call([evidence], memory_collection_complete=False, problems=interrupted)
+        usable = self.call([evidence], memory_collection_complete=False,
+                           problems=['Memory proposals could not be collected: missing spool'])
+        late = self.call([evidence], memory_collection_complete=False, problems=interrupted, check={'passed': False})
+        report, = ingest.backfill(self.layout, [usable])
+        self.assertEqual((report['deliveries'], report['proposal_collection']), ({'passage': 1}, 'incomplete'))
+        self.assertEqual([r['run'] for r in ingest.backfill(self.layout)], [late])
+        info = ingest.status(self.layout)
+        self.assertEqual(info['blocked_runs'], [ambiguous])
+        self.assertIn('legacy record', info['blocked_reasons'][ambiguous])
+        with self.assertRaisesRegex(ValueError, ambiguous + '.*session archive'):
+            ingest.backfill(self.layout, [ambiguous])
+        self.assertEqual(ledger.load(self.layout).reports.keys(), {usable, late})
+        # A missing independent report is recreated from committed bytes without reinterpreting the old call.
+        (self.layout.records / 'memory' / f'{usable}.json').unlink()
+        with mock.patch.object(ingest, 'eligible', side_effect=AssertionError('already committed')):
+            self.assertEqual(ingest.backfill(self.layout, [usable]), [report])
+
     def test_malformed_session_manifest_does_not_hide_healthy_pending_records(self):
         bad, good = self.call([]), self.call([])
         first, second = self.records.calls()
@@ -177,7 +198,7 @@ class Ledger(unittest.TestCase):
         self.assertTrue(ingest.eligible({**second, 'problems': [
             'Proposal collection exceeded its 64-file limit',
             'Proposal sample.json could not be collected: expected a bounded single-link regular file']}))
-        self.assertFalse(ingest.eligible({**second, 'problems': [
+        self.assertTrue(ingest.eligible({**second, 'problems': [
             'Proposal sample.json could not be collected: [Errno 5] Input/output error']}))
 
     def test_distinguish_source_failures_from_local_failures_and_unknown_stage(self):

@@ -1,6 +1,8 @@
 """Require a sealed submission and prior, verified deliveries for every judgment reference."""
 import hashlib
 import json
+import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -120,6 +122,96 @@ class Proposals(unittest.TestCase):
         self.assertEqual(second['objects'], {'judgment': 1})
         proof, = ledger.load(self.layout).objects[-1]['source_refs']
         self.assertEqual((proof['source_run'], proof['id'], proof['revision']), (second['run'], passage['id'], 1))
+
+    @staticmethod
+    def object_parts(obj, deliveries, name):
+        canonical = ledger.encode(obj).decode()
+        bounds = (0, len(canonical) // 3, 2 * len(canonical) // 3, len(canonical))
+        pages = []
+        for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
+            part = dict(id=obj['id'], revision=obj['revision'], offset=lo, total_chars=len(canonical),
+                        text=canonical[lo:hi])
+            result = {'results': [{'object_part': part, 'deliveries': deliveries}], 'omitted': 0}
+            if hi < len(canonical):
+                result['next_object_offset'] = hi
+            item = returned('memory', 'get_evidence', f'{name}-{i}', result)
+            item['arguments'] = dict(id=obj['id'], revision=obj['revision'], object_offset=lo)
+            pages.append(item)
+        return pages
+
+    def test_complete_object_and_passage_parts_credit_only_the_final_native_calls(self):
+        sub = self.submit_subquestion()
+        entry = json.loads(self.read['result']['content'][0]['text'])['results'][0]
+        state = ledger.load(self.layout)
+        for _ in range(4):
+            run = self.records.new_id('R')
+            delivery = dict(entry['deliveries'][0], run=run, invocation_id=run + '-later')
+            ledger.publish(self.layout, state, run, [('delivery', delivery)], {})
+        work = self.layout.root / 'paged-reader'
+        work.mkdir()
+        place_snapshot(self.layout, work)
+        package = Path(__file__).resolve().parents[1] / 'seed/work/tools/memory'
+        with mock.patch.object(sys, 'path', [str(package), *sys.path]):
+            reader = runpy.run_path(str(package / 'server.py'))['Server'](work / 'memory')
+        key = dict(id=entry['object']['id'], revision=1)
+        recent = reader.call('get_evidence', key)['results'][0]
+        self.assertEqual(recent['delivery_count'], 5)
+        self.assertNotIn('R0000', [d['run'] for d in recent['deliveries']])
+        source = []
+        query = dict(key, source_run='R0000', max_bytes=650, object_offset=0)
+        while True:
+            page = reader.call('get_evidence', query)
+            self.assertEqual(page['results'][0]['deliveries'][0]['run'], 'R0000')
+            item = returned('memory', 'get_evidence', f'passage-{len(source)}', page)
+            item['arguments'] = query
+            source.append(item)
+            if 'next_object_offset' not in page:
+                break
+            query = dict(query, object_offset=page['next_object_offset'])
+        self.assertGreater(len(source), 1)
+        question = self.object_parts(sub, [], 'question')
+        args = dict(self.args, question_id=sub['id'],
+                    object_refs=[dict(id=sub['id'], revision=1, relation='background')])
+        result = self.record([*source, *question, self.write(2, args)], {2: args})
+        self.assertEqual(result['objects'], {'judgment': 1})
+        registered = ledger.load(self.layout).objects[-1]
+        self.assertEqual(registered['source_refs'][0]['call_id'], source[-1]['id'])
+        self.assertEqual(registered['object_refs'][0]['call_id'], question[-1]['id'])
+        # Audit the registered citation through the same sealed participant sessions and starting snapshot.
+        from rsi.memory_history import trusted_rows, passage_index
+        audit = runpy.run_path(str(package.parents[4] / 'tasks/pool-analysis-readout/audit.py'))
+        call = self.records.load_call(result['run'])
+        state = ledger.load(self.layout)
+        rows = trusted_rows(state, call['memory'])
+        with mock.patch.dict(audit['native_reads'].__globals__, LAYOUT=self.layout):
+            items, reads, starts = audit['native_reads'](call, rows)
+        revisions = {(o['id'], o['revision']): o for o in state.objects}
+        proof = audit['verify_source'](registered['source_refs'][0], items, passage_index(rows), revisions,
+                                       reads, starts['lead', 'native-2'])
+        self.assertEqual((proof['source_run'], proof['call_id']), ('R0000', source[-1]['id']))
+
+    def test_partial_tampered_late_and_cross_thread_pages_cannot_support_a_proposal(self):
+        entry = json.loads(self.read['result']['content'][0]['text'])['results'][0]
+        first, middle, last = self.object_parts(entry['object'], entry['deliveries'], 'passage')
+        damaged = json.loads(json.dumps(middle))
+        body = json.loads(damaged['result']['content'][0]['text'])
+        body['results'][0]['object_part']['text'] = 'X' + body['results'][0]['object_part']['text'][1:]
+        damaged['result']['content'][0]['text'] = json.dumps(body)
+        write = self.write(1)
+        for scenario, events, opts in (
+            ('missing initial segment', [middle, last, write], {}),
+            ('missing middle segment', [first, last, write], {}),
+            ('changed segment', [first, damaged, last, write], {}),
+            ('late final segment', [first, middle, write, last], {}),
+            ('different participants', [last, write], {'child': [first, middle]}),
+            ('earlier segment has later completion clock', [first, middle, last, write],
+             {'clocks': {first['id']: {'completed_at_ms': 100}, middle['id']: {'completed_at_ms': 2},
+                         last['id']: {'completed_at_ms': 3}, write['id']: {'started_at_ms': 4, 'completed_at_ms': 5}}}),
+        ):
+            with self.subTest(scenario=scenario):
+                result = self.record(events, {1: self.args}, **opts)
+                self.assertNotIn('judgment', result['objects'])
+                self.assertEqual(len(result['rejected']), 1)
 
     def test_current_reference_rejects_wrong_quote_address_invocation_and_ledger_fields(self):
         found, ref = self.literature(self.passage())

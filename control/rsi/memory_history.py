@@ -106,6 +106,57 @@ def timeline(layout, call, deadline=None, *, include_proposal_starts=False):
         yield event.get('timestamp'), (rel, position), thread, item, payload
 
 
+class ObjectPartReads:
+    """Authenticate contiguous character ranges of a visible revision read by one thread."""
+
+    def __init__(self, rows):
+        self.objects = {(obj['id'], obj['revision']): obj for row in rows if (obj := row['object'])}
+        self.serialized = {}
+        self.pending = {}
+
+    def verify(self, item, result, native):
+        """Return a completed read and its component events; keep ordinary receipts intact."""
+        rows = result.get('results')
+        if (item.get('tool') != 'get_evidence' or not isinstance(rows, list) or len(rows) != 1
+                or not isinstance(rows[0], dict) or 'object_part' not in rows[0]):
+            return result, ()
+        part = rows[0]['object_part']
+        args = item.get('arguments')
+        if not isinstance(part, dict) or not isinstance(args, dict):
+            return {}, ()
+        ident, rev = part.get('id'), part.get('revision')
+        if not isinstance(ident, str) or type(rev) is not int:
+            return {}, ()
+        key = ident, rev
+        group = native['thread'], key
+        expected, events = self.pending.pop(group, (0, []))
+        offset, total, text = part.get('offset'), part.get('total_chars'), part.get('text')
+        if (key not in self.objects or args.get('id') != ident
+                or type(args.get('revision', rev)) is not int or args.get('revision', rev) != rev
+                or type(offset) is not int or offset < 0 or type(args.get('object_offset', 0)) is not int
+                or args.get('object_offset', 0) != offset or type(total) is not int
+                or not isinstance(text, str) or not text):
+            return {}, ()
+        if offset == 0:
+            expected, events = 0, []
+        if key not in self.serialized:
+            self.serialized[key] = encode(self.objects[key]).decode()
+        canonical = self.serialized[key]
+        end = offset + len(text)
+        if (offset != expected or total != len(canonical) or not canonical.startswith(text, offset)
+                or type(result.get('omitted')) is not int or result['omitted'] != 0):
+            return {}, ()
+        if end < total:
+            if type(result.get('next_object_offset')) is int and result['next_object_offset'] == end:
+                events.append(native)
+                self.pending[group] = end, events
+            return {}, ()
+        if 'next_object_offset' in result:
+            return {}, ()
+        events.append(native)
+        return {'results': [{'object': self.objects[key], 'deliveries': rows[0].get('deliveries')}]}, tuple(events)
+
+
 def returned_memory(tool, result, trusted):
     if tool not in ('get_evidence', 'recall_objects', 'recall_passages'):
         return

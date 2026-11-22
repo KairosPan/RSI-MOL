@@ -84,7 +84,7 @@ def collect(workspace: Path, expected: list[int], call_dir: Path) -> list[str]:
             for name in sorted(names):
                 try:
                     raw = _read(folder, name)
-                except ValueError as error:
+                except (OSError, ValueError) as error:
                     problems.add(f'Proposal {name} could not be collected: {error}')
                     continue
                 with (staged / name).open('xb') as output:

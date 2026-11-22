@@ -279,11 +279,14 @@ class MoreLabRuns(unittest.TestCase):
             # Codex had ended: the call keeps its status and usage, and says what was not done.
             self.assertEqual((second['status'], second['usage']['input_tokens']), ('finished', 0))
             self.assertTrue(any('KeyboardInterrupt' in line for line in second['problems']))
-            self.assertFalse(second['memory_collection_complete'])
-            self.assertFalse(memory_ingest.eligible({**second, 'problems': []}))
+            self.assertTrue(second['memory_collection_complete'])
+            self.assertEqual(second['memory_collection'], {'sessions': 'complete', 'proposals': 'not_requested',
+                                                          'results': 'interrupted'})
+            self.assertTrue(memory_ingest.eligible(second))
             legacy = dict(second)
-            del legacy['memory_collection_complete']
-            self.assertFalse(memory_ingest.eligible(legacy))
+            del legacy['memory_collection']
+            legacy['memory_collection_complete'] = False
+            self.assertTrue(memory_ingest.eligible(legacy))  # the recorded check was reached after proof collection
             # The collection left its sealed tree in the root and no work/: nothing runs until rsi recover has kept
             # the tree under sealed/ and put main's head back.
             with self.assertRaisesRegex(Refused, 'rsi recover'):
@@ -292,7 +295,7 @@ class MoreLabRuns(unittest.TestCase):
             root.model.push(say('ok'))
             self.assertEqual(run_task(root.layout, 'T1')['status'], 'finished')
             self.assertEqual((root.layout.work / 'left.txt').read_text(), 'what the interrupted run left')
-            self.assertFalse((root.layout.records / 'memory' / f'{second["id"]}.json').exists())
+            self.assertTrue((root.layout.records / 'memory' / f'{second["id"]}.json').is_file())
 
     def test_damaged_memory_preserves_work_and_the_no_memory_control(self):
         with Root() as root:
@@ -327,7 +330,7 @@ class MoreLabRuns(unittest.TestCase):
             self.assertFalse((work / 'notes.md').exists())
             self.assertEqual(json.loads((work / 'memory/status.json').read_bytes())['condition'], 'unavailable')
 
-    def test_failed_proof_collection_keeps_the_model_status_and_skips_registration(self):
+    def test_only_failed_session_collection_blocks_registration(self):
         with Root() as root:
             root.add_task('T')
             (root.layout.work / 'codex').mkdir()
@@ -339,11 +342,19 @@ class MoreLabRuns(unittest.TestCase):
                         call = run_task(root.layout, 'T')
                     self.assertEqual(call['status'], 'finished')
                     self.assertFalse(call['memory_collection_complete'])
-                    self.assertFalse(memory_ingest.eligible(call))
+                    session_ok = collection == 'proposal_files.collect'
+                    self.assertEqual(memory_ingest.eligible(call), session_ok)
                     legacy = dict(call)
-                    del legacy['memory_collection_complete']
-                    self.assertFalse(memory_ingest.eligible(legacy))
-                    self.assertFalse((root.layout.records / 'memory' / f'{call["id"]}.json').exists())
+                    del legacy['memory_collection']
+                    self.assertEqual(memory_ingest.eligible(legacy), session_ok)
+                    report_path = root.layout.records / 'memory' / f'{call["id"]}.json'
+                    self.assertEqual(report_path.is_file(), session_ok)
+                    if session_ok:
+                        self.assertEqual(json.loads(report_path.read_bytes())['proposal_collection'], 'incomplete')
+                    else:
+                        self.assertIn(call['id'], memory_ingest.status(root.layout)['blocked_runs'])
+                        with self.assertRaisesRegex(ValueError, 'session archive'):
+                            memory_ingest.backfill(root.layout, [call['id']])
 
     def test_unusable_control_folders_never_block_a_run(self):
         with Root() as root:

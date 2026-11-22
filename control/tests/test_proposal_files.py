@@ -153,6 +153,25 @@ class ProposalFiles(unittest.TestCase):
         with self.assertRaises(OSError):
             proposal_files.collect(self.work, identity, other_record)
 
+    def test_unreadable_proposal_leaves_other_complete_attachments_available(self):
+        identity = proposal_files.prepare(self.work)
+        first, second = (f'{n:032x}.json' for n in (1, 2))
+        (self.spool / first).write_bytes(b'{"first":true}')
+        (self.spool / second).write_bytes(b'{"second":true}')
+        read = proposal_files._read
+
+        def read_one(folder, name):
+            if name == first:
+                raise OSError('temporary read failure')
+            return read(folder, name)
+
+        with patch.object(proposal_files, '_read', side_effect=read_one):
+            notices = proposal_files.collect(self.work, identity, self.record)
+        self.assertEqual(len(notices), 1)
+        self.assertIn(first, notices[0])
+        saved, = (self.record / 'proposals').iterdir()
+        self.assertEqual((saved.name, saved.read_bytes()), (second, b'{"second":true}'))
+
     def test_contention_and_full_spool_report_a_tool_error(self):
         proposal_files.prepare(self.work)
         place_snapshot(Layout(self.root), self.work)

@@ -239,6 +239,56 @@ class MemorySnapshot(unittest.TestCase):
         self.assertEqual(info['omitted']['deliveries'], len(self.state.deliveries))
         self.assertEqual((limited / 'memory' / 'evidence.jsonl').read_bytes(), b'')
 
+    def test_text_queries_preserve_numbers_scientific_terms_and_inflections(self):
+        paper = self.state.objects[0]['content']
+        paper.update(title='CONSORT 2010 statement on GO:0006915')
+        self.state.objects[-1]['content'].update(section_path=['Body', 'Sampling methods'],
+            text='SAMtools performed paired alignments in 2009. Measurements: 95. GO:0006915.')
+        work, _ = self.place()
+        positive = ('2009', '95', 'GO:0006915', 'samtools:view', 'pair', 'align', 'measure', 'methods')
+        negative = ('200', '950', 'goals', 'med', 'body', 'PMID:95', 'MED:2009', 'W2009')
+        found = self.values(work, [('recall_passages', {'query': q}) for q in (*positive, *negative)])
+        for query, response in zip((*positive, *negative), found):
+            self.assertEqual([r['id'] for r in response['results']], ['paragraph'] if query in positive else [], query)
+        titles = self.values(work, [('lookup_sources', {'query': q}) for q in ('2010', 'GO:0006915', '201')])
+        self.assertEqual([r['type'] for r in titles[0]['results']], ['paper', 'acquisition', 'passage'])
+        self.assertEqual(titles[1]['results'], titles[0]['results'])
+        self.assertEqual(titles[2]['results'], [])
+
+    def test_generated_headings_and_provider_names_do_not_add_unrelated_matches(self):
+        para = self.state.objects[-1]
+        para['content'].update(section_path=['Body', 'Untitled section'], text='Our goal was to compare repairs.')
+        other = object_row('real', 1, 'R4', 'B', 'passage', section_path=['Body', 'Body weight'], text='Observed mass.',
+                           source_sha256=SHA, locator='block:8', parser_version='v1')
+        self.state.objects.append(other)
+        self.state.deliveries.append(receipt('real', 1, 8, 'B', 'R4', document_id='doc_b', document_version='vb'))
+        for i in (1, 2):
+            self.state.objects.append(object_row('oa' + str(i), 1, 'R5', 'B', 'paper', provider='openalex',
+                                                 paper_id=f'openalex:W{i}', title=f'OpenAlex paper {i}'))
+            self.state.deliveries.append(receipt('oa' + str(i), 1, i + 8, 'B', 'R5'))
+        work, _ = self.place()
+        body, no_section, go, pair, oa, absent = self.values(work, [
+            ('recall_passages', {'query': q}) for q in ('body weight', 'section', 'GO:0006915', 'pair')] + [
+            ('recall_objects', {'query': q}) for q in ('W1', 'W10')])
+        self.assertEqual([r['id'] for r in body['results']], ['real'])
+        self.assertTrue(all(r['results'] == [] for r in (no_section, go, pair, absent)))
+        self.assertEqual([r['object']['id'] for r in oa['results']], ['oa1'])
+
+    def test_unspaced_passages_and_judgments_match_local_phrases(self):
+        self.add_judgments()
+        para = next(o for o in self.state.objects if o['id'] == 'paragraph')
+        para['content']['text'] += ' 先计算池内差值，再等权汇总。解析した結果です。การทดลองทางวิทยาศาสตร์'
+        judgment = next(o for o in self.state.objects if o['id'] == 'J')
+        judgment['content']['statement'] = '先计算池内差值，再等权汇总。'
+        work, _ = self.place()
+        queries = ('池内差值', '如何汇总配对差值', '解析した', 'ทดลอง', '秋風夜雨')
+        matches = self.values(work, [('recall_passages', {'query': q}) for q in queries] + [
+            ('recall_judgments', {'query': '如何汇总配对差值'})])
+        for response in matches[:4]:
+            self.assertEqual([r['id'] for r in response['results']], ['paragraph'])
+        self.assertEqual(matches[4]['results'], [])
+        self.assertEqual([r['object']['id'] for r in matches[5]['results']], ['J'])
+
     def test_native_budget_counts_escaping_and_caps_repeated_deliveries(self):
         from seed.work.tools.memory.query import NATIVE_RECEIPT_BYTES, bounded, encode
         # A single large row and a dense mix of quotes, escapes and UTF-8 text.
@@ -259,6 +309,97 @@ class MemorySnapshot(unittest.TestCase):
             row, = page['results']
             self.assertEqual(row['delivery_count'], 14)
             self.assertEqual([d['invocation_id'] for d in row['deliveries']], ['21', '20', '19'])
+
+    def test_exact_delivery_filters_and_pages_preserve_historical_citations(self):
+        from rsi.memory_history import passage_index, returned_memory
+
+        original = self.state.deliveries[-1]
+        self.state.deliveries.extend(dict(original, seq=n, at=str(n), invocation_id=str(n)) for n in range(10, 19))
+        work, _ = self.place()
+        key = {'id': 'paragraph', 'revision': 1}
+        addresses = {'source_run': 'R1', 'document_id': 'doc_a', 'document_version': 'va', 'invocation_id': 'call-6'}
+        early, wrong, hidden = self.values(work, [('get_evidence', {**key, **addresses}),
+            ('get_evidence', {**key, **addresses, 'invocation_id': '17'}),
+            ('get_evidence', {**key, 'source_run': 'R2'})])
+        row, = early['results']
+        self.assertEqual((row['delivery_count'], row['deliveries'][0]['run']), (1, 'R1'))
+        self.assertEqual([s['acquisition_id'] for s in row['sources']], ['get_a'])
+        self.assertEqual(wrong['results'], hidden['results'])
+        self.assertFalse(hidden['results'])
+        trusted = passage_index([json.loads(line) for line in (work / 'memory/evidence.jsonl').read_bytes().splitlines()])
+        [(address, proof)] = returned_memory('get_evidence', early, trusted)
+        self.assertEqual((address[:2], proof['source_run'], proof['historical_invocation']), (('doc_a', 'va'), 'R1', 'call-6'))
+        deliveries, offset = [], 0
+        while offset is not None:
+            page, = self.values(work, [('get_evidence', {**key, 'delivery_offset': offset})])
+            row, = page['results']
+            deliveries.extend(d['invocation_id'] for d in row['deliveries'])
+            offset = row.get('next_delivery_offset')
+        self.assertEqual(deliveries, [str(n) for n in reversed(range(10, 19))] + ['call-7', 'call-6'])
+
+    def test_search_continuations_visit_every_ranked_result_once(self):
+        from seed.work.tools.memory.query import Snapshot
+
+        self.add_judgments()
+        original = next(o for o in self.state.objects if o['id'] == 'paragraph')
+        for seq in range(21, 28):
+            ident = f'passage_{seq}'
+            self.state.objects.append({**original, 'id': ident})
+            self.state.deliveries.append(receipt(ident, 1, seq, 'A', 'R1', document_id='doc_a', document_version='va'))
+        work, _ = self.place('live')
+        snapshot = Snapshot(work / 'memory')
+        cases = [('lookup_sources', 'PMID:123', snapshot.lookup('PMID:123')),
+                 ('recall_objects', 'paired', snapshot.recall_objects('paired')),
+                 ('recall_judgments', 'paired', snapshot.recall_judgments('paired')),
+                 ('recall_passages', 'quoted', snapshot.recall('quoted', None, None, None))]
+
+        def identity(row):
+            obj = row.get('get_evidence', row.get('object', row))
+            return obj['id'], obj['revision']
+
+        for name, query, ranked in cases:
+            with self.subTest(tool=name):
+                expected = [identity(row) for row in ranked]
+                self.assertGreater(len(expected), 1)
+                offset, found = 0, []
+                while offset is not None:
+                    page, = self.values(work, [(name, {'query': query, 'offset': offset, 'max_bytes': 1050})])
+                    self.assertTrue(page['results'])
+                    found.extend(identity(row) for row in page['results'])
+                    self.assertEqual(page['omitted'], len(expected) - len(found))
+                    offset = page.get('next_offset')
+                    self.assertIn(offset, (None, len(found)))
+                self.assertEqual(found, expected)
+
+    def test_oversize_revision_has_a_search_pointer_and_lossless_unicode_pages(self):
+        from rsi.memory_store import encode
+        from seed.work.tools.memory.query import NATIVE_RECEIPT_BYTES
+
+        self.add_judgments()
+        obj = next(o for o in self.state.objects if o['id'] == 'J')
+        obj['content']['statement'] = '存🧬"\\\n' * 8000
+        work, _ = self.place('live')
+        expected = next(row['object'] for row in map(json.loads, (work / 'memory/evidence.jsonl').read_bytes().splitlines())
+                        if row['object']['id'] == 'J')
+        found, = self.values(work, [('recall_judgments', {'query': 'J'})])
+        key = found['results'][0]['get_evidence']
+        self.assertEqual(key, {'id': 'J', 'revision': 1})
+        chunks, args = [], key
+        while True:
+            reply, = self.mcp(work, [('get_evidence', args)])
+            self.assertFalse(reply['isError'])
+            self.assertLessEqual(len(encode(reply)), NATIVE_RECEIPT_BYTES)
+            page = json.loads(reply['content'][0]['text'])
+            part = page['results'][0]['object_part']
+            self.assertEqual(part['offset'], args.get('object_offset', 0))
+            self.assertTrue(part['text'])
+            chunks.append(part['text'])
+            if 'next_object_offset' not in page:
+                break
+            self.assertEqual(page['next_object_offset'], part['offset'] + len(part['text']))
+            args = {**key, 'object_offset': page['next_object_offset']}
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(''.join(chunks).encode(), encode(expected))
 
     def test_latest_visible_revision_can_have_a_hidden_predecessor(self):
         work, _ = self.place('trial', 'A')

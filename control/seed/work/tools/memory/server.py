@@ -9,7 +9,7 @@ import sys
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
-from query import DEFAULT_BYTES, NATIVE_RECEIPT_BYTES, Snapshot, bounded, encode
+from query import DEFAULT_BYTES, NATIVE_RECEIPT_BYTES, Snapshot, bounded, encode, exact_page
 
 PROTOCOLS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')
 MAX_REQUEST = 64 * 1024
@@ -19,6 +19,8 @@ TEXT = {'type': 'string', 'minLength': 1, 'maxLength': 4096}
 BYTES = {'type': 'integer', 'minimum': 64, 'maximum': 16 << 20,
          'description': 'Maximum UTF-8 result bytes. The escaped MCP receipt is also capped at 32 KiB. '
                         'Whole items that do not fit count as omitted.'}
+OFFSET = {'type': 'integer', 'minimum': 0}
+SEARCH = {'query': TEXT, 'max_bytes': BYTES, 'offset': OFFSET}
 CITATION_FIELDS = {key: TEXT for key in ('document_id', 'document_version', 'source_sha256', 'locator', 'quote')}
 CITATION_FIELDS['relation'] = {'type': 'string', 'enum': ['supports', 'challenges', 'background', 'derived_from']}
 HISTORICAL_FIELDS = dict(CITATION_FIELDS, evidence_id=TEXT, revision={'type': 'integer', 'minimum': 1}, source_run=TEXT)
@@ -57,19 +59,22 @@ TOOLS = {
     'memory_status': spec('Report the condition, ledger version, visible counts and omissions for this snapshot.', {}),
     'lookup_sources': spec('Look up a paper identifier, title or document ID. See acquisition requests, reported '
                            'identifier checks, conflicts and delivered passage addresses.',
-                           {'query': TEXT, 'max_bytes': BYTES}, ['query']),
+                           SEARCH, ['query']),
     'recall_passages': spec('Retrieve complete historical passages by keywords or an exact identifier. Optionally '
                             'filter by paper, original SHA-256 or source task.',
-                            {'query': TEXT, 'paper': TEXT, 'source_sha256': TEXT, 'task': TEXT, 'max_bytes': BYTES},
+                            {**SEARCH, 'paper': TEXT, 'source_sha256': TEXT, 'task': TEXT},
                             ['query']),
     'get_evidence': spec('Get a memory object and its visible deliveries. Omit revision for the latest visible '
-                         'version.', {'id': TEXT, 'revision': {'type': 'integer', 'minimum': 1},
-                                      'max_bytes': BYTES}, ['id']),
+                         'version. Select a historical delivery by source_run, document_id, document_version or '
+                         'invocation_id. Follow next_delivery_offset for older deliveries and next_object_offset '
+                         'for the rest of a large revision.', {'id': TEXT, 'revision': {'type': 'integer', 'minimum': 1},
+                         'source_run': TEXT, 'document_id': TEXT, 'document_version': TEXT, 'invocation_id': TEXT,
+                         'delivery_offset': OFFSET, 'object_offset': OFFSET, 'max_bytes': BYTES}, ['id']),
     'recall_judgments': spec('Retrieve historical judgments with their applicable scope and evidence.',
-                             {'query': TEXT, 'max_bytes': BYTES}, ['query']),
+                             SEARCH, ['query']),
     'recall_objects': spec('Search visible memory objects, optionally by kind, with freshness and supporting or '
-                           'challenging references.', {'query': TEXT, 'kind': {'type': 'string',
-                           'enum': ['evidence', *CONTENT_FIELDS]}, 'max_bytes': BYTES}, ['query']),
+                           'challenging references.', {**SEARCH, 'kind': {'type': 'string',
+                           'enum': ['evidence', *CONTENT_FIELDS]}}, ['query']),
     'propose_memory': spec('Submit an interpretation for review after the run. Use text for question, statement for '
                            'judgment, decision for decision, description for investigation, or change, rationale and '
                            'outcome for method_experience. Each kind except question requires scope and a source_refs '
@@ -201,9 +206,13 @@ class Server:
         elif name == 'recall_objects':
             items = self.snapshot.recall_objects(args['query'], args.get('kind'))
         else:
-            items = self.snapshot.get_evidence(args['id'], args.get('revision'))
-        default = NATIVE_RECEIPT_BYTES if name == 'get_evidence' else DEFAULT_BYTES
-        return bounded(items, args.get('max_bytes', default))
+            address = {key: args[key] for key in ('document_id', 'document_version', 'invocation_id') if key in args}
+            if 'source_run' in args:
+                address['run'] = args['source_run']
+            items = self.snapshot.get_evidence(args['id'], args.get('revision'), address=address,
+                                               delivery_offset=args.get('delivery_offset', 0))
+            return exact_page(items, args.get('max_bytes', NATIVE_RECEIPT_BYTES), args.get('object_offset'))
+        return bounded(items, args.get('max_bytes', DEFAULT_BYTES), offset=args.get('offset', 0))
 
     def handle(self, message):
         if not isinstance(message, dict) or message.get('jsonrpc') != '2.0' or not isinstance(message.get('method'), str):

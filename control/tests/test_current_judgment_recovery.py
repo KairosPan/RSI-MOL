@@ -51,18 +51,42 @@ def clone_inputs(layout, run, path):
     return replica
 
 
+def install_paired_source(layout):
+    for folder in ('tools', 'codex'):
+        shutil.copytree(SEED / folder, layout.work / folder, ignore=shutil.ignore_patterns('__pycache__'))
+    (layout.work / 'paired.xml').write_bytes(SOURCE)
+    (layout.work / 'tools/literature/sources.json').write_text(json.dumps({'paired': {
+        'path': 'paired.xml', 'media_type': 'application/xml', 'sha256': hashlib.sha256(SOURCE).hexdigest()}}))
+
+
 @needs_codex
 class CurrentJudgmentRecovery(unittest.TestCase):
+    def test_missing_proposal_spool_preserves_the_verified_read_in_the_same_task(self):
+        with Root() as root:
+            root.add_task('author')
+            layout = root.layout
+            install_paired_source(layout)
+            root.model.push(run_js(READ_AND_PROPOSE), say('done'))
+            with mock.patch('rsi.labrun.proposal_files.collect', side_effect=FileNotFoundError('missing proposal spool')):
+                call = run_task(layout, 'author')
+            run = call['id']
+            report, = memory_ingest.backfill(layout, [run])
+            self.assertEqual(call['memory_collection'], {'sessions': 'complete', 'proposals': 'incomplete',
+                                                        'results': 'finished'})
+            self.assertEqual(report['proposal_collection'], 'incomplete')
+            self.assertGreater(report['deliveries']['passage'], 0)
+            self.assertEqual(report['deliveries']['acquisition'], 1)
+            self.assertNotIn('judgment', report['objects'])
+            self.assertEqual(report['reasons']['native submission lacks a sealed proposal attachment'], 1)
+            self.assertEqual(memory_ingest.status(layout)['blocked_runs'], [])
+            self.assertEqual(memory_ingest.verify(layout)['runs'], 1)
+
     def test_first_read_and_judgment_publish_and_recover_together(self):
         with Root() as root, tempfile.TemporaryDirectory() as replicas:
             for task in ('author', 'reader'):
                 root.add_task(task)
             layout = root.layout
-            for folder in ('tools', 'codex'):
-                shutil.copytree(SEED / folder, layout.work / folder, ignore=shutil.ignore_patterns('__pycache__'))
-            (layout.work / 'paired.xml').write_bytes(SOURCE)
-            (layout.work / 'tools/literature/sources.json').write_text(json.dumps({'paired': {
-                'path': 'paired.xml', 'media_type': 'application/xml', 'sha256': hashlib.sha256(SOURCE).hexdigest()}}))
+            install_paired_source(layout)
 
             root.model.push(run_js(READ_AND_PROPOSE), say('done'))
             with stop_publishing_in(layout.memory / 'batches'):

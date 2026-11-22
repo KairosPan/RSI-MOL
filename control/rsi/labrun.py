@@ -597,6 +597,9 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     end = {'status': result.status, 'exit_code': result.exit_code, 'thread_id': result.thread_id,
            'usage': result.usage, 'command': result.command, 'ended': _now(), 'check': None,
            'subagent_threads': [], 'version_after': None}
+    collection = {'sessions': 'not_started', 'proposals': 'not_started' if 'proposal_workspace' in run.fields
+                  else 'not_requested', 'results': 'not_started'}
+    end.update(memory_collection=collection, memory_collection_complete=False)
     if run.name == 'trial':
         end['tree_after'] = None
     else:
@@ -605,7 +608,9 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
     try:
         manual = _collect(layout, records, store, run, call_id, call_dir, result, end, problems)
     except BaseException as error:                  # only an interruption gets here: each step catches Exception
-        end['memory_collection_complete'] = False
+        for phase, state in collection.items():
+            if state == 'collecting':
+                collection[phase] = 'interrupted'
         problems.append(f'Interrupted while collecting the results ({type(error).__name__}); the remaining steps were '
                         'not done')
         try:
@@ -614,6 +619,7 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
         except Exception:
             pass
         raise
+    collection['results'] = 'finished'
     call = records.finish_call(call_id, {**end, 'problems': problems})
     if run.name == 'trial':
         return call
@@ -640,12 +646,14 @@ def _execute(layout: Layout, records: Records, store: VersionStore, run: _Run) -
 def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, call_id: str, call_dir: Path, result,
              end: dict, problems: list[str]) -> tuple[Path, Settings] | None:
     """Collect the call and prepare the owner's next workspace in private staging before finalizing the record."""
+    collection = end['memory_collection']
+    collection['sessions'] = 'collecting'
     session_problems = []
     if result.thread_id is not None:
         with _problem(session_problems, 'Could not copy the session records'):
             end['subagent_threads'] = collect_sessions(layout.lab_home, result.thread_id, call_dir / 'sessions',
                                                         problems=session_problems)
-    end['memory_collection_complete'] = bool(result.thread_id) and not session_problems
+    collection['sessions'] = 'complete' if result.thread_id and not session_problems else 'incomplete'
     problems.extend(session_problems)
     context = {**run.context, 'call': call_id}
     with _root(layout) as root_fd:
@@ -661,16 +669,20 @@ def _collect(layout: Layout, records: Records, store: VersionStore, run: _Run, c
                 problems.extend(literature_logs.collect(layout.root / entry, run.fields['literature_workspace'],
                                                         call_dir))
         if 'proposal_workspace' in run.fields:
+            collection['proposals'] = 'collecting'
             try:
                 if entry is None:
                     raise ValueError('the workspace could not be sealed')
                 notices = proposal_files.collect(layout.root / entry, run.fields['proposal_workspace'], call_dir)
             except Exception as error:
-                end['memory_collection_complete'] = False
+                collection['proposals'] = 'incomplete'
                 problems.append(f'Memory proposals could not be collected: {type(error).__name__}: {error}')
             else:
-                # Rejected filenames, file types and capacity violations are ordinary collection diagnostics.
+                collection['proposals'] = 'partial' if notices else 'complete'
                 problems.extend(notices)
+        end['memory_collection_complete'] = (collection['sessions'] == 'complete'
+                                             and collection['proposals'] in ('complete', 'not_requested'))
+        collection['results'] = 'collecting'
         out = call_dir / 'out'
         with _problem(problems, f'out/{run.out_name} could not be collected into the record'):
             if entry is None:

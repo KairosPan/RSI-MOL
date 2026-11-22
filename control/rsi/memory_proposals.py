@@ -5,7 +5,7 @@ import json
 import re
 
 from rsi import memory_store as ledger
-from rsi.memory_history import (ADDRESS, attachment, passage_index, require, returned_memory,
+from rsi.memory_history import (ADDRESS, ObjectPartReads, attachment, passage_index, require, returned_memory,
                                 returned_objects, timeline, trusted_rows)
 from rsi.memory_receipts import CALLS_LIMIT, INVOCATION, deadline_check
 from rsi.records import CALL_ID
@@ -37,7 +37,9 @@ def _stamp(value):
         return None
 
 
-def _before(read, proposal):
+def read_before_proposal(read, proposal):
+    if read.get('part_reads'):
+        return all(read_before_proposal(part, proposal) for part in read['part_reads'])
     marker = proposal['start_position']
     boundary = marker if marker is not None else proposal['position']
     same_session = read['position'][0] == boundary[0]
@@ -75,15 +77,10 @@ def _native_bounds(stamp, item, payload):
     return start, end
 
 
-def _proofs(reg, rows, current):
-    """Bind prior memory reads and successfully staged literature deliveries to their native completions."""
-    reads, writes = defaultdict(list), defaultdict(list)
+def timed_completions(events):
+    """Expose native read completions and the earliest verifiable proposal boundary."""
     starts = {}
-    passages = passage_index(rows)
-    objects = {(o['id'], o['revision']): ledger.encode(o) for row in rows if (o := row['object'])['kind'] in CONTENT_FIELDS}
-    count = 0
-    for stamp, pos, thread, item, payload in timeline(reg.layout, reg.call, reg.deadline, include_proposal_starts=True):
-        tool = item['tool']
+    for stamp, pos, thread, item, payload in events:
         if payload['type'] == 'item_started':
             require(len(starts) < CALLS_LIMIT, 'proposal start receipt limit')
             starts[thread, item['id']] = (pos, payload.get('started_at_ms'))
@@ -100,7 +97,20 @@ def _proofs(reg, rows, current):
                 start = min(start, marker_time) if start is not None else marker_time
         except (OverflowError, ValueError):
             continue
-        native = {'at': stamp or '', 'time': end, 'position': pos, 'thread': thread, 'call_id': item['id']}
+        yield item, {'at': stamp or '', 'time': end, 'position': pos, 'thread': thread, 'call_id': item['id'],
+                     'start': start, 'start_position': start_position}
+
+
+def _proofs(reg, rows, current):
+    """Bind prior memory reads and successfully staged literature deliveries to their native completions."""
+    reads, writes = defaultdict(list), defaultdict(list)
+    passages = passage_index(rows)
+    objects = {(o['id'], o['revision']): ledger.encode(o) for row in rows if (o := row['object'])['kind'] in CONTENT_FIELDS}
+    parts_read = ObjectPartReads(rows)
+    count = 0
+    events = timeline(reg.layout, reg.call, reg.deadline, include_proposal_starts=True)
+    for item, native in timed_completions(events):
+        thread, tool = native['thread'], item['tool']
         if item['server'] == 'literature':
             for d in current.get((thread, item['id']), ()):
                 content = reg.latest[d['id']]['content']
@@ -128,9 +138,11 @@ def _proofs(reg, rows, current):
             if not (isinstance(pid, str) and INVOCATION.fullmatch(pid) and value.get('status') == 'pending'):
                 continue
             require(len(writes) < CALLS_LIMIT or pid in writes, 'proposal receipt limit')
-            writes[pid].append({**native, 'start': start, 'start_position': start_position,
-                                'args': item.get('arguments')})
+            writes[pid].append({**native, 'args': item.get('arguments')})
         else:
+            value, part_events = parts_read.verify(item, value, native)
+            if part_events:
+                native = {**native, 'part_reads': part_events}
             for address, match in returned_memory(tool, value, passages):
                 count += 1
                 require(count <= MAX_MATCHES, 'proposal evidence receipt limit')
@@ -161,7 +173,7 @@ def _reference(ref, reads, proposal, history_error):
     address = tuple(ref[k] for k in ADDRESS)
     located = [r for r in candidates if r['address'] == address and (current or r['source_run'] == ref['source_run'])]
     require(located, 'evidence address or historical delivery does not match')
-    preceding = [r for r in located if _before(r, proposal)]
+    preceding = [r for r in located if read_before_proposal(r, proposal)]
     require(preceding, 'tool returned the evidence after the proposal or without verifiable ordering')
     matches = [r for r in preceding if ref['quote'] in r['text']]
     require(matches, 'quotation does not occur verbatim in the returned evidence')
@@ -181,7 +193,7 @@ def _object_reference(ref, ident, reads, write, history_error):
     require(not history_error, history_error)
     candidates = reads.get(('object', ref['id'], ref['revision']), ())
     require(candidates, 'object revision was not returned by memory in this run')
-    match = next((r for r in candidates if _before(r, write)), None)
+    match = next((r for r in candidates if read_before_proposal(r, write)), None)
     require(match, 'tool returned the object after the proposal or without verifiable ordering')
     return {**ref, 'thread': match['thread'], 'call_id': match['call_id']}
 

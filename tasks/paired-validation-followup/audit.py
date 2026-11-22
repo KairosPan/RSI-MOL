@@ -9,7 +9,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / 'control'))
-from rsi.memory_history import ADDRESS, attachment, read, require, returned_memory, timeline, trusted_passages
+from rsi.memory_history import (ADDRESS, ObjectPartReads, attachment, passage_index, read, require,
+                                returned_memory, timeline, trusted_rows)
 from rsi.memory_store import load
 from rsi.paths import Layout
 from rsi.records import CALL_ID
@@ -24,9 +25,11 @@ def completions(layout, call):
         yield thread, item
 
 
-def receipts(events, trusted):
+def receipts(events, rows):
     counts = Counter()
     memory, literature = defaultdict(list), defaultdict(list)
+    trusted = passage_index(rows)
+    parts_read = ObjectPartReads(rows)
     for thread, item in events:
         name, tool = item['server'], item['tool']
         counts[name, tool] += 1
@@ -44,6 +47,8 @@ def receipts(events, trusted):
                 continue
             call = {'thread': thread, 'call_id': item['id'], 'tool': tool}
             if name == 'memory':
+                if len(reply['content']) == 1:
+                    result, _ = parts_read.verify(item, result, call)
                 for address, match in returned_memory(tool, result, trusted):
                     memory[address].append({**call, **match})
             elif tool in ('read_document', 'find_passages') and result.get('status') in ('ok', 'partial'):
@@ -157,8 +162,8 @@ def arm(layout, run, condition, state):
     require(call['id'] == run and call['purpose'] == 'task' and call['task'] == TASK and
             call['status'] == 'finished' and call['memory']['condition'] == condition,
             f'Expected a completed {condition} run of {TASK}: {run}')
-    trust = trusted_passages(state, call['memory'])
-    counts, memory, literature = receipts(completions(layout, call), trust)
+    rows = trusted_rows(state, call['memory'])
+    counts, memory, literature = receipts(completions(layout, call), rows)
     classified, coverage = final_citations(layout, call, memory, literature)
     observed = Counter(r['observed'] for r in classified)
     elapsed = (datetime.fromisoformat(call['ended']) - datetime.fromisoformat(call['started'])).total_seconds()
