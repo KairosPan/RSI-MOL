@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from rsi import fs as os
-from rsi.paths import SAFE_ID, is_link
+from rsi.paths import SAFE_ID
 
 SETTINGS = 'codex/settings.toml'
 AGENTS = 'codex/agents'
@@ -112,10 +112,20 @@ def _read_table(path: Path, label: str, problems: list[str]) -> dict | None:
     return None
 
 
-def _linked(workspace: Path, folder: str, problems: list[str]) -> bool:
-    """Whether a workspace folder is a symbolic link; then nothing below it is read."""
-    if is_link(workspace / folder):
+def _invalid_folder(workspace: Path, folder: str, problems: list[str]) -> bool:
+    """Report existing entries that cannot serve as a workspace settings directory."""
+    try:
+        info = os.lstat(workspace / folder)
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        problems.append(f'{folder}: cannot be read ({error.strerror})')
+        return True
+    if stat.S_ISLNK(info.st_mode) or (os.name == 'nt' and info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
         problems.append(f'{folder}: a symbolic link; nothing in it takes effect')
+        return True
+    if not stat.S_ISDIR(info.st_mode):
+        problems.append(f'{folder}: not a directory; nothing in it takes effect')
         return True
     return False
 
@@ -347,12 +357,12 @@ def _roles(settings: Settings, workspace: Path) -> None:
 def load_settings(workspace: Path) -> Settings:
     """The free settings and roles of a workspace; a bad or missing part becomes its default plus a problem."""
     settings = Settings()
-    if _linked(workspace, 'codex', settings.problems):
+    if _invalid_folder(workspace, 'codex', settings.problems):
         return settings
     table = _read_table(workspace / SETTINGS, SETTINGS, settings.problems)
     if table:
         _apply(settings, table, workspace)
-    if not _linked(workspace, AGENTS, settings.problems):
+    if not _invalid_folder(workspace, AGENTS, settings.problems):
         _roles(settings, workspace)
     return settings
 
