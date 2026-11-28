@@ -12,15 +12,17 @@ No record file is ever overwritten. The one exception by design is a call's call
 twice: by start_call (status `started`) and by finish_call (an end status, plus the sha256 of every file the call
 folder holds). Every other file is created once, completely or not at all, and refused if the name is taken.
 """
-import fcntl
 import hashlib
 import json
-import os
 import re
 import stat
 import tempfile
 from datetime import datetime
 from pathlib import Path
+
+from rsi import fs as os
+from rsi.paths import is_link
+from rsi.publication import publish_new
 
 KINDS = {'R': 'runs', 'M': 'rounds', 'A': 'applications'}
 CALL_ID = re.compile(r'R[0-9]{4,}')
@@ -67,11 +69,14 @@ def _hashes(folder: Path) -> tuple[dict, dict]:
         for name in folders + names:
             path = Path(top) / name
             relative = path.relative_to(folder).as_posix()
-            mode = os.lstat(path).st_mode
-            if stat.S_ISLNK(mode):
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode) or (os.name == 'nt' and
+                                              info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+                if name in folders:
+                    folders.remove(name)
                 links[relative] = os.readlink(path)
                 files[relative] = hashlib.sha256(os.fsencode(links[relative])).hexdigest()
-            elif stat.S_ISREG(mode) and relative != CALL_FILE:
+            elif stat.S_ISREG(info.st_mode) and relative != CALL_FILE:
                 files[relative] = _sha_of_file(path)
     return dict(sorted(files.items())), dict(sorted(links.items()))
 
@@ -182,8 +187,10 @@ class Records:
     def write_json(self, relative: str, data: dict) -> Path:
         """Create records/<relative> holding data; FileExistsError rather than overwrite. Indexed with its sha256."""
         parts = relative.split('/') if isinstance(relative, str) else []
-        if not parts or not all(COMPONENT.fullmatch(part) for part in parts) or relative == INDEX \
-                or (len(parts) == 3 and parts[0] == KINDS['R'] and parts[2] == CALL_FILE):
+        canonical = [os.path.normcase(part) for part in parts]
+        if (not parts or not all(COMPONENT.fullmatch(part) for part in parts) or canonical == [INDEX]
+                or (len(canonical) == 3 and canonical[0] == KINDS['R'] and canonical[2] == CALL_FILE)
+                or (os.name == 'nt' and any(Path(part).is_reserved() or part.endswith('.') for part in parts))):
             raise ValueError(f'The record path {relative!r} is not valid.')
         folder = self.root
         for part in parts[:-1]:
@@ -191,7 +198,7 @@ class Records:
             try:
                 os.mkdir(folder)
             except FileExistsError:
-                if folder.is_symlink() or not folder.is_dir():
+                if is_link(folder) or not folder.is_dir():
                     raise ValueError(f'The record path {relative!r} is not valid: {part} in it is not a plain '
                                      'folder.') from None
         content = _encode(data)
@@ -231,9 +238,9 @@ class Records:
         """Create target with content, all at once; FileExistsError if any entry (a link too) has that name."""
         temporary = self._staged(target, content)
         try:
-            os.link(temporary, target, follow_symlinks=False)
+            publish_new(temporary, target)
         finally:
-            os.unlink(temporary)
+            Path(temporary).unlink(missing_ok=True)
 
     def _replace(self, target: Path, content: bytes) -> None:
         temporary = self._staged(target, content)
@@ -247,7 +254,7 @@ class Records:
         content = (json.dumps(line, ensure_ascii=False) + '\n').encode('utf-8')
         fd = os.open(self.root / INDEX, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            os.lock_exclusive(fd)
             view = memoryview(content)
             while view:
                 view = view[os.write(fd, view):]

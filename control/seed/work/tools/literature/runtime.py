@@ -3,7 +3,6 @@
 The log is what this server reports about its calls. The Lab's commands can write the same folder, so a row is not
 proof that a call happened; the originals in library/ are what a row can be checked against."""
 
-import fcntl
 import hashlib
 import json
 import os
@@ -15,6 +14,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
+
+if os.name == 'nt':
+    import rsi_fs as os
+else:
+    import fcntl
 
 from rsi_literature.documents import DocumentError, DocumentStore, MAX_SOURCE_BYTES
 
@@ -37,7 +41,12 @@ def _integrity(detail):
 def _directory(path, create=False):
     if create:
         path.mkdir(exist_ok=True)
-    if path.is_symlink() or not path.is_dir():
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        raise _integrity("Expected a regular directory: " + path.name) from None
+    if not stat.S_ISDIR(info.st_mode) or (os.name == 'nt' and
+                                         info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT):
         raise _integrity("Expected a regular directory: " + path.name)
     return path
 
@@ -128,7 +137,10 @@ class Runtime:
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise _integrity("Invalid literature store lock")
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            if os.name == 'nt':
+                os.lock_exclusive(fd)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX)
             yield
         finally:
             os.close(fd)
@@ -153,14 +165,21 @@ class Runtime:
         if hashlib.sha256(raw).hexdigest() != digest:
             raise _integrity("Original changed before publication")
         if not target.exists():
-            with tempfile.NamedTemporaryFile(dir=objects, prefix=".object-") as tmp:
-                tmp.write(raw)
-                tmp.flush()
-                # A completed immutable original becomes visible in one filesystem operation.
-                try:
-                    os.link(tmp.name, target)
-                except FileExistsError:
-                    pass
+            fd, temporary = tempfile.mkstemp(dir=objects, prefix=".object-")
+            try:
+                with os.fdopen(fd, 'wb') as tmp:
+                    tmp.write(raw)
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                # Publish only to an unused name, after closing the file on Windows.
+                if os.name == 'nt':
+                    os.rename(temporary, target)
+                else:
+                    os.link(temporary, target)
+            except FileExistsError:
+                pass
+            finally:
+                Path(temporary).unlink(missing_ok=True)
         if _read(target, MAX_SOURCE_BYTES) != raw:
             raise _integrity("Archived original differs from its digest")
         files = {name: _read(current / name, _MAX_INDEX) for name in ("manifest.json", "text.txt")}

@@ -6,7 +6,7 @@ All writers enter under the rsi command lock. Reading an absent store does not i
 """
 import hashlib
 import json
-import os
+from rsi import fs as os
 import stat
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -50,7 +50,7 @@ def _folder(path, create=False):
     if create:
         path.mkdir(exist_ok=True)
     try:
-        mode = path.lstat().st_mode
+        mode = os.lstat(path).st_mode
     except FileNotFoundError:
         return False
     if not stat.S_ISDIR(mode):

@@ -1,6 +1,7 @@
 """Folders of the RSI root, and the check every id must pass before it becomes part of a path."""
 import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -102,7 +103,17 @@ def find_layout() -> Layout:
 
 def safe_id(text: str, what: str) -> str:
     """Return text if it is one plain path component (never `..`, hidden or nested); else raise ValueError."""
-    if not isinstance(text, str) or not SAFE_ID.fullmatch(text):
+    if not isinstance(text, str) or not SAFE_ID.fullmatch(text) or (os.name == 'nt' and Path(text).is_reserved()):
         raise ValueError(f'The {what} {text!r} is not valid. Use only letters, digits, _ and -, start with a letter '
                          'or a digit, and use at most 64 characters.')
     return text
+
+
+def is_link(path: Path) -> bool:
+    """Include Windows junctions and other reparse points when checking a directory boundary."""
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return stat.S_ISLNK(info.st_mode) or (os.name == 'nt' and
+                                        bool(info.st_file_attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT))

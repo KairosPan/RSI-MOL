@@ -7,11 +7,10 @@ workspace's `in/<id>/` before a run) and `check.py` (run on the collected result
 Results are collected from a sealed workspace (rsi.workspace), never from one an agent can still write, and without
 ever following a link: they keep only regular files (copied by content) and folders, within a budget.
 """
-import os
+from rsi import fs as os
 import re
 import selectors
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -20,6 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rsi.paths import safe_id
+from rsi.processes import kill_group as _kill_group, start_group
 from rsi.settings import show
 from rsi.workspace import MAX_DEPTH, Lines, close, grant, kind, open_folder, open_unlocked
 
@@ -120,13 +120,6 @@ def prompt_for(task: Task) -> str:
 
 # The check script.
 
-def _kill_group(process: subprocess.Popen) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def _keep(head: bytearray, chunk: bytes, done: bool) -> bool:
     """Add chunk to the first line collected so far; True once that line is complete (or long enough)."""
     if done:
@@ -152,13 +145,19 @@ def run_check(task: Task, out: Path, timeout: float = 60) -> dict | None:
     if task.check is None:
         return None
     command = [sys.executable, '-E', '-s', '-B', '-X', 'utf8', str(task.check), os.path.abspath(out)]
-    process = subprocess.Popen(command, cwd=task.folder, env={'PATH': CHECK_PATH}, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True)
+    env = {'PATH': CHECK_PATH}
+    if os.name == 'nt':
+        windir = os.environ['SYSTEMROOT']
+        env = {'SYSTEMROOT': windir, 'PATH': str(Path(windir) / 'System32')}
+    process = start_group(command, cwd=task.folder, env=env, stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     head, line_done, timed_out = bytearray(), False, False
     deadline = time.monotonic() + timeout
     fd = process.stdout.fileno()
-    os.set_blocking(fd, False)
     try:
+        if os.name == 'nt':
+            return _windows_check_output(process, fd, head, deadline)
+        os.set_blocking(fd, False)
         with selectors.DefaultSelector() as selector:
             selector.register(fd, selectors.EVENT_READ)
             stream_open = True
@@ -197,6 +196,25 @@ def run_check(task: Task, out: Path, timeout: float = 60) -> dict | None:
         return {'passed': False, 'message': CHECK_TIMED_OUT, 'exit_code': None}
     message = head.decode('utf-8', errors='replace').strip()[:CHECK_MESSAGE_LIMIT]
     return {'passed': process.returncode == 0, 'message': message, 'exit_code': process.returncode}
+
+
+def _windows_check_output(process, fd, head, deadline):
+    """Windows selectors cannot wait on anonymous pipes. Drain it while the child runs."""
+    from rsi.processes import read_available
+    done = False
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            # Check output once more after observing exit to include its final write.
+            while not done and (chunk := read_available(fd, 1 << 16)):
+                done = _keep(head, chunk, done)
+            message = head.decode('utf-8', errors='replace').strip()[:CHECK_MESSAGE_LIMIT]
+            return {'passed': process.returncode == 0, 'message': message, 'exit_code': process.returncode}
+        chunk = read_available(fd, 1 << 16)
+        if chunk:
+            done = _keep(head, chunk, done)
+        else:
+            time.sleep(0.01)
+    return {'passed': False, 'message': CHECK_TIMED_OUT, 'exit_code': None}
 
 
 # The task's inputs.

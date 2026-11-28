@@ -4,7 +4,8 @@ The log is what the server reports about its calls. The server writes it by path
 commands can write too, so a row is not proof that a call happened; the originals in library/ are what a row can be
 checked against. The control program only copies complete, well-formed rows, within limits."""
 import json
-import os
+from rsi import fs as os
+from rsi.publication import publish_new
 import re
 import stat
 from contextlib import ExitStack
@@ -121,7 +122,7 @@ def _sync_folder(folder: Path) -> None:
 def collect(workspace: Path, expected: list[int], call_dir: Path) -> list[str]:
     """Publish complete rows only. A newly staged workspace with no service calls gets an empty attachment.
 
-    Written like every record file: complete and synced under a temporary name, then linked to its name (refused if
+    Written like every record file: complete and synced under a temporary name, then published under its name (refused if
     the name is taken), so the attachment is whole or absent. A temporary file an interrupted collection left is
     removed first."""
     final, pending = call_dir / LOG, call_dir / PENDING
@@ -148,7 +149,7 @@ def collect(workspace: Path, expected: list[int], call_dir: Path) -> list[str]:
                     _read_calls(fd, stream, problems)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.link(pending, final, follow_symlinks=False)
+            publish_new(pending, final)
     finally:
         discard_pending(call_dir)
     _sync_folder(call_dir)

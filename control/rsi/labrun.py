@@ -26,7 +26,7 @@ Refusals before a call are noted in records/index.jsonl and start no call; a bad
 has started it is always finished, and after Codex has ended a failing step becomes a line of the call's `problems`
 and never changes its status or usage.
 """
-import os
+from rsi import fs as os
 import secrets
 import socket
 import subprocess
@@ -96,6 +96,8 @@ def _stamp() -> str:
 
 def process_start(pid: int) -> str | None:
     """When the process pid started, as local ISO time to the second, from ps; None when that cannot be told."""
+    if os.name == 'nt':
+        return None  # Job lifetime handles recovery; record the controller's observation time.
     try:
         done = subprocess.run(['/bin/ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
                               timeout=10, env={'LC_ALL': 'C', 'PATH': '/usr/bin:/bin'}, stdin=subprocess.DEVNULL)

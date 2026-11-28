@@ -17,6 +17,7 @@ from rsi.labrun import (discard, move_in, noting_refusals, open_store, problem, 
                         unrecovered)
 from rsi.paths import Layout, Refused
 from rsi.records import Records
+from rsi.seed import windows_seed
 from rsi.settings import SETTINGS, load_settings
 from rsi.tomlout import toml_value
 
@@ -243,7 +244,8 @@ def install_feature(layout: Layout, seed: Path, lines: list[str] | None, *, name
                 raise Refused('The pre-install workspace needed attention: ' + ' '.join(notes))
             staged, _ = stage(layout, store, baseline)
             try:
-                changed = install_files(staged, seed)
+                with windows_seed(seed, layout.staging) as native_seed:
+                    changed = install_files(staged, native_seed)
                 settings = load_settings(staged)
                 if settings.problems:
                     raise Refused(f'{label} install found invalid workspace settings: ' + ' '.join(settings.problems))

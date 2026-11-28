@@ -18,7 +18,9 @@ from urllib.parse import parse_qs, urlsplit
 
 from rsi.check import _pdf
 
-SEED = Path(__file__).resolve().parents[1] / 'seed' / 'work' / 'tools' / 'literature'
+from tests.installed_seed import WORK
+
+SEED = WORK / 'tools/literature'
 _PYPDF = sys.modules.get('pypdf', 'absent')
 with mock.patch.object(sys, 'path', [str(SEED), *sys.path]), mock.patch.object(sys, 'dont_write_bytecode', True):
     import transport

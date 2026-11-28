@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest import mock
 
 from rsi.versions import VersionStore
+from tests.links import make_link
 
 
 class Versions(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp()).resolve()
-        self.addCleanup(shutil.rmtree, self.tmp)
+        temp = tempfile.TemporaryDirectory()
+        self.tmp = Path(temp.name).resolve()
+        self.addCleanup(temp.cleanup)
         self.a = self.tmp / 'a'; self.b = self.tmp / 'b'; self.a.mkdir(); self.b.mkdir()
         self.store = VersionStore(self.tmp / 'versions' / 'lab.git'); self.store.init(); self.store.init()
 
@@ -74,7 +76,7 @@ class Versions(unittest.TestCase):
         self.assertEqual(self.store.commit(self.a, 'init', 'one'), 'V0001')
         self.assertEqual(self.store.tree_of('V0001'), without)
         self.assertEqual(self.store.tree_of(self.store.snapshot(self.a, 'M0001', 's')), without)
-        shutil.rmtree(alias); os.symlink(self.tmp, alias)                              # a link by that name
+        shutil.rmtree(alias); make_link(self.tmp, alias)
         self.assertEqual(self.store.tree_of_dir(self.a), without)
         self.store.checkout('V0001', self.b)
         self.assertEqual(os.listdir(self.b), ['f.txt'])
@@ -106,7 +108,7 @@ class Versions(unittest.TestCase):
         self.assertEqual(self.store.head(), 'V0003')
 
     def test_symlink_is_kept_as_a_link(self):
-        os.symlink('/etc/hosts', self.a / 'link'); self.store.commit(self.a, 'init', 'one')
+        make_link('target', self.a / 'link'); self.store.commit(self.a, 'init', 'one')
         self.store.checkout('V0001', self.b)
         self.assertTrue(os.path.islink(self.b / 'link'))
 
@@ -138,7 +140,7 @@ class Versions(unittest.TestCase):
         self.store.commit(self.a, 'init', 'one')
         (self.b / 'out').mkdir(); (self.b / 'out' / 'r').write_text('kept'); (self.b / 'in').write_text('kept')
         self.store.checkout('V0001', self.b)
-        self.assertEqual(sorted(str(p.relative_to(self.b)) for p in self.b.rglob('*')),
+        self.assertEqual(sorted(p.relative_to(self.b).as_posix() for p in self.b.rglob('*')),
                          ['in', 'out', 'out/r', 'sub', 'sub/out', 'sub/out/r'])
         self.assertEqual((self.b / 'out' / 'r').read_text(), 'kept')
 
@@ -157,7 +159,7 @@ class Versions(unittest.TestCase):
 
     def test_unsafe_folders_rounds_and_authors_are_refused(self):
         (self.a / 'f.txt').write_text('1'); self.store.commit(self.a, 'init', 'one')
-        (self.tmp / 'link').symlink_to(self.a); (self.tmp / 'file').write_text('x')
+        make_link(self.a, self.tmp / 'link'); (self.tmp / 'file').write_text('x')
         for folder in (self.tmp / 'link', self.tmp, self.tmp / 'versions', self.tmp / 'file', self.tmp / 'missing'):
             with self.assertRaises(ValueError):
                 self.store.checkout('V0001', folder)
@@ -188,7 +190,7 @@ class Versions(unittest.TestCase):
         self.assertEqual(self.store.commit(self.a, 'x', 'renamed'), 'V0002')
         (self.a / 'pkg' / 'n.py').write_text('n'); self.assertEqual(self.store.commit(self.a, 'x', 'added'), 'V0003')
         self.store.checkout('V0003', self.b)
-        self.assertEqual(sorted(str(p.relative_to(self.b)) for p in self.b.rglob('*')), ['pkg', 'pkg/m.py', 'pkg/n.py'])
+        self.assertEqual(sorted(p.relative_to(self.b).as_posix() for p in self.b.rglob('*')), ['pkg', 'pkg/m.py', 'pkg/n.py'])
         self.assertEqual(self.store.tree_of_dir(self.b), self.store.tree_of('V0003'))
 
     def test_a_case_variant_path_to_the_store_or_around_it_is_refused(self):
@@ -209,7 +211,7 @@ class Versions(unittest.TestCase):
         outside = self.tmp / 'outside'; outside.mkdir()
         (outside / 'f').write_text('outside'); (outside / 'x').write_text('x')
         self.store.checkout('V0001', self.b)
-        shutil.rmtree(self.b / 'd'); (self.b / 'd').symlink_to(outside)
+        shutil.rmtree(self.b / 'd'); make_link(outside, self.b / 'd')
         self.store.checkout('V0001', self.b)
         self.assertFalse((self.b / 'd').is_symlink()); self.assertEqual((self.b / 'd' / 'f').read_text(), '1')
         self.assertEqual(sorted(p.name for p in outside.iterdir()), ['f', 'x'])
@@ -271,7 +273,14 @@ class Versions(unittest.TestCase):
         self.assertEqual(self.store._out('for-each-ref'), refs)
         lock = self.store.git_dir / 'refs' / 'heads' / 'main.lock'; lock.touch()     # a git that crashed
         with self.assertRaises(RuntimeError): self.store.check_writable()
-        lock.unlink(); (self.store.git_dir / 'objects').chmod(0o555)
+        lock.unlink()
+        if os.name == 'nt':
+            # A Windows directory's read-only attribute does not change its ACL.
+            with mock.patch('rsi.versions.tempfile.TemporaryFile', side_effect=PermissionError):
+                with self.assertRaisesRegex(RuntimeError, 'objects'): self.store.check_writable()
+            self.store.check_writable()
+            return
+        (self.store.git_dir / 'objects').chmod(0o555)
         self.addCleanup((self.store.git_dir / 'objects').chmod, 0o755)
         with self.assertRaisesRegex(RuntimeError, 'objects'): self.store.check_writable()
         (self.store.git_dir / 'objects').chmod(0o755); self.store.check_writable()

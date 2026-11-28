@@ -2,13 +2,17 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from rsi.limits import Limits, refusal, usage_by_class
 from rsi.records import Records
+from tests.links import make_link
 
 
 def sha(data: bytes) -> str:
@@ -72,16 +76,18 @@ class RecordsTests(unittest.TestCase):
         (folder / 'out' / 'deep').mkdir(parents=True); (folder / 'out' / 'deep' / 'a.txt').write_bytes(b'a')
         (folder / 'out' / 'deep' / 'call.json').write_bytes(b'{}')       # only the top call.json is the record
         (folder / 'empty').mkdir()
-        os.symlink(outside / 'secret.txt', folder / 'out' / 'file-link')
-        os.symlink(outside, folder / 'out' / 'dir-link')
-        os.symlink('missing', folder / 'dangling')
+        make_link(outside / 'secret.txt', folder / 'out' / 'file-link')
+        make_link(outside, folder / 'out' / 'dir-link')
+        make_link('missing', folder / 'dangling')
+        file_target = os.readlink(folder / 'out' / 'file-link')
+        dir_target = os.readlink(folder / 'out' / 'dir-link')
         done = self.records.finish_call(call, {'status': 'finished'})
         self.assertEqual(done['files'], {'dangling': sha(b'missing'), 'out/deep/a.txt': sha(b'a'),
                                          'out/deep/call.json': sha(b'{}'),
-                                         'out/dir-link': sha(str(outside).encode()),
-                                         'out/file-link': sha(str(outside / 'secret.txt').encode())})
-        self.assertEqual(done['links'], {'dangling': 'missing', 'out/dir-link': str(outside),
-                                         'out/file-link': str(outside / 'secret.txt')})
+                                         'out/dir-link': sha(os.fsencode(dir_target)),
+                                         'out/file-link': sha(os.fsencode(file_target))})
+        self.assertEqual(done['links'], {'dangling': 'missing', 'out/dir-link': dir_target,
+                                         'out/file-link': file_target})
         self.assertEqual(self.records.load_call(call)['files'], done['files'])
 
     def test_ids_are_reserved_and_calls_are_in_numeric_order(self):
@@ -157,12 +163,30 @@ class RecordsTests(unittest.TestCase):
             with self.assertRaises(ValueError, msg=bad): self.records.write_json(bad, {})
         self.assertEqual(len(self.index()), 2)
 
+    def test_independent_writers_append_whole_records(self):
+        script = ('from pathlib import Path\n'
+                  'import sys\n'
+                  'from rsi.records import Records\n'
+                  'records = Records(Path(sys.argv[1]))\n'
+                  'for number in range(20):\n'
+                  '    records.note("test", {"writer": sys.argv[2], "number": number})\n')
+
+        def write(writer):
+            subprocess.run([sys.executable, '-B', '-c', script, str(self.records.root), str(writer)],
+                           cwd=Path(__file__).resolve().parents[1], check=True, timeout=30)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            list(pool.map(write, range(3)))
+        rows = self.index()
+        self.assertCountEqual([(entry['writer'], entry['number']) for entry in rows],
+                              [(str(writer), number) for writer in range(3) for number in range(20)])
+
     def test_write_json_never_writes_through_a_link(self):
         outside = self.tmp / 'outside'
         outside.mkdir()
-        os.symlink(outside, self.records.root / 'linked')
+        make_link(outside, self.records.root / 'linked')
         with self.assertRaises(ValueError): self.records.write_json('linked/x.json', {})
-        os.symlink(outside / 'y.json', self.records.root / 'y.json')
+        make_link(outside / 'y.json', self.records.root / 'y.json')
         with self.assertRaises(FileExistsError): self.records.write_json('y.json', {})
         self.assertEqual(list(outside.iterdir()), [])
 

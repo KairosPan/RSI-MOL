@@ -61,8 +61,11 @@ def decision(kind: str, **more) -> str:
 def scratch_config(root: Path, workspace: Path) -> dict:
     """Never ask for approval; the `lab` profile reads the minimum, denies `root` and writes `workspace`, no network."""
     filesystem = {':minimal': 'read', str(root): 'deny', str(workspace): 'write'}
-    return {'approval_policy': 'never', 'default_permissions': 'lab',
-            'permissions': {'lab': {'filesystem': filesystem, 'network': {'enabled': False}}}}
+    config = {'approval_policy': 'never', 'default_permissions': 'lab',
+              'permissions': {'lab': {'filesystem': filesystem, 'network': {'enabled': False}}}}
+    if os.name == 'nt':
+        config['windows'] = {'sandbox': 'mxc'}
+    return config
 
 
 def force_remove(path: Path) -> None:
@@ -99,15 +102,25 @@ def _installed_codex(program: str) -> str | None:
 
 
 def write_passing_check(layout: Layout) -> None:
-    """records/check.json as a passed `rsi check` for the installed Codex (its version and its program), the owner
-    files and the control program's code as they are now would leave it (without its cases), so that the gate lets
-    agents start; nothing when Codex reports no version."""
+    """Supply fixture input for tests downstream of admission. It is not a sandbox measurement."""
+    folder = layout.root.resolve()
+    if folder.parent != Path(tempfile.gettempdir()).resolve() or not folder.name.startswith('rsi-test-'):
+        raise ValueError('This helper only writes into disposable RSI test roots')
     version = _installed_codex(os.environ.get('RSI_CODEX', 'codex'))
     if version is not None:
-        (layout.records / CHECK_FILE).write_text(json.dumps(
-            {'codex_version': version, 'codex_program': native_codex(layout), 'owner_files': owner_fingerprints(layout),
-             'program': program_fingerprints(), 'passed': True, 'at': '2026-01-01T00:00:00+00:00', 'results': [],
-             'problems': [], 'notes': [], 'info': []}), encoding='utf-8')
+        report = {'codex_version': version, 'codex_program': native_codex(layout),
+                  'owner_files': owner_fingerprints(layout), 'program': program_fingerprints(), 'passed': True,
+                  'at': '2026-01-01T00:00:00+00:00', 'results': [], 'problems': [], 'info': [],
+                  'notes': ['Synthetic test fixture. No sandbox checks were performed.']}
+        if os.name == 'nt':
+            from rsi.compose import load_envelope, windows_offline
+            from rsi.win_check import check_scope, required_cases
+            offline = windows_offline(load_envelope(layout.owner))
+            report['scope'] = check_scope(layout, offline)
+            report['results'] = [dict(name=name, profile=profile, expected=expected, observed=expected, ok=True,
+                                      detail='Simulated result for a disposable test workspace')
+                                 for name, profile, expected in required_cases(offline)]
+        (layout.records / CHECK_FILE).write_text(json.dumps(report), encoding='utf-8')
 
 
 class Root:
@@ -127,7 +140,7 @@ class Root:
     def __enter__(self) -> 'Root':
         self._environment = mock.patch.dict(os.environ)
         self._environment.start()
-        self.path = Path(tempfile.mkdtemp()).resolve()
+        self.path = Path(tempfile.mkdtemp(prefix='rsi-test-')).resolve()
         try:
             self.layout = layout = Layout(self.path)
             for folder in (layout.owner, layout.tasks, layout.work, layout.trial, layout.candidate, layout.notes,

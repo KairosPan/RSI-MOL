@@ -2,6 +2,10 @@
 gate that lets agents start only once that proof holds for the Codex version installed now, for the owner files
 (owner/lab-envelope.toml, owner/meta/settings.toml) and for the control program's own code (rsi/) as they are now.
 
+On native Windows the suite in win_check exercises the selected network mode, command profiles, edit and shell
+entry points and registered local servers. The record identifies the measured installation and mode. A sandbox
+startup failure leaves the remaining cases unknown and closes the gate. The POSIX suite is described below.
+
 Run it again whenever Codex changes version. A case that fails is reported as it is: it is never weakened or
 skipped, since the point is to find out when an assumption stops holding.
 
@@ -47,11 +51,9 @@ envelope composes for the real root.
 import hashlib
 import importlib.machinery
 import json
-import os
 import secrets
 import shlex
 import shutil
-import signal
 import socket
 import stat
 import subprocess
@@ -64,12 +66,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from rsi import proposal_files
+from rsi import fs as os, proposal_files
 from rsi.codexrun import PROXY_VARIABLES, codex_environment, codex_version, run_codex
 from rsi.compose import (SYSTEM_PATH, TOOL_FOLDERS, lab_config, load_envelope, meta_config, native_codex, profiles,
-                         temp_folders, write_home_config, write_role_files)
+                         read_regular, temp_folders, write_home_config, write_role_files)
 from rsi.mockmodel import ScriptedModel, run_js, say
 from rsi.paths import Layout, Refused
+from rsi.processes import kill_group, start_group
 from rsi.records import Records
 from rsi.settings import load_settings, show
 from rsi.tomlout import render_flags
@@ -427,23 +430,16 @@ def _no_lookup(*args, **kwargs):
     raise OSError('rsi check does not resolve host names')
 
 
-def _kill_group(process: subprocess.Popen) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def _run(command: list[str], *, cwd: Path, env: dict, timeout: float) -> tuple[int | None, str, str]:
     """Run a command in its own process group, which is killed afterwards whatever happened; (exit code or None
     when it ran out of time, stdout, stderr)."""
-    process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE, start_new_session=True)
+    process = start_group(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE)
     try:
         out, err = process.communicate(timeout=timeout)
         code = process.returncode
     except subprocess.TimeoutExpired:
-        _kill_group(process)
+        kill_group(process)
         try:
             out, err = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:          # something outside the group still holds the pipes
@@ -453,7 +449,7 @@ def _run(command: list[str], *, cwd: Path, env: dict, timeout: float) -> tuple[i
             process.wait()
         code = None
     finally:
-        _kill_group(process)
+        kill_group(process)
     return code, out.decode('utf-8', 'replace'), err.decode('utf-8', 'replace')
 
 
@@ -1279,23 +1275,14 @@ def _static_problems(layout: Layout, envelope: dict | None) -> list[str]:
     problems += loaded_at_root(layout)
     path = layout.lab_home / 'config.toml'
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except FileNotFoundError:
-        fd = None
-    except OSError as error:
-        fd = None
-        problems.append(f'{path} cannot be opened ({error.strerror or error}; it may be a symbolic link)')
-    if fd is not None:
-        try:
-            with os.fdopen(fd, 'rb') as stream:
-                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
-                    raise ValueError('not a regular file')
-                table = tomllib.loads(stream.read().decode('utf-8'))
+        content = read_regular(path)
+        if content is not None:
+            table = tomllib.loads(content.decode('utf-8'))
             if 'projects' in table:
                 problems.append(f'{path} has a projects table: a trusted project lets the .codex/config.toml in '
                                 'that folder override the configuration')
-        except (OSError, ValueError, RecursionError) as error:
-            problems.append(f'{path} cannot be read or is not valid TOML ({" ".join(str(error).split())})')
+    except (OSError, ValueError, RecursionError) as error:
+        problems.append(f'{path} cannot be read or is not valid TOML ({" ".join(str(error).split())})')
     if envelope is not None:
         try:
             profiles(layout, envelope)
@@ -1438,10 +1425,18 @@ def run_check(layout: Layout) -> dict:
         problems.append(str(error))
     problems += _static_problems(layout, envelope)
     if version is not None and envelope is not None:
-        results = _cases(layout, envelope, problems, notes, info)
+        if os.name == 'nt':
+            from rsi.win_check import run_windows_cases
+            results = run_windows_cases(layout, envelope, problems, notes)
+        else:
+            results = _cases(layout, envelope, problems, notes, info)
     passed = bool(results) and not problems and all(result['ok'] for result in results)
     report = {'codex_version': version, 'codex_program': codex, 'owner_files': owner_files, 'program': program,
               'passed': passed, 'at': at, 'results': results, 'problems': problems, 'notes': notes, 'info': info}
+    if os.name == 'nt':
+        from rsi.compose import windows_offline
+        from rsi.win_check import check_scope
+        report['scope'] = check_scope(layout, windows_offline(envelope or {}))
     _save(layout, report)
     return report
 
@@ -1450,9 +1445,10 @@ def _load(layout: Layout) -> tuple[dict | None, str | None]:
     """records/check.json (never followed if it is a link) as a dict, or None and why not (English)."""
     path = layout.records / CHECK_FILE
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'rb') as stream:
-            data = json.loads(stream.read().decode('utf-8'))
+        content = read_regular(path)
+        if content is None:
+            raise FileNotFoundError(path)
+        data = json.loads(content.decode('utf-8'))
     except FileNotFoundError:
         return None, ('No isolation check has been run yet, so no agent can start. Run rsi check first (and again '
                       'whenever Codex changes version).')
@@ -1484,6 +1480,17 @@ def gate(layout: Layout) -> str | None:
     if changed:
         return (f'{", ".join("owner/" + name for name in changed)} changed after the last rsi check (or that check '
                 'did not record it), so no agent can start. Run rsi check again.')
+    if os.name == 'nt':
+        from rsi.compose import windows_offline
+        from rsi.win_check import check_scope, covers_required
+        try:
+            offline = windows_offline(load_envelope(layout.owner))
+        except Refused as error:
+            return f'The Windows owner envelope could not be checked: {error}. Run rsi check again.'
+        if data.get('scope') != check_scope(layout, offline):
+            return 'Run rsi check for this Windows host, installation and network mode before starting an agent.'
+        if not covers_required(data.get('results'), offline):
+            return 'The native Windows suite has missing or inconclusive results. Run rsi check again.'
     try:
         changed = _changed(data.get('program'), program_fingerprints())
     except OSError as error:

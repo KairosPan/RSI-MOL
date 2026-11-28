@@ -191,7 +191,7 @@ class RunLogs(unittest.TestCase):
 @needs_codex
 class CodexServer(unittest.TestCase):
     def test_codex_discovers_and_calls_the_seed_service_and_the_task_archives_its_report(self):
-        seed = Path(__file__).resolve().parents[1] / 'seed/work'
+        from tests.installed_seed import WORK as seed
         with Root() as root:
             root.add_task('T1')
             shutil.copytree(seed / 'tools/literature', root.layout.work / 'tools/literature',

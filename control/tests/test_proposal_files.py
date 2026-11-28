@@ -1,5 +1,4 @@
 """Managed MCP submission and descriptor-relative collection into a sealed call's attachments."""
-import fcntl
 import json
 import os
 import shutil
@@ -10,11 +9,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rsi import proposal_files
+from rsi import fs, proposal_files
 from rsi.memory_snapshot import place_snapshot
 from rsi.paths import Layout
 
-SEED = Path(__file__).resolve().parents[1] / 'seed/work/tools/memory'
+from tests.installed_seed import WORK
+
+SEED = WORK / 'tools/memory'
 
 
 def judgment():
@@ -42,7 +43,7 @@ class ProposalFiles(unittest.TestCase):
         lines = ''.join(json.dumps(dict(numbered, jsonrpc='2.0', id=n)) + '\n' for n, numbered in enumerate(messages))
         env = dict(os.environ, RSI_MEMORY_PROPOSALS='1' if enabled else '0')
         completed = subprocess.run([sys.executable, '-B', str(self.work / 'tools/memory/server.py')],
-                                   input=lines, env=env, text=True, capture_output=True, timeout=10, check=True)
+                                   input=lines, env=env, encoding='utf-8', capture_output=True, timeout=10, check=True)
         replies = [json.loads(line)['result'] for line in completed.stdout.splitlines()]
         return {tool['name']: tool['inputSchema'] for tool in replies[1]['tools']}, replies[2]
 
@@ -126,6 +127,7 @@ class ProposalFiles(unittest.TestCase):
                 self.assertTrue(self.server(invalid)[1]['isError'])
         self.assertEqual(len(list(self.spool.iterdir())), 2)
 
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires POSIX FIFO support')
     def test_sealed_file_types_identity_and_caps(self):
         identity = proposal_files.prepare(self.work)
         external = self.root / 'outside'
@@ -175,9 +177,12 @@ class ProposalFiles(unittest.TestCase):
     def test_contention_and_full_spool_report_a_tool_error(self):
         proposal_files.prepare(self.work)
         place_snapshot(Layout(self.root), self.work)
-        fd = os.open(self.spool, os.O_RDONLY | os.O_DIRECTORY)
+        if os.name == 'nt':
+            fd = fs.open(self.spool.parent / '.memory-proposals.lock', fs.O_RDWR | fs.O_CREAT, 0o600)
+        else:
+            fd = fs.open(self.spool, fs.O_RDONLY | fs.O_DIRECTORY)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fs.lock_exclusive(fd, wait=False)
             _, failed = self.server(judgment())
             self.assertTrue(failed['isError'])
             self.assertIn('retry', failed['content'][0]['text'])

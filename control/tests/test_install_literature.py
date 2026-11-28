@@ -15,7 +15,7 @@ from rsi.versions import VersionStore
 from tests.support import Root, decision, needs_codex
 from tests.test_cli import run
 
-SEED = Path(__file__).resolve().parents[1] / 'seed' / 'work'
+from tests.installed_seed import WORK as SEED
 PACKAGE = SEED / 'tools' / 'literature'
 
 

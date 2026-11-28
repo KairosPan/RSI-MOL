@@ -10,11 +10,13 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 
 from rsi.check import CHECK_FILE, check_state, run_check
+from rsi.codexrun import codex_environment, codex_program
 from rsi.init import init, locked, recover
 from rsi.labrun import noting_refusals, run_task, unrecovered
 from rsi.limits import usage_by_class
@@ -56,6 +58,7 @@ USAGE = """Usage: rsi <command>
 
   init                 make the folders and the version store, write the two Codex configurations, and check
                        whether the two Codex homes are signed in
+  login <lab|meta>     sign in to the selected role's Codex home
   check                test the isolation requirements one by one; no model is called
   install-literature   merge the Literature service into the current Lab workspace and print its rollback version
   install-memory       merge the Scientific Memory service into the current Lab workspace
@@ -98,6 +101,8 @@ def _parse(args: list[str]) -> tuple[str, dict]:
     if not args:
         raise Usage('')
     command, rest = args[0], args[1:]
+    if command == 'login' and rest in (['lab'], ['meta']):
+        return command, {'role': rest[0]}
     if command in ('init', 'check', 'meta', 'recover', 'install-literature', 'install-memory') and not rest:
         return command, {}
     if command == 'memory' and rest:
@@ -138,7 +143,9 @@ def _interruptible():
     handlers from before are put back afterwards. Outside the main thread nothing is changed."""
     previous = {}
     try:
-        for number in (signal.SIGHUP, signal.SIGTERM):
+        for number in (getattr(signal, 'SIGHUP', None), signal.SIGTERM, getattr(signal, 'SIGBREAK', None)):
+            if number is None:
+                continue
             previous[number] = signal.signal(number, _interrupt)
     except ValueError:
         pass
@@ -458,11 +465,27 @@ def _init(layout: Layout) -> int:
                      'and plugins follow owner/lab-envelope.toml)')
     for home, state in report['signed_in'].items():
         said = 'signed in' if state else 'not signed in' if state is False else 'the sign-in state cannot be told'
+        role = 'lab' if home == layout.lab_home.name else 'meta'
+        login = (f'.\\rsi.cmd login {role}' if os.name == 'nt'
+                 else f'CODEX_HOME={layout.root / home} codex login')
         lines.append(f'{home}: {said}'
-                     + ('' if state else f' (to sign in: CODEX_HOME={layout.root / home} codex login)'))
+                     + ('' if state else f' (to sign in: {login})'))
     lines += [f'Problem: {safe(line)}' for line in report['problems']]
     _print(lines)
     return 0
+
+
+def _login(layout: Layout, role: str) -> int:
+    from rsi.workspace import open_folder
+    home = layout.lab_home if role == 'lab' else layout.meta_home
+    if not home.is_dir():
+        raise Refused('Run rsi init before signing in.')
+    fd = open_folder(home)
+    try:
+        return subprocess.run([codex_program(layout.root), 'login'], cwd=layout.root,
+                              env=codex_environment(home, secrets=False, root=layout.root)).returncode
+    finally:
+        os.close(fd)
 
 
 def _check(layout: Layout) -> int:
@@ -470,9 +493,15 @@ def _check(layout: Layout) -> int:
     if report['passed']:
         lines = [f'All passed (Codex {safe(report["codex_version"], ID_CHARS)}, {len(report["results"])} cases)']
     else:
+        failures = [r for r in report['results'] if not r['ok']]
+        unknown = [r for r in failures if r['observed'] == 'unknown']
+        if os.name == 'nt' and report['problems'] and len(unknown) > SHOWN_PROBLEMS:
+            failures = [r for r in failures if r['observed'] != 'unknown']
         lines = [f'{safe(r["profile"], ID_CHARS)} {safe(r["name"], ID_CHARS)}: expected '
                  f'{safe(r["expected"], ID_CHARS)}, observed {safe(r["observed"], ID_CHARS)} ({safe(r["detail"])})'
-                 for r in report['results'] if not r['ok']]
+                 for r in failures]
+        if len(failures) < sum(not r['ok'] for r in report['results']):
+            lines.append(f'{len(unknown)} cases could not be measured. Individual results are in the check record.')
         lines += [f'Problem: {safe(line)}' for line in report['problems']]
     lines += [f'Note: {safe(line)}' for line in report['notes']]
     lines += [f'Information (not a case): {safe(item["profile"], ID_CHARS)} {safe(item["name"], ID_CHARS)} = '
@@ -602,6 +631,6 @@ def _memory(layout: Layout, action: str, values: list[str]) -> int:
     return 0
 
 
-COMMANDS = {'init': _init, 'check': _check, 'task': _task, 'meta': _meta, 'rollback': _rollback, 'recover': _recover,
+COMMANDS = {'init': _init, 'login': _login, 'check': _check, 'task': _task, 'meta': _meta, 'rollback': _rollback, 'recover': _recover,
             'install-literature': lambda layout: _install(layout, install_literature, 'Literature'),
             'install-memory': lambda layout: _install(layout, install_memory, 'Scientific Memory'), 'memory': _memory}

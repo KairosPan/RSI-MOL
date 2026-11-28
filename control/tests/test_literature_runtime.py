@@ -11,11 +11,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-SEED = Path(__file__).resolve().parents[1] / "seed/work/tools/literature"
+from tests.installed_seed import WORK
+
+SEED = WORK / "tools/literature"
 with patch.object(sys, "path", [str(SEED), *sys.path]), patch.object(sys, "dont_write_bytecode", True):
     from runtime import Runtime
     from rsi_literature.documents import DocumentError
-    from rsi_literature import parsers, poppler
+    from dispatch import parsers, poppler
 
 XML = ("<article><body><sec><title>Results</title><p>Café, 茶, and apples.</p>"
        "<p>The sample has two stages.</p></sec></body></article>").encode()
@@ -55,6 +57,19 @@ class LiteratureRuntime(unittest.TestCase):
         for folder in (self.work, self.trial, self.library):
             folder.mkdir()
         self.runtime = Runtime(self.work)
+
+    @unittest.skipUnless(sys.platform == 'win32', 'native Windows subprocess adapter')
+    def test_windows_parser_drains_binary_output_and_bounds_the_job(self):
+        def execute(code, **settings):
+            return parsers._execute([sys.executable, '-I', '-c', code], self.work, settings, {'attempt_count': 0})
+
+        self.assertEqual(execute('import os; os.write(1, bytes(range(256)))'), bytes(range(256)))
+        with self.assertRaises(parsers._ParserError) as over:
+            execute("import os; os.write(1, b'x' * 4096)", max_log_bytes=1024)
+        self.assertEqual(over.exception.code, 'output_limit')
+        with self.assertRaises(parsers._ParserError) as slow:
+            execute('import time; time.sleep(4)', timeout=1)
+        self.assertEqual(slow.exception.code, 'parser_timeout')
 
     def test_multiple_processes_share_one_original_and_run_cursor(self):
         src = ("from runtime import Runtime\n"

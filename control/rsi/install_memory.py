@@ -19,6 +19,7 @@ PREVIOUS_TEMPLATE_HASHES = {
         '654fcd548e1e0d7554f8a1f15b08c4055488e0b83afbda9858910843c58a172c',
     },
     'tools/memory/server.py': {
+        'f6991202fdc8be9a8058b3eed6d7bd696d1f18e973a5a089396fdec3bdd44717',
         'aaf365a6c9432190e88bc107c5da8a12df2a9b52f4087b815fcb6259f07d5be7',
         '54064b893cacd97eadd1cecceb254ab39e85c7c1db31cc43531cd5250b307b8a',
         'fd8027c3f0c305540ef4f51313d3ee5b9541aadb3cef18f9a587cc13da578fb1',
@@ -66,7 +67,8 @@ def _install_folder(staged: Path, seed: Path, relative: str, required: str) -> N
             old = destination.read_bytes()
             if old == new:
                 continue
-            if hashlib.sha256(old).hexdigest() not in PREVIOUS_TEMPLATE_HASHES.get(f'{relative}/{key}', ()):
+            known = PREVIOUS_TEMPLATE_HASHES.get(f'{relative}/{key.as_posix()}', ())
+            if hashlib.sha256(old.replace(b'\r\n', b'\n')).hexdigest() not in known:
                 raise Refused(f'Memory install conflict: preserve the workspace entry {relative}/{key}')
         destination.write_bytes(new)
 

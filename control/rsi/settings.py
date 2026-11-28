@@ -5,7 +5,6 @@ plan (design §5.3) and turns everything else into a problem: one English line n
 falls back to its default and is listed; nothing in a file's content makes it raise. Files are read without
 following symbolic links, and only when they are small regular files.
 """
-import os
 import re
 import stat
 import tomllib
@@ -13,7 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from rsi.paths import SAFE_ID
+from rsi import fs as os
+from rsi.paths import SAFE_ID, is_link
 
 SETTINGS = 'codex/settings.toml'
 AGENTS = 'codex/agents'
@@ -114,7 +114,7 @@ def _read_table(path: Path, label: str, problems: list[str]) -> dict | None:
 
 def _linked(workspace: Path, folder: str, problems: list[str]) -> bool:
     """Whether a workspace folder is a symbolic link; then nothing below it is read."""
-    if (workspace / folder).is_symlink():
+    if is_link(workspace / folder):
         problems.append(f'{folder}: a symbolic link; nothing in it takes effect')
         return True
     return False
@@ -125,16 +125,20 @@ def is_workspace_path(arg: str, workspace: Path) -> bool:
     containing `/` or naming an existing workspace entry."""
     if not arg or arg.startswith('-') or os.path.isabs(arg):
         return False
-    return '/' in arg or os.path.lexists(workspace / arg)
+    return has_path_component(arg) or os.path.lexists(workspace / arg)
+
+
+def has_path_component(arg: str) -> bool:
+    return '/' in arg or (os.name == 'nt' and ('\\' in arg or bool(os.path.splitdrive(arg)[0])))
 
 
 def inside(arg: str, workspace: Path) -> bool:
     """Whether a relative path stays in the workspace, by its spelling and after following links."""
     normal = os.path.normpath(arg)
-    if normal == '..' or normal.startswith('../'):
+    if normal == '..' or normal.startswith('..' + os.sep) or (os.name == 'nt' and os.path.splitdrive(arg)[0]):
         return False
-    base = os.path.realpath(workspace)
-    real = os.path.realpath(os.path.join(workspace, normal))
+    base = os.path.normcase(os.path.realpath(workspace))
+    real = os.path.normcase(os.path.realpath(os.path.join(workspace, normal)))
     return real == base or real.startswith(base + os.sep)
 
 
@@ -198,7 +202,7 @@ def _tool_server(name: str, server, workspace: Path, problems: list[str]) -> dic
     command, args, network = server['command'], server.get('args', []), server.get('network', False)
     if not _clean(command) or not command or command.startswith('-'):
         problems.append(f'{where}: command must be non-empty text that does not start with -')
-    elif '/' in command and not os.path.isabs(command) and not inside(command, workspace):
+    elif has_path_component(command) and not Path(command).is_absolute() and not inside(command, workspace):
         problems.append(f'{where}: the command {show(command)} points outside the workspace')
     if not isinstance(args, list) or not all(_clean(arg) for arg in args):
         problems.append(f'{where}: args must be a list of texts')
@@ -249,7 +253,8 @@ def _apply(settings: Settings, table: dict, workspace: Path) -> None:
                 problems.append(f'{SETTINGS}: tool_servers must be a table')
                 continue
             for name in sorted(value, key=str):
-                if not (isinstance(name, str) and SAFE_ID.fullmatch(name)):
+                if not (isinstance(name, str) and SAFE_ID.fullmatch(name)) or (
+                        os.name == 'nt' and Path(name).is_reserved()):
                     problems.append(f'{SETTINGS}: the tool server name {show(name)} is not valid: use only letters, '
                                     'digits, _ and -, start with a letter or a digit, and use at most 64 characters')
                 elif 'codex' in name.lower():
@@ -312,7 +317,7 @@ def _roles(settings: Settings, workspace: Path) -> None:
             continue
         label = f'{AGENTS}/{show(file_name)}'
         name = file_name.removesuffix('.toml')
-        if not ROLE.fullmatch(name) or name in RESERVED_ROLES:
+        if not ROLE.fullmatch(name) or name in RESERVED_ROLES or (os.name == 'nt' and Path(name).is_reserved()):
             problems.append(f'{label}: a role name must be [a-z0-9_-] starting with a small letter, at most 32 '
                             "characters, and not default, explorer, worker or a setting name of Codex's agents table")
             continue

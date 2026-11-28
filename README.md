@@ -114,10 +114,52 @@ To replay both types of passage citation in a temporary ledger on that installat
 `python3 -B tasks/paired-validation-followup/replay_judgment.py` and repeat it with `--current-literature`.
 The [implementation plan](docs/plan-memory-proposals.md) records the recovery tests and their results.
 
-## Requirements
+## Native Windows
 
-macOS, Codex CLI 0.170.0 (the check must pass again after any Codex upgrade), Python 3.11 or newer, git. The paths
-in the permission profiles assume Homebrew under `/opt/homebrew`.
+Use a current Windows 11 installation with Microsoft Execution Containers (MXC), a local NTFS checkout,
+Python 3.11 or newer, Git for Windows and the native Windows Codex CLI. This port was developed against Codex
+0.170.0. Put the checkout in a directory owned by your Windows account. A short checkout path also helps PDF
+and memory workloads whose content-addressed filenames can be long. User-created links depend on Windows
+account and filesystem permissions.
+
+Open PowerShell in the checkout. The launcher looks for a registered Python installation. If needed, set
+`$env:RSI_PYTHON` to the full path of your trusted `python.exe`. Set `$env:RSI_CODEX` to your native
+`codex.exe` if it is outside PATH. Install both programs outside the RSI-MOL checkout.
+
+```powershell
+.\rsi.cmd init
+.\rsi.cmd status --json
+.\rsi.cmd check
+```
+
+After the check passes, authenticate both roles and run the included grid task:
+
+```powershell
+.\rsi.cmd login lab
+.\rsi.cmd login meta
+.\rsi.cmd task grid
+```
+
+If local policy restricts PowerShell scripts, an installed Python interpreter can start the same controller.
+For example, run `& $env:RSI_PYTHON -I -B .\control\rsi\__main__.py status --json` with that variable set.
+
+Windows defaults to `windows_offline = true` in the owner's `rsi` settings. Lab and Meta can use the model
+connection. Their tools run offline, including Literature, which can read previously registered sources.
+Internet literature searches require networked tool support. The full network mode is experimental. Changing
+the owner setting requires a new successful check. MXC currently limits private-network filtering for managed
+networking, so that mode can fail the project's isolation checks. Optional PDF extraction requires Poppler,
+including `pdftotext.exe`; set `RSI_POPPLER_BIN` to its installed bin directory before initialization.
+
+`check` uses disposable fixtures, the real Codex executable and a local scripted endpoint. It records the
+mode, host, results and any unmeasured cases in `records/check.json`. If it reports that native MXC is
+unavailable, run the check in a normal PowerShell terminal on an MXC-capable host. Owner commands such as
+`init`, `status`, `recover` and `memory verify` are independently usable. Lab and Meta require a passing
+check on that installation. [Windows sandbox requirements](https://developers.openai.com/codex/windows/)
+
+## macOS requirements
+
+macOS, Codex CLI 0.170.0, Python 3.11 or newer, and git. The macOS permission profiles use Homebrew under
+`/opt/homebrew`. Run `./rsi check` again after any Codex upgrade.
 
 ## Documents
 

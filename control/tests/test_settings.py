@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from rsi.settings import load_settings, workspace_problems
+from tests.links import make_link
 
 GOOD_ROLE = 'name = "literature"\ndescription = "d"\ndeveloper_instructions = "i"\n'
 
@@ -118,12 +119,15 @@ class SettingsTests(unittest.TestCase):
         (w / 'notes.md').write_text('n')
         s = load_settings(w)
         self.assertEqual((s.problems, s.tool_servers['t']['args']), ([], ['-m', './tools/t/x.py', 'plain', 'notes.md']))
-        outside = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, outside, True)
-        (w / 'tools').symlink_to(outside)
-        s = load_settings(w)
-        self.assertTrue(any('tools/t' in p for p in s.problems), s.problems); self.assertEqual(s.tool_servers, {})
         for arg in ('..', 'a/../../x'):
             self.assertTrue(self.problems(f'[tool_servers.t]\ncommand = "x"\nargs = ["{arg}"]\n'), arg)
+
+    def test_linked_tool_server_path(self):
+        w = self.ws('[tool_servers.t]\ncommand = "tools/t/run"\n')
+        outside = self.ws()
+        make_link(outside, w / 'tools')
+        s = load_settings(w)
+        self.assertTrue(any('tools/t' in p for p in s.problems), s.problems); self.assertEqual(s.tool_servers, {})
 
     def test_unreadable_settings_files(self):
         w = self.ws(); (w / 'codex').mkdir(); (w / 'codex' / 'settings.toml').write_bytes(b'model = "\xff"\n')
@@ -131,15 +135,17 @@ class SettingsTests(unittest.TestCase):
         w = self.ws(); (w / 'codex').mkdir()
         (w / 'codex' / 'settings.toml').write_text('model = "' + 'm' * (1 << 20) + '"\n')
         self.assertTrue(any('settings.toml' in p for p in load_settings(w).problems))
-        outside = self.ws(); (outside / 'secret.toml').write_text('model = "leaked"\n')
-        w = self.ws(); (w / 'codex').mkdir(); (w / 'codex' / 'settings.toml').symlink_to(outside / 'secret.toml')
-        s = load_settings(w)
-        self.assertEqual(s.model, None); self.assertTrue(any('settings.toml' in p for p in s.problems))
-        w = self.ws(); (w / 'codex').symlink_to(self.ws('model = "leaked"\n') / 'codex')
-        s = load_settings(w)
-        self.assertEqual(s.model, None); self.assertTrue(any('codex' in p for p in s.problems))
         w = self.ws(); (w / 'codex').write_text('')
         self.assertTrue(load_settings(w).problems)
+
+    def test_linked_settings_files(self):
+        outside = self.ws(); (outside / 'secret.toml').write_text('model = "leaked"\n')
+        w = self.ws(); (w / 'codex').mkdir(); make_link(outside / 'secret.toml', w / 'codex' / 'settings.toml')
+        s = load_settings(w)
+        self.assertEqual(s.model, None); self.assertTrue(any('settings.toml' in p for p in s.problems))
+        w = self.ws(); make_link(self.ws('model = "leaked"\n') / 'codex', w / 'codex')
+        s = load_settings(w)
+        self.assertEqual(s.model, None); self.assertTrue(any('codex' in p for p in s.problems))
 
     def test_deep_nesting_is_a_problem(self):
         for value in ('[' * 5000 + ']' * 5000, '{a = ' * 5000 + '1' + '}' * 5000):
@@ -152,6 +158,7 @@ class SettingsTests(unittest.TestCase):
         s = load_settings(self.ws('[tool_servers.t]\nurl = ' + '[' * 200 + ']' * 200 + '\n'))
         self.assertTrue(any('<list>' in p for p in s.problems), s.problems)
 
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'requires a filesystem FIFO')
     def test_a_fifo_does_not_hang(self):
         w = self.ws(); (w / 'codex').mkdir(); os.mkfifo(w / 'codex' / 'settings.toml')
         result = []
@@ -178,11 +185,11 @@ class SettingsTests(unittest.TestCase):
 
     def test_linked_role_files(self):
         elsewhere = self.ws('', {'literature': GOOD_ROLE}) / 'codex' / 'agents'
-        w = self.ws(''); (w / 'codex' / 'agents').mkdir(); (w / 'codex' / 'agents' / 'literature.toml').symlink_to(
-            elsewhere / 'literature.toml')
+        w = self.ws(''); (w / 'codex' / 'agents').mkdir()
+        make_link(elsewhere / 'literature.toml', w / 'codex' / 'agents' / 'literature.toml')
         s = load_settings(w)
         self.assertEqual(s.roles, {}); self.assertTrue(any('literature.toml' in p for p in s.problems))
-        w = self.ws(''); (w / 'codex' / 'agents').symlink_to(elsewhere)
+        w = self.ws(''); make_link(elsewhere, w / 'codex' / 'agents')
         s = load_settings(w)
         self.assertEqual(s.roles, {}); self.assertTrue(any('agents' in p for p in s.problems))
 

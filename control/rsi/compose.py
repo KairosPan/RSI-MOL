@@ -11,19 +11,20 @@ resolve only to public addresses and may carry a secret only to the host the own
 import copy
 import errno
 import ipaddress
-import os
 import shutil
 import socket
 import stat
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from rsi import programs, proposal_files
-from rsi.paths import Layout, Refused
+from rsi import fs as os, programs, proposal_files
+from rsi.paths import Layout, Refused, is_link
+from rsi.publication import publish_new
 from rsi.programs import NATIVE_TARGETS, TEMP_FOLDERS, inside as _inside, temp_folders  # noqa: F401 (kept names)
-from rsi.settings import EFFORTS, MODEL, ROLE, SETTINGS, Settings, is_workspace_path, show
+from rsi.settings import EFFORTS, MODEL, ROLE, SETTINGS, Settings, has_path_component, is_workspace_path, show
 from rsi.tomlout import render_file, toml_value
 
 ENVELOPE = 'lab-envelope.toml'
@@ -35,12 +36,54 @@ SYSTEM_PATH = '/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin'
 # by their real paths (agents would otherwise pass data through them); each run's TMPDIR is inside its own workspace.
 # The PATH of the unsandboxed `codex sandbox` wrapper: nothing an agent can write.
 WRAPPER_PATH = '/usr/bin:/bin:/usr/sbin:/sbin'
+if os.name == 'nt':
+    # The controller is started by an owner-selected interpreter outside the RSI root. Use its base installation,
+    # not its active venv or the caller's PATH (which can contain agent-writable entries).
+    _system32 = Path(os.environ['SystemRoot']) / 'System32'
+    _git_bins = tuple(dict.fromkeys(Path(p).parent for p in programs.GIT_PROGRAMS if os.path.isfile(p)))
+    _poppler_bins = [Path(sys.base_prefix).parent / 'native/poppler/Library/bin',
+                     Path(os.environ['ProgramFiles']) / 'poppler/Library/bin']
+    if os.environ.get('RSI_POPPLER_BIN'):
+        _poppler_bins.insert(0, Path(os.environ['RSI_POPPLER_BIN']))
+    _poppler_bins = tuple(str(folder.resolve()) for folder in _poppler_bins
+                          if folder.is_absolute() and (folder / 'pdfinfo.exe').is_file())
+    TOOL_FOLDERS = (sys.base_prefix, *(str(folder.parent) for folder in _git_bins), *_poppler_bins)
+    WRAPPER_PATH = str(_system32)
+    SYSTEM_PATH = os.pathsep.join([WRAPPER_PATH, str(_system32 / 'WindowsPowerShell/v1.0'),
+                                   str(Path(sys._base_executable).parent),
+                                   *map(str, _git_bins), *_poppler_bins])
 HOME_CONFIG = 'config.toml'
 OWNER_BACKUP = 'config.toml.before-rsi'      # the owner's own config.toml, kept before rsi replaces it
 BACKUP_NAMES = 100                           # config.toml.before-rsi, config.toml.before-rsi-2, ... -100
 MARKER = render_file({}).encode()            # the first line of every config.toml rsi writes
 NETWORK_OFF = {'enabled': False}
 NETWORK_ON = {'enabled': True, 'mode': 'full', 'domains': {'*': 'allow'}}
+
+# Run by the trusted base Python after Codex has applied the Windows profile. Avoid searching the working
+# directory or handing server arguments through a shell. Native script hosts (e.g. python.exe) take script paths
+# as arguments; a .bat/.cmd file would implicitly use cmd.exe's shell parser on Windows.
+WINDOWS_SERVER_START = """import os, shutil, subprocess, sys
+path, command, *args = sys.argv[1:]
+os.environ.update(PATH=path, PATHEXT='.EXE', NoDefaultCurrentDirectoryInExePath='1', PYTHONNOUSERSITE='1')
+executable = command if os.path.isabs(command) else shutil.which(command, path=path)
+if not executable or not executable.lower().endswith('.exe'):
+    sys.exit('The Windows MCP command must be a native executable in the sandbox.')
+sys.exit(subprocess.call([executable, *args]))
+"""
+
+
+def windows_sandbox(config: dict) -> None:
+    """MXC supports a restricted-read profile without granting every command host-wide read access."""
+    if os.name == 'nt':
+        config['windows'] = {'sandbox': 'mxc'}
+
+
+def windows_offline(envelope: dict) -> bool:
+    """Keep agent tools offline on Windows unless the owner explicitly requests the full policy."""
+    setting = envelope.get('rsi', {}).get('windows_offline', True)
+    if not isinstance(setting, bool):
+        raise Refused(f'rsi.windows_offline in {ENVELOPE} must be true or false')
+    return os.name == 'nt' and setting
 
 
 def root_rule() -> str:
@@ -59,7 +102,7 @@ def _tool_secrets(envelope: dict, source: str = ENVELOPE) -> dict[str, str]:
 
 def _extra_read_list(envelope: dict, source: str) -> list[str]:
     folders = envelope.get('rsi', {}).get('extra_read', [])
-    if not isinstance(folders, list) or not all(isinstance(item, str) and os.path.isabs(item) for item in folders):
+    if not isinstance(folders, list) or not all(isinstance(item, str) and Path(item).is_absolute() for item in folders):
         raise Refused(f'rsi.extra_read in {source} must be a list of absolute paths')
     return folders
 
@@ -91,6 +134,7 @@ def load_envelope(owner: Path) -> dict:
             raise Refused(f'{key} in {path} must be a table')
     _extra_read_list(envelope, str(path))
     _tool_secrets(envelope, str(path))
+    windows_offline(envelope)
     return envelope
 
 
@@ -111,8 +155,14 @@ def _extra_read(layout: Layout, envelope: dict) -> list[str]:
     return out
 
 
-def _tool_folders() -> list[str]:
-    return [folder for folder in TOOL_FOLDERS if os.path.exists(folder)]
+def _tool_folders(layout: Layout) -> list[str]:
+    folders = [folder for folder in TOOL_FOLDERS if os.path.exists(folder)]
+    if os.name == 'nt':
+        for folder in folders:
+            if any(_inside(folder, unsafe) for unsafe in [str(layout.root), *_homes(), *temp_folders()]):
+                raise Refused(f'The runtime tool directory {folder} must be outside the RSI root, Codex homes '
+                              'and shared temporary folders')
+    return folders
 
 
 def _filesystem(layout: Layout, envelope: dict, workspace: Path, shared: str) -> dict:
@@ -124,7 +174,7 @@ def _filesystem(layout: Layout, envelope: dict, workspace: Path, shared: str) ->
     there would open the link's target (`rsi check` case dot_codex_link)."""
     table = {':minimal': 'read', str(layout.root): root_rule(), str(workspace): 'write',
              str(layout.library): shared, str(layout.env): shared, str(layout.lab_home / 'plugins' / 'cache'): 'read'}
-    for folder in _tool_folders() + _extra_read(layout, envelope):
+    for folder in _tool_folders(layout) + _extra_read(layout, envelope):
         table.setdefault(folder, 'read')
     for closed in temp_folders() + list(_homes()):
         table[closed] = 'deny'
@@ -140,12 +190,13 @@ def profiles(layout: Layout, envelope: dict) -> dict:
     for name, workspace, shared in (('lab', layout.work, 'write'), ('trial', layout.trial, 'read')):
         filesystem = _filesystem(layout, envelope, workspace, shared)
         out[name] = {'filesystem': filesystem, 'network': copy.deepcopy(NETWORK_OFF)}
-        out[name + '_net'] = {'filesystem': dict(filesystem), 'network': copy.deepcopy(NETWORK_ON)}
+        if not windows_offline(envelope):
+            out[name + '_net'] = {'filesystem': dict(filesystem), 'network': copy.deepcopy(NETWORK_ON)}
     return out
 
 
 def _path(layout: Layout) -> str:
-    return f'{layout.env}/bin:{SYSTEM_PATH}'
+    return str(layout.env / ('Scripts' if os.name == 'nt' else 'bin')) + os.pathsep + SYSTEM_PATH
 
 
 def _tmpprefix(workspace: Path) -> str:
@@ -155,6 +206,11 @@ def _tmpprefix(workspace: Path) -> str:
 
 
 def _shell(layout: Layout, workspace: Path) -> dict:
+    if os.name == 'nt':
+        temp = str(workspace / '.tmp')
+        return {'inherit': 'core', 'set': {'TMP': temp, 'TEMP': temp, 'TMPDIR': temp, 'PATH': _path(layout),
+                                            'SystemRoot': os.environ['SystemRoot'],
+                                            'NoDefaultCurrentDirectoryInExePath': '1', 'PYTHONNOUSERSITE': '1'}}
     return {'inherit': 'core', 'set': {'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout),
                                        'TMPPREFIX': _tmpprefix(workspace)}}
 
@@ -177,7 +233,7 @@ def _local_server(layout: Layout, workspace: Path, profile: str, name: str, serv
     config: `-c` is merged with a home's config.toml (it would keep any extra entries there), and a trusted
     project in it would load the workspace's .codex/config.toml."""
     command = server['command']
-    if '/' in command and not os.path.isabs(command):
+    if has_path_component(command) and not Path(command).is_absolute():
         command = str(workspace / os.path.normpath(command))
     args = [str(workspace / os.path.normpath(arg)) if is_workspace_path(arg, workspace) else arg
             for arg in server['args']]
@@ -196,20 +252,40 @@ def _local_server(layout: Layout, workspace: Path, profile: str, name: str, serv
         permissions = copy.deepcopy(permissions)
         for rules in permissions.values():
             rules['filesystem'][str(layout.env)] = 'read'
+    selected = profile + '_net' if server['network'] else profile
+    if os.name == 'nt':
+        # Only one profile is needed for this wrapper. Keeping that one also avoids Windows' process command-line
+        # limit when a Lab configuration contains multiple MCP servers.
+        permissions = {selected: permissions[selected]}
     sandbox = ['sandbox', '-c', 'permissions=' + toml_value(permissions)]
+    if os.name == 'nt':
+        sandbox += ['-c', 'windows.sandbox="mxc"', '--include-managed-config']
     if server['network']:
         sandbox += ['-c', 'features=' + toml_value({'network_proxy': True}), '-P', profile + '_net',
                     '--enable', 'network_proxy']
     else:
         sandbox += ['-P', profile]
-    in_sandbox = ['/usr/bin/env', 'PATH=' + _path(layout), 'TMPPREFIX=' + _tmpprefix(workspace)]
+    temp = str(workspace / '.tmp')
+    env = {'CODEX_HOME': str(wrapper_home(layout)), 'TMPDIR': temp, 'PATH': WRAPPER_PATH}
+    if os.name == 'nt':
+        env.update(TEMP=temp, TMP=temp, SystemRoot=os.environ['SystemRoot'], NoDefaultCurrentDirectoryInExePath='1')
+        # Set the agent's executable search path *after* entering the sandbox. A Windows cmd.exe wrapper would
+        # reinterpret MCP arguments as shell text. The small Python trampoline keeps them as argument strings.
+        in_sandbox = [sys._base_executable, '-I', '-S', '-B', '-c', WINDOWS_SERVER_START, _path(layout)]
+        if command.lower() in ('python', 'python3', 'python.exe', 'python3.exe'):
+            command = str(layout.env / 'Scripts/python.exe')
+    else:
+        in_sandbox = ['/usr/bin/env', 'PATH=' + _path(layout), 'TMPPREFIX=' + _tmpprefix(workspace)]
     if name == 'memory' and proposals:
-        in_sandbox.append(proposal_files.ENABLE_ENV + '=1')
-    if name == 'literature':
+        if os.name == 'nt':
+            env[proposal_files.ENABLE_ENV] = '1'
+        else:
+            in_sandbox.append(proposal_files.ENABLE_ENV + '=1')
+    if name == 'literature' and os.name != 'nt':
         # macOS's CA bundle is readable under :minimal. Homebrew OpenSSL's default certificate folder is not.
         in_sandbox.append('SSL_CERT_FILE=/etc/ssl/cert.pem')
     return {'command': codex, 'args': [*sandbox, '--', *in_sandbox, command, *args],
-            'env': {'CODEX_HOME': str(wrapper_home(layout)), 'TMPDIR': str(workspace / '.tmp'), 'PATH': WRAPPER_PATH},
+            'env': env,
             'default_tools_approval_mode': 'approve', 'startup_timeout_sec': 30}
 
 
@@ -253,15 +329,17 @@ def prepare_wrapper_home(layout: Layout) -> None:
     """
     home = wrapper_home(layout)
     for folder in (layout.lab_home, home.parent, home):
-        if folder.is_symlink():
+        if is_link(folder):
             raise Refused(f'{folder} is a symbolic link; the control program does not follow it to empty another '
                           'folder. Make it a plain folder.')
         folder.mkdir(exist_ok=True)
     for entry in home.iterdir():
-        if entry.name == 'tmp' and entry.is_dir() and not entry.is_symlink():
+        if entry.name == 'tmp' and entry.is_dir() and not is_link(entry):
             continue
-        if entry.is_dir() and not entry.is_symlink():
+        if entry.is_dir() and not is_link(entry):
             shutil.rmtree(entry)
+        elif os.name == 'nt' and entry.is_dir():
+            entry.rmdir()
         else:
             entry.unlink()
 
@@ -290,8 +368,10 @@ def write_role_files(layout: Layout, settings: Settings, *, trial: bool) -> None
         wanted.add(name + '.toml')
     for entry in folder.iterdir():
         if entry.name not in wanted:
-            if entry.is_dir() and not entry.is_symlink():
+            if entry.is_dir() and not is_link(entry):
                 shutil.rmtree(entry)
+            elif os.name == 'nt' and entry.is_dir():
+                entry.rmdir()
             else:
                 entry.unlink()
 
@@ -316,6 +396,9 @@ def _server_problems(envelope: dict, settings: Settings, resolve) -> dict[str, l
             out[name] = [f'{SETTINGS}: the memory tool server must be a local server with network off']
             continue
         if 'url' not in server:
+            continue
+        if windows_offline(envelope):
+            out[name] = [f'{SETTINGS}: remote tool server {show(name)} is disabled by rsi.windows_offline']
             continue
         where, problems = f'{SETTINGS}: tool server {show(name)}', []
         try:
@@ -369,8 +452,9 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     check`, which composes for scratch roots inside the real one, passes the program it validated for the real root).
     """
     workspace, base = (layout.trial, 'trial') if trial else (layout.work, 'lab')
+    offline = windows_offline(envelope)
     config = {'approval_policy': envelope['approval_policy'] if interactive else 'never',
-              'default_permissions': base + ('_net' if settings.network else '')}
+              'default_permissions': base + ('_net' if settings.network and not offline else '')}
     if settings.model is not None:
         config['model'] = settings.model
     if settings.effort is not None:
@@ -378,7 +462,10 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     if settings.web_search is not None:
         config['web_search'] = settings.web_search
     features = copy.deepcopy(envelope.get('features', {}))
-    if settings.network:
+    if offline:
+        config['web_search'] = 'disabled'
+        features.update(apps=False, plugins=False, network_proxy=False)
+    elif settings.network:
         # Only for the Lab's commands. A local tool server with network gets its proxy from its own wrapper
         # (_local_server), whatever this says: measured with Codex 0.170.0, and by `rsi check`.
         features['network_proxy'] = True
@@ -388,6 +475,8 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
                         'config_file': str(role_folder(layout, trial=trial) / (name + '.toml'))}
     refused = _server_problems(envelope, settings, resolve)
     kept = {name: server for name, server in settings.tool_servers.items() if name not in refused}
+    if offline:
+        kept = {name: {**server, 'network': False} for name, server in kept.items()}
     if any('url' not in server for server in kept.values()):
         codex = codex or native_codex(layout)
     permissions = profiles(layout, envelope)
@@ -399,11 +488,14 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
         'features': features,
         'shell_environment_policy': _shell(layout, workspace),
         'agents': agents,
-        'apps': _disabled(envelope.get('apps', {}), settings.disabled_connectors, 'connectors', settings.problems),
-        'plugins': _disabled(envelope.get('plugins', {}), settings.disabled_plugins, 'plugins', settings.problems),
+        'apps': {} if offline else _disabled(envelope.get('apps', {}), settings.disabled_connectors,
+                                             'connectors', settings.problems),
+        'plugins': {} if offline else _disabled(envelope.get('plugins', {}), settings.disabled_plugins,
+                                                'plugins', settings.problems),
         'mcp_servers': servers,
         'permissions': permissions,
     })
+    windows_sandbox(config)
     return config
 
 
@@ -419,7 +511,7 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
                   str(layout.memory): 'read',
                   str(layout.work): 'read', str(layout.library): 'read', str(layout.env): 'read',
                   str(layout.meta): 'write', str(layout.candidate): 'write'}
-    for folder in _tool_folders():
+    for folder in _tool_folders(layout):
         filesystem.setdefault(folder, 'read')
     for closed in temp_folders() + list(_homes()):
         filesystem[closed] = 'deny'
@@ -435,10 +527,11 @@ def meta_config(layout: Layout, envelope: dict, meta_settings: dict) -> dict:
         config[key] = value
     config.update({
         'features': {'apps': False, 'plugins': False},
-        'web_search': 'live',
+        'web_search': 'disabled' if windows_offline(envelope) else 'live',
         'shell_environment_policy': _shell(layout, layout.meta),
         'permissions': {'meta': {'filesystem': filesystem, 'network': copy.deepcopy(NETWORK_OFF)}},
     })
+    windows_sandbox(config)
     return config
 
 
@@ -503,9 +596,9 @@ def _copy_verified(source: Path, target: Path, data: bytes) -> None:
     otherwise target is removed again and OSError raised."""
     temporary = _temporary(target.parent, data)
     try:
-        os.link(temporary, target)
+        publish_new(Path(temporary), target)
     finally:
-        os.unlink(temporary)
+        Path(temporary).unlink(missing_ok=True)
     try:
         if read_regular(target) != data or read_regular(source) != data:
             raise OSError(errno.EIO, 'the backup read back differs from the original', str(target))

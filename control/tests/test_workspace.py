@@ -1,5 +1,4 @@
 import os
-import resource
 import stat
 import subprocess
 import sys
@@ -12,6 +11,9 @@ from rsi import workspace
 from rsi.workspace import (free_name, keep, open_folder, prepare_for_commit, raise_open_files_limit, remove, seal)
 from tests.support import Root
 
+if os.name != 'nt':
+    import resource
+
 DEPTH = 300
 DENY_ALL = ('write,delete,add_subdirectory,add_file,delete_child,writeattr,writeextattr,writesecurity,readsecurity,'
             'list,search')
@@ -20,6 +22,8 @@ macos = unittest.skipUnless(sys.platform == 'darwin', 'macOS flags and ACLs')
 
 def few_open_files(test: unittest.TestCase) -> None:
     """macOS's default for a program: 256 open files, for the rest of the test."""
+    if os.name == 'nt':
+        return
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))
     test.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
@@ -282,6 +286,7 @@ class BeforeCommit(unittest.TestCase):
 
 
 class Limits(unittest.TestCase):
+    @unittest.skipIf(os.name == 'nt', 'requires a POSIX resource limit')
     def test_open_files_limit_is_raised(self):
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))

@@ -5,7 +5,6 @@ none of them may exist beforehand.
 """
 import json
 import os
-import signal
 import subprocess
 import tempfile
 import time
@@ -14,6 +13,7 @@ from pathlib import Path
 
 from rsi.mockmodel import provider_config
 from rsi.paths import Refused, find_layout, safe_id
+from rsi.processes import kill_group as _kill_group, start_group, stop_group
 from rsi.programs import clean_path, native_codex
 from rsi.tomlout import render_flags
 
@@ -26,6 +26,10 @@ LOCAL_HOSTS = '127.0.0.1,localhost'
 PROXY_VARIABLES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_proxy', 'https_proxy', 'all_proxy',
                    'no_proxy')
 KEPT_VARIABLES = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', *PROXY_VARIABLES)
+if os.name == 'nt':
+    KEPT_VARIABLES += ('SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
+                       'USERNAME', 'USERDOMAIN', 'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)',
+                       'PROCESSOR_ARCHITECTURE', 'COMSPEC', 'PATHEXT')
 
 
 @dataclass
@@ -58,6 +62,8 @@ def codex_environment(home: Path, *, secrets: bool = True, root: Path | None = N
            if key in KEPT_VARIABLES or key.startswith('LC_') or (secrets and key.startswith('RSI_TOOL_'))}
     if 'PATH' in env:
         env['PATH'] = clean_path(_root(root), env['PATH'])
+    if os.name == 'nt':
+        env['NoDefaultCurrentDirectoryInExePath'] = '1'
     env['CODEX_HOME'] = str(home)
     return env
 
@@ -81,9 +87,9 @@ def codex_version(root: Path | None = None) -> str:
     except Refused as error:
         raise RuntimeError(str(error)) from None
     with tempfile.TemporaryDirectory() as home:
-        process = subprocess.Popen([program, '--version'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE, text=True, start_new_session=True,
-                                   env=codex_environment(Path(home), secrets=False, root=root))
+        process = start_group([program, '--version'], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, env=codex_environment(Path(home), secrets=False,
+                                                                                       root=root))
         try:
             out, err = process.communicate(timeout=60)
         except subprocess.TimeoutExpired:
@@ -111,27 +117,7 @@ def _merge(base: dict, extra: dict) -> dict:
 
 
 def _stop(process: subprocess.Popen) -> None:
-    """SIGTERM the call's process group, SIGKILL it after KILL_GRACE seconds, and reap the leader. The SIGKILL is sent
-    in any case: a second interruption (Ctrl-C, SIGTERM, SIGHUP) during the grace period cannot skip it."""
-    try:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):  # macOS: PermissionError for a group of one exited leader
-            pass
-        try:
-            process.wait(timeout=KILL_GRACE)
-        except subprocess.TimeoutExpired:
-            pass
-    finally:
-        _kill_group(process)
-        process.wait()
-
-
-def _kill_group(process: subprocess.Popen) -> None:
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    stop_group(process, KILL_GRACE)
 
 
 def _read_events(path: Path) -> tuple[str | None, dict | None, bool]:
@@ -172,7 +158,8 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
     endpoint = os.environ.get('RSI_TEST_MODEL_ENDPOINT')
     if endpoint:
         config = _merge(config, provider_config(endpoint))
-        for key in ('NO_PROXY', 'no_proxy'):              # the endpoint is local: never through a proxy
+        # Windows environment variable names are case-insensitive.
+        for key in (('NO_PROXY',) if os.name == 'nt' else ('NO_PROXY', 'no_proxy')):
             env[key] = _with_local_hosts(env.get(key))
     if resume is not None:
         safe_id(resume, 'thread id')
@@ -200,8 +187,7 @@ def run_codex(*, home: Path, cwd: Path, prompt: str, config: dict, record_dir: P
             stderr.write(f'could not start Codex: {unusable}\n'.encode())
         else:
             try:
-                process = subprocess.Popen(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env,
-                                           start_new_session=True)
+                process = start_group(command, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd, env=env)
             except OSError as error:
                 stderr.write(f'could not start {command[0]}: {error}\n'.encode())
         if process is not None:

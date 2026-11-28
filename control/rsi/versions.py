@@ -11,12 +11,13 @@ attributes from them or from the owner's git setup, content is stored byte for b
 command line before it passes a strict pattern.
 """
 import hashlib
-import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
-from rsi.paths import safe_id
+from rsi import fs as os
+from rsi.paths import is_link, safe_id
 from rsi.programs import git_program
 
 VERSION = re.compile(r'V[0-9]{4,}')
@@ -91,6 +92,10 @@ class VersionStore:
             self._git('init', '--quiet', '--bare', '--initial-branch=main', '--object-format=sha1', '--template=')
         for key, value in STORE_CONFIG:
             self._git('config', key, value)
+        if os.name == 'nt':
+            # A versioned link must be restored as a link, even on a Windows
+            # installation whose global Git defaults would convert it to text.
+            self._git('config', 'core.symlinks', 'true')
         (self.git_dir / 'info').mkdir(exist_ok=True)
         (self.git_dir / 'info' / 'exclude').write_text(''.join(f'{pattern}\n' for pattern in self._ignore))
         (self.git_dir / 'info' / 'attributes').write_text(ATTRIBUTES)
@@ -178,8 +183,12 @@ class VersionStore:
         self._git('update-ref', '--stdin',
                   stdin=f'start\nverify {MAIN} {main}\ncreate refs/tags/{tag} {main}\nprepare\nabort\n'.encode())
         for folder in ('objects', 'indexes'):
-            if not os.access(self.git_dir / folder, os.W_OK):
-                raise RuntimeError(f'{self.git_dir / folder} is not writable')
+            path = self.git_dir / folder
+            try:
+                with tempfile.TemporaryFile(dir=path):
+                    pass
+            except OSError as error:
+                raise RuntimeError(f'{path} is not writable ({error})') from error
 
     def diff(self, old: str, new: str, limit: int = 1_000_000) -> str:
         """`git diff` from one version or commit to another, cut after `limit` bytes of output (with a note)."""
@@ -279,7 +288,7 @@ class VersionStore:
         Overlap is judged by file identity, not by path text: a path may name the same folder in another letter case.
         """
         folder = Path(folder)
-        if folder.is_symlink() or not folder.is_dir():
+        if is_link(folder) or not folder.is_dir():
             raise ValueError(f'Not a folder (or a link): {folder}')
         real = folder.resolve()
         here, store = os.stat(real), os.stat(self.git_dir)
@@ -298,6 +307,9 @@ class VersionStore:
             for name in dirs + files:
                 if name.lower() == '.git':
                     raise ValueError(f'The folder holds .git, so it cannot be saved as a version: {Path(top, name)}')
+                entry = Path(top, name)
+                if os.name == 'nt' and is_link(entry) and not entry.is_symlink():
+                    raise ValueError(f'The folder holds a Windows reparse point that Git cannot version: {entry}')
 
     def _index(self, folder: Path) -> Path:
         return self.git_dir / 'indexes' / hashlib.sha256(str(folder).encode()).hexdigest()[:32]
@@ -306,8 +318,11 @@ class VersionStore:
         """The caller's environment without any GIT_* variable, pointed at this store only, with a PATH no agent can
         write (git itself is rsi.programs.git_program, never looked up in a PATH)."""
         env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        git_path = GIT_PATH
+        if os.name == 'nt':
+            git_path = os.pathsep.join((os.path.dirname(git_program()), os.path.join(os.environ['SystemRoot'], 'System32')))
         env.update(GIT_DIR=str(self.git_dir), GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
-                   GIT_ATTR_NOSYSTEM='1', GIT_TERMINAL_PROMPT='0', PATH=GIT_PATH)
+                   GIT_ATTR_NOSYSTEM='1', GIT_TERMINAL_PROMPT='0', PATH=git_path)
         if folder is not None:
             env.update(GIT_WORK_TREE=str(folder), GIT_INDEX_FILE=str(self._index(folder)))
         if author is not None:

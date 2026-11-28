@@ -20,7 +20,7 @@ named in an English line, except regular files directly in skills/ (a README, a 
 ignored. Once nothing more can be taken the walk stops, with one line saying where.
 """
 import errno
-import os
+from rsi import fs as os
 import stat
 from pathlib import Path
 

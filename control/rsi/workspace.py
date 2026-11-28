@@ -18,14 +18,13 @@ Even so, everything here
 import ctypes
 import errno
 import functools
-import os
 import re
-import resource
 import secrets
 import stat
 import sys
 from pathlib import Path
 
+from rsi import fs as os
 from rsi.settings import show
 from rsi.versions import VersionStore, same_entries
 
@@ -65,6 +64,9 @@ class Lines:
 
 def raise_open_files_limit() -> None:
     """Raise this process's soft limit of open files as far as the hard limit allows (macOS starts at 256)."""
+    if os.name == 'nt':
+        return
+    import resource
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     for target in (hard, 1 << 20, 10240):                 # macOS refuses RLIM_INFINITY; its OPEN_MAX is 10240
         if target == resource.RLIM_INFINITY or target <= soft or (hard != resource.RLIM_INFINITY and target > hard):
@@ -420,6 +422,11 @@ def _visit(name: str, fd: int, prefix: str, depth: int, counters: dict, tree: st
     """One entry of the walk of prepare_for_commit."""
     info = os.stat(name, dir_fd=fd, follow_symlinks=False)
     path = f'{tree}/{prefix}{name}'
+    if os.name == 'nt' and stat.S_ISLNK(info.st_mode):
+        # A reparse point can represent many things besides a symbolic link.
+        # Git for Windows must only be handed ordinary files and directories.
+        aside.take(name, fd, path, info, prefix + name, 'is a Windows reparse point', lines)
+        return
     folder, regular = stat.S_ISDIR(info.st_mode), stat.S_ISREG(info.st_mode)
     _unlock(name, fd, path, info, stat.S_IRWXU if folder else stat.S_IRUSR if regular else 0)
     if is_dotgit(name) or (stat.S_ISLNK(info.st_mode) and is_dotgitmodules(name)):
@@ -464,7 +471,7 @@ def prepare_for_commit(tree: Path, left_out: Path, shown: str) -> tuple[list[str
     (shown names left_out in the lines): a folder deeper than MAX_DEPTH or whose relative path is longer than
     MAX_PATH_BYTES, a regular file bigger than BIG_FILE, and a folder or file that cannot be opened; an ACL that
     refuses the move is cleared first. Links, FIFOs and sockets stay: git stores a link as a link and skips the
-    other two.
+    other two. Windows reparse points are moved to left_out before Git sees the tree.
     """
     tree = str(tree)
     lines, aside, failed = Lines(), _Aside(left_out, shown), 0

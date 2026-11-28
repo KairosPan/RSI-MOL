@@ -13,7 +13,7 @@ from tests.support import Root, needs_codex
 @needs_codex
 class Lifecycle(unittest.TestCase):
     def test_a_live_delivery_then_an_excluded_trial_and_a_memory_free_task(self):
-        seed = Path(__file__).resolve().parents[1] / 'seed/work'
+        from tests.installed_seed import WORK as seed
         with Root() as root:
             root.add_task('source')
             root.add_task('reader')

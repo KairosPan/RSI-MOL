@@ -150,7 +150,8 @@ class Proposals(unittest.TestCase):
         work = self.layout.root / 'paged-reader'
         work.mkdir()
         place_snapshot(self.layout, work)
-        package = Path(__file__).resolve().parents[1] / 'seed/work/tools/memory'
+        from tests.installed_seed import WORK
+        package = WORK / 'tools/memory'
         with mock.patch.object(sys, 'path', [str(package), *sys.path]):
             reader = runpy.run_path(str(package / 'server.py'))['Server'](work / 'memory')
         key = dict(id=entry['object']['id'], revision=1)
@@ -179,7 +180,7 @@ class Proposals(unittest.TestCase):
         self.assertEqual(registered['object_refs'][0]['call_id'], question[-1]['id'])
         # Audit the registered citation through the same sealed participant sessions and starting snapshot.
         from rsi.memory_history import trusted_rows, passage_index
-        audit = runpy.run_path(str(package.parents[4] / 'tasks/pool-analysis-readout/audit.py'))
+        audit = runpy.run_path(str(Path(__file__).resolve().parents[2] / 'tasks/pool-analysis-readout/audit.py'))
         call = self.records.load_call(result['run'])
         state = ledger.load(self.layout)
         rows = trusted_rows(state, call['memory'])

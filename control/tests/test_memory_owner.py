@@ -72,7 +72,7 @@ class OwnerLedger(unittest.TestCase):
             self.command(*args, code=code)
         with locked(self.layout):
             self.assertIn('Another rsi', self.command('source-changed', self.original, code=3))
-        with patch('rsi.records.os.link', side_effect=InterruptedError), self.assertRaises(InterruptedError):
+        with patch('rsi.records.publish_new', side_effect=InterruptedError), self.assertRaises(InterruptedError):
             ledger.record_owner_action(self.layout, 'source_changed', {'source_sha256': self.original})
         self.assertEqual(ledger.load(self.layout).tail, self.registration['tail_sha256'])
         self.assertEqual(self.command('source-changed', self.original)['version_before'], 3)

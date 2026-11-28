@@ -20,6 +20,7 @@ from rsi.records import CALL_FILE, KINDS
 from rsi.settings import SETTINGS, Settings, load_settings, workspace_problems
 from rsi.tasks import SECTIONS, load_task, run_check
 from rsi.versions import VersionStore
+from tests.installed_seed import WORK as INSTALLED_WORK
 from tests.support import ENVELOPE, PASS_CHECK, Root, force_remove, needs_codex, write_passing_check
 
 SEED = Path(__file__).resolve().parents[1] / 'seed'
@@ -27,7 +28,7 @@ TASKS = SEED.parents[1] / 'tasks'
 META_TEXT = SEED / 'owner' / 'meta' / 'AGENTS.md'
 WORK_FILES = ['AGENTS.md', 'codex/agents/literature.toml', 'codex/settings.toml', 'notes/README.md']
 LIT_FILES = ['tools/literature/' + name for name in
-             ('UPSTREAM.md', 'dispatch.py', 'runtime.py', 'server.py', 'transport.py')]
+             ('UPSTREAM.md', 'dispatch.py', 'runtime.py', 'server.py', 'transport.py', 'windows_poppler.py')]
 UPSTREAM_MODULES = ('__init__', 'catalog', 'documents', 'parsers', 'poppler', 'projects', 'providers', 'remote',
                     'sdk_tools', 'services', 'worker')
 LIT_FILES += ['tools/literature/rsi_literature/' + name + '.py' for name in UPSTREAM_MODULES]
@@ -281,11 +282,11 @@ class Seed(unittest.TestCase):
         checkout = tmp / 'V0001'
         checkout.mkdir()
         store.checkout('V0001', checkout)
-        expected = WORK_FILES + LIT_FILES + MEMORY_FILES
+        expected = files(INSTALLED_WORK)
         self.assertEqual(files(checkout), sorted(expected))
         self.assertEqual(files(layout.work), sorted(expected + ['.agents/skills/scientific-memory/SKILL.md',
                                                                'memory/status.json', 'memory/evidence.jsonl']))
         for name in expected:
-            self.assertEqual((checkout / name).read_bytes(), (SEED / 'work' / name).read_bytes(), name)
+            self.assertEqual((checkout / name).read_bytes(), (INSTALLED_WORK / name).read_bytes(), name)
         for name in OWNER_FILES:
             self.assertEqual((layout.owner / name).read_bytes(), (SEED / 'owner' / name).read_bytes(), name)

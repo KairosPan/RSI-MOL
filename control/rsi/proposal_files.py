@@ -1,5 +1,5 @@
 """Stage the managed task's proposal directory and collect its sealed contents before call finalization."""
-import os
+from rsi import fs as os
 import re
 import stat
 import tempfile

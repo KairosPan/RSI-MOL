@@ -3,12 +3,14 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest import mock
 
 from rsi import memory_ingest as ingest, memory_store as ledger
+from rsi.compose import WINDOWS_SERVER_START
 from rsi.labrun import run_task
 from rsi.memory_receipts import original_problem, service_source
 from rsi.memory_snapshot import place_snapshot
@@ -19,6 +21,7 @@ from rsi.tomlout import toml_value
 from rsi.versions import VersionStore
 from seed.work.tools.literature.rsi_literature.providers import ProviderClient
 from seed.work.tools.memory.query import Snapshot
+from tests.links import make_hardlink, make_link
 from tests.support import Root, needs_codex
 from tests.test_cli import run as cli_run
 from tests.test_literature_server import ARTICLE, DRIVER, SEED
@@ -343,8 +346,8 @@ class Ledger(unittest.TestCase):
         shutil.copytree(self.layout.records, reference.records)
         shutil.copytree(self.layout.library, reference.library)
         wanted, = ingest.backfill(reference)
-        # The segment has been written to a private staging file when os.link publishes it.
-        with mock.patch('rsi.records.os.link', side_effect=InterruptedError('before publication')), self.assertRaises(InterruptedError):
+        # The segment has been written to a private staging file before publication.
+        with mock.patch('rsi.records.publish_new', side_effect=InterruptedError('before publication')), self.assertRaises(InterruptedError):
             ingest.backfill(self.layout)
         self.assertEqual(ledger.load(self.layout).version, 0)
         self.assertFalse((self.layout.records / 'memory').exists())
@@ -400,15 +403,18 @@ class Ledger(unittest.TestCase):
         delivery, = ledger.load(self.layout).deliveries
         self.assertEqual((delivery['thread'], delivery['role']), ('lead', 'lead'))
 
-    def test_original_rejects_hardlinks_mismatches_and_changed_directory_entries(self):
+    def test_original_rejects_hardlinks(self):
         link = self.file.parent / 'other'
-        os.link(self.file, link)
+        make_hardlink(self.file, link)
         self.assertIn('single-link', original_problem(self.layout, self.original))
-        link.unlink()
+
+    def test_original_rejects_mismatch(self):
         self.file.write_bytes(b'different')
         self.assertIn('mismatch', original_problem(self.layout, self.original))
+
+    def test_original_rejects_changed_directory_entries(self):
         base = self.file.parent
-        moved = base.with_name('old'); base.rename(moved); base.symlink_to(moved)
+        moved = base.with_name('old'); base.rename(moved); make_link(moved, base)
         self.assertIn('opened', original_problem(self.layout, self.original))
 
     def test_service_provenance_does_not_echo_custom_command_or_token(self):
@@ -430,7 +436,13 @@ class Ledger(unittest.TestCase):
         meta = store.commit(self.layout.work, 'meta M0001', 'Edited again')
 
         def launch(before, after=None, script=entry):
-            server = {'command': '/usr/bin/codex', 'args': ['sandbox', '--', '/usr/bin/env', 'python3', '-B', str(script)]}
+            if os.name == 'nt':
+                inner = [sys._base_executable, '-I', '-S', '-B', '-c', WINDOWS_SERVER_START, '',
+                         str(self.layout.env / 'Scripts/python.exe'), '-B', str(script)]
+            else:
+                inner = ['/usr/bin/env', 'python3', '-B', str(script)]
+            server = {'command': 'codex.exe' if os.name == 'nt' else '/usr/bin/codex',
+                      'args': ['sandbox', '--', *inner]}
             call = {'version_before': before, 'version_after': after, 'command': ['-c', 'mcp_servers=' + toml_value({'literature': server})]}
             return service_source(self.layout, call)
 
@@ -445,6 +457,30 @@ class Ledger(unittest.TestCase):
         self.assertEqual(launch(installed, script=entry.with_name('alternative.py'))['origin'], 'custom')
         self.assertEqual(service_source(self.layout, {})['origin'], 'unknown')
 
+    def test_archived_windows_and_posix_service_commands_survive_relocation(self):
+        store = VersionStore(self.layout.versions)
+        store.init()
+        entry = self.layout.work / 'tools/literature/server.py'
+        entry.parent.mkdir(parents=True)
+        entry.write_text('installed\n')
+        version = store.commit(self.layout.work, 'owner', 'Install the Literature tool server')
+        for recorded in (PureWindowsPath('D:/RSI Archive'), PurePosixPath('/srv/rsi-archive')):
+            with self.subTest(recorded=recorded):
+                script = str(recorded / 'work/tools/literature/server.py')
+                output = str(recorded / 'records/runs/R0001/last-message.txt')
+                if isinstance(recorded, PureWindowsPath):
+                    codex = str(recorded.parent / 'Programs/Codex/bin/codex.exe')
+                    inner = [str(recorded.parent / 'Python/python.exe'), '-I', '-S', '-B', '-c', WINDOWS_SERVER_START,
+                             '', str(recorded / 'env/Scripts/python.exe'), '-B', script]
+                else:
+                    codex = '/usr/bin/codex'
+                    inner = ['/usr/bin/env', 'python3', '-B', script]
+                server = {'command': codex, 'args': ['sandbox', '--', *inner]}
+                call = {'id': 'R0001', 'version_before': version,
+                        'command': ['-o', output, '-c', 'mcp_servers=' + toml_value({'literature': server})]}
+                provenance = service_source(self.layout, call)
+                self.assertEqual((provenance['origin'], provenance.get('version')), ('installed', version))
+
     def test_invalid_receipt_paths_and_required_fields_reject_only_the_bad_rows(self):
         missing_locator = dict(self.row)
         del missing_locator['locator']
@@ -457,14 +493,14 @@ class Ledger(unittest.TestCase):
     def test_reserved_store_and_report_names_must_be_real_directories_and_files(self):
         outside = self.layout.root / 'outside'
         outside.mkdir()
-        self.layout.memory.symlink_to(outside)
+        make_link(outside, self.layout.memory)
         with self.assertRaisesRegex(ValueError, 'plain directory'):
             ledger.init_store(self.layout)
         self.assertEqual(list(outside.iterdir()), [])
         self.layout.memory.unlink()
         self.layout.memory.mkdir()
         batches = self.layout.memory / 'batches'
-        batches.symlink_to(outside)
+        make_link(outside, batches)
         with self.assertRaisesRegex(ValueError, 'plain directory'):
             ingest.backfill(self.layout)
         batches.unlink()
@@ -473,14 +509,14 @@ class Ledger(unittest.TestCase):
         batch, = batches.glob('*.jsonl')
         moved = outside / 'batch'
         batch.rename(moved)
-        batch.symlink_to(moved)
+        make_link(moved, batch)
         with self.assertRaisesRegex(ValueError, 'regular file'):
             ingest.verify(self.layout)
         batch.unlink()
         moved.rename(batch)
         report = self.layout.records / 'memory' / f'{r}.json'
         report.rename(outside / 'report')
-        report.symlink_to(outside / 'report')
+        make_link(outside / 'report', report)
         with self.assertRaisesRegex(ValueError, 'regular file'):
             ingest.backfill(self.layout)
 

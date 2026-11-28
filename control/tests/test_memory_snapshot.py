@@ -15,7 +15,7 @@ from rsi.memory_snapshot import _encode, _project, place_snapshot
 from rsi.memory_store import State
 from rsi.paths import Layout
 
-SEED = Path(__file__).resolve().parents[1] / 'seed' / 'work'
+from tests.installed_seed import WORK as SEED
 SHA = '1' * 64
 
 
@@ -74,7 +74,7 @@ class MemorySnapshot(unittest.TestCase):
                         for n, (name, args) in enumerate(calls, 3))
         lines = [json.dumps({'jsonrpc': '2.0', **r}) for r in requests]
         done = subprocess.run([sys.executable, '-B', str(work / 'tools/memory/server.py')],
-                              input='\n'.join(lines) + '\n', capture_output=True, text=True, check=True, timeout=10)
+                              input='\n'.join(lines) + '\n', capture_output=True, encoding='utf-8', check=True, timeout=10)
         self.assertEqual(done.stderr, '')
         replies = [json.loads(line)['result'] for line in done.stdout.splitlines()]
         self.assertEqual(replies[0]['protocolVersion'], '2025-06-18')
@@ -579,11 +579,9 @@ class MemorySnapshot(unittest.TestCase):
         self.add_judgments()
         self.state.reports['R3'] = {'version_after': self.state.version}
         # Model directory listings from a case-sensitive volume, including on macOS CI.
-        first, other = self.parent / 't', self.parent / 'other' / 'T'
-        first.mkdir()
+        first, other = self.layout.tasks / 't', self.parent / 'other' / 'T'
+        first.mkdir(parents=True)
         other.mkdir(parents=True)
-        self.layout.tasks.mkdir(parents=True)
-        (self.layout.tasks / 't').symlink_to(first, target_is_directory=True)
         with patch.object(Path, 'iterdir', return_value=iter([first, other])):
             _, meta = self.place('trial', 't')
         self.assertEqual(meta['case_distinct_tasks'], ['T'])

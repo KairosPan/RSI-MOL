@@ -1,6 +1,5 @@
 """Offline Scientific Memory MCP server. Its input is the snapshot beside the workspace tools directory."""
 
-import fcntl
 import json
 import os
 import re
@@ -8,6 +7,11 @@ import secrets
 import sys
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+
+if os.name == 'nt':
+    import rsi_fs as os
+else:
+    import fcntl
 
 from query import DEFAULT_BYTES, NATIVE_RECEIPT_BYTES, Snapshot, bounded, challenge_address, encode, exact_page
 
@@ -134,13 +138,27 @@ def validate(prop, value, key):
 
 
 @contextmanager
-def proposal_folder(workspace):
+def proposal_folder(workspace, *, writing=False):
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     with ExitStack() as stack:
         folder = None
         for entry in (workspace, '.tmp', 'memory-proposals'):
+            if writing and entry == 'memory-proposals' and os.name == 'nt':
+                # Windows locks regular files. A sibling lock keeps it outside the
+                # proposal quota and the controller's sealed collection.
+                lock = os.open('.memory-proposals.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=folder)
+                stack.callback(os.close, lock)
+                try:
+                    os.lock_exclusive(lock, wait=False)
+                except BlockingIOError:
+                    raise ValueError('Another writer holds the proposal directory; retry submission shortly') from None
             folder = os.open(entry, flags, dir_fd=folder)
             stack.callback(os.close, folder)
+        if writing and os.name != 'nt':
+            try:
+                fcntl.flock(folder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError('Another writer holds the proposal directory; retry submission shortly') from None
         yield folder
 
 
@@ -150,12 +168,7 @@ def save_proposal(workspace, args):
         raise ValueError('Proposal exceeds the byte limit')
     proposal_id = secrets.token_hex(16)
     name = proposal_id + '.json'
-    with proposal_folder(workspace) as folder:
-        # Separate Lab and Literature processes may submit to the same collection directory.
-        try:
-            fcntl.flock(folder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise ValueError('Another writer holds the proposal directory; retry submission shortly') from None
+    with proposal_folder(workspace, writing=True) as folder:
         with os.scandir(folder) as entries:
             if any(count == MAX_PROPOSALS for count, _ in enumerate(entries, start=1)):
                 raise ValueError(f'This task has reached its {MAX_PROPOSALS}-proposal limit')

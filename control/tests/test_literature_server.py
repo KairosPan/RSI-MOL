@@ -11,7 +11,9 @@ from pathlib import Path
 
 from rsi.check import _pdf
 
-SEED = Path(__file__).resolve().parents[1] / 'seed' / 'work' / 'tools' / 'literature'
+from tests.installed_seed import WORK
+
+SEED = WORK / 'tools/literature'
 ARTICLE = ('<article><body><sec><title>Methods</title><p>Offset checking uses '
            'caf\u00e9. Each record has a location.</p></sec></body></article>').encode()
 DRIVER = '''
@@ -83,7 +85,7 @@ class LiteratureServer(unittest.TestCase):
         (path / 'sources.json').write_text(json.dumps({'known': {'path': 'known.pdf', 'sha256': self.pdf_hash,
                                                                  'media_type': 'application/pdf'}}))
         self.proc = subprocess.Popen([sys.executable, '-B', str(path / 'fixture_server.py')], stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8')
         self.addCleanup(self.close)
         self.counter = 0
 

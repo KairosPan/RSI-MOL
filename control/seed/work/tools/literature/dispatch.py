@@ -5,6 +5,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import os
 import re
 import socket
 import time
@@ -15,6 +16,10 @@ from pathlib import Path
 
 import transport
 from rsi_literature import catalog, documents, parsers, poppler, providers, remote
+
+if os.name == 'nt':
+    from windows_poppler import execute as windows_execute
+    parsers._execute = windows_execute
 
 NATIVE = ('europe_pmc', 'pubmed', 'openalex')
 ENABLED = (*NATIVE, 'asta', 'poppler')

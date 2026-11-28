@@ -18,6 +18,9 @@ from urllib.parse import urlsplit
 
 DELAY, USAGE, HANG_UP = 'rsi.delay', 'rsi.usage', 'rsi.hang_up'
 _ids = itertools.count(1)
+# Disable host-side exports for local validation, independently of the agent's sandbox.
+LOCAL_DIAGNOSTICS = {'analytics': {'enabled': False},
+                     'otel': {'exporter': 'none', 'trace_exporter': 'none', 'metrics_exporter': 'none'}}
 
 
 def say(text: str) -> list[dict]:
@@ -75,7 +78,7 @@ def hang_up() -> list[dict]:
 
 def provider_config(base_url: str) -> dict:
     """Config keys that point Codex at the endpoint, with no retries."""
-    return {'model_provider': 'mock', 'model_providers': {'mock': {
+    return {**LOCAL_DIAGNOSTICS, 'model_provider': 'mock', 'model_providers': {'mock': {
         'name': 'mock', 'base_url': base_url, 'wire_api': 'responses',
         'request_max_retries': 0, 'stream_max_retries': 0}}}
 

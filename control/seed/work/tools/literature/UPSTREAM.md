@@ -33,6 +33,8 @@ outside them:
   for the whole exchange, an error for a body shorter than its declared length, and
   an error (not an exception that ends the server) for every HTTP fault.
 - `server.py` blocks the import of `pypdf`, so PDFs are read with Poppler only.
+- On Windows, `windows_poppler.py` runs Poppler in a Windows job and drains its
+  output through a native pipe. It enforces the parser's time and size limits.
 
 Local sources can be registered in an optional `sources.json` beside this file.
 Each entry binds a source ID to a workspace-relative path, SHA-256, and media type.

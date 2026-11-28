@@ -15,7 +15,7 @@ from rsi.mockmodel import run_js, say
 from tests.support import Root, needs_codex
 
 
-SEED = Path(__file__).resolve().parents[1] / 'seed/work'
+from tests.installed_seed import WORK as SEED
 SOURCE = b'<article><body><sec><p>Score the difference within each pair.</p></sec></body></article>'
 # Enough matching blocks and JSON escapes to exceed Codex's old native receipt budget.
 PARAGRAPHS = ''.join(f'<p>Score the difference within each pair. Pool {n}: ' + '"\\中' * 35 + '</p>'

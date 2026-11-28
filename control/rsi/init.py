@@ -24,12 +24,11 @@ read and renames back. Then it moves what only an interrupted run leaves (entrie
 the root) under sealed/, never deleting them or reading anything else in them, and puts main's head back into a
 missing work/. Until it has run, rsi task, meta and rollback refuse to start (rsi.labrun.unrecovered).
 """
-import fcntl
 import json
-import os
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import tomllib
@@ -37,20 +36,26 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from rsi import fs as os
 from rsi.codexrun import codex_environment, codex_program
+from rsi.processes import kill_group, start_group
 from rsi.compose import (ENVELOPE, HOME_CONFIG, TOOL_FOLDERS, backup_names, keep_owner_config, load_envelope,
                          read_regular, write_home_config)
 from rsi.labrun import (MANUAL, PROCESS_FILE, WORKSPACE_ERRORS, discard, interrupted_literature, move_in, now,
                         process_start, refusing, restore_work, root_descriptor, settle, stage, stamp)
 from rsi.memory_store import init_store
-from rsi.paths import Layout, Refused
+from rsi.paths import Layout, Refused, is_link
+from rsi.programs import inside
+from rsi.publication import publish_new
 from rsi.records import STARTED, Records
+from rsi.seed import windows_seed
 from rsi.settings import Settings
 from rsi.tomlout import render_file
 from rsi.versions import VersionStore
 from rsi.workspace import SEALED, has_entry, keep, kind, open_folder, seal
 
-DEFAULT_PYTHON = '/opt/homebrew/bin/python3'
+DEFAULT_PYTHON = (getattr(sys, '_base_executable', sys.executable)
+                  if os.name == 'nt' else '/opt/homebrew/bin/python3')
 IMPORTED = ('features', 'apps', 'plugins')      # tables of that file the envelope takes (and approval_policy)
 UNSAFE_IN_ROOT = '"[]*?\n\r'                    # Codex's own sandbox cannot confine a path with these
 # What Codex loads from a project root. The RSI root is a git repository, so Codex may take it for the project root of
@@ -73,7 +78,7 @@ ENVELOPE_HEADER = ("# What the Lab may reach outside. The owner's file; agents c
 
 @contextmanager
 def locked(layout: Layout):
-    """An exclusive flock on layout.lock, held until the block ends; Refused if another rsi holds it. The
+    """An exclusive lock on layout.lock, held until the block ends; Refused if another rsi holds it. The
     descriptor is not inherited by the programs rsi starts, so a leftover process never keeps the lock."""
     try:
         fd = os.open(layout.lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -81,7 +86,7 @@ def locked(layout: Layout):
         raise Refused(f'The lock file {layout.lock} cannot be opened ({error.strerror or error})') from None
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.lock_exclusive(fd, wait=False)
         except BlockingIOError:
             raise Refused('Another rsi is running; wait until it ends, then try again') from None
         yield
@@ -118,7 +123,7 @@ def _folders(layout: Layout, root_fd: int, report: dict) -> None:
         elif found != 'folder':
             report['problems'].append(f'{name}/ is not a folder (it may be a symbolic link); it was left as it is')
     meta = layout.owner / 'meta'
-    if meta.is_symlink() or (os.path.lexists(meta) and not meta.is_dir()):
+    if is_link(meta) or (os.path.lexists(meta) and not meta.is_dir()):
         raise Refused(f'{meta} is not a folder (it may be a symbolic link). Make it a plain folder.')
     if not meta.exists():
         meta.mkdir()
@@ -126,7 +131,7 @@ def _folders(layout: Layout, root_fd: int, report: dict) -> None:
 
 
 def _create(path: Path, data: bytes, mode: int = 0o644) -> None:
-    """A new file holding data, all at once: written to a synced temporary file in the same folder, then linked to
+    """A new file holding data, all at once: written to a synced temporary file in the same folder, then published at
     path, so a crash or a full disk never leaves a partial file under that name. FileExistsError if anything (a link
     too) has that name."""
     fd, temporary = tempfile.mkstemp(prefix='.rsi-', suffix='.tmp', dir=path.parent)
@@ -136,15 +141,15 @@ def _create(path: Path, data: bytes, mode: int = 0o644) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
-        os.link(temporary, path)
+        publish_new(temporary, path)
     finally:
-        os.unlink(temporary)
+        Path(temporary).unlink(missing_ok=True)
 
 
 def _keep_owner_config(layout: Layout, report: dict) -> None:
     """A verified copy of the owner's codex-home/config.toml before anything can rewrite it (Refused, and nothing
     rewritten, when none can be made). A link there is never followed: reported, and only the link is replaced."""
-    if os.path.islink(layout.lab_home / HOME_CONFIG):
+    if is_link(layout.lab_home / HOME_CONFIG):
         report['problems'].append('codex-home/config.toml is a symbolic link, so it was not backed up or imported '
                                   'from; the generated configuration replaces only the link itself, not the file it '
                                   'points to')
@@ -191,6 +196,8 @@ def _envelope(layout: Layout, report: dict, original: dict | None, source: Path 
     envelope.update({key: table[key] for key in IMPORTED if key in table})
     envelope['rsi'] = {'extra_read': [folder for folder in TOOL_FOLDERS if os.path.exists(folder)],
                        'python': DEFAULT_PYTHON}
+    if os.name == 'nt':
+        envelope['rsi']['windows_offline'] = True
     try:
         text = ENVELOPE_HEADER + render_file(envelope)
     except (TypeError, ValueError) as error:
@@ -217,7 +224,7 @@ def _first_version(layout: Layout, store: VersionStore, seed: Path, report: dict
     layout.staging.mkdir(exist_ok=True)
     folder = layout.staging / stamp()
     try:
-        shutil.copytree(seed / 'work', folder, symlinks=True, ignore=shutil.ignore_patterns('__pycache__'))
+        shutil.copytree(seed, folder, symlinks=True, ignore=shutil.ignore_patterns('__pycache__'))
         report['first_version'] = store.commit(folder, 'init', 'First version (made by rsi init from the seed files)')
     finally:
         discard(folder)
@@ -280,7 +287,7 @@ def _first_versions(layout: Layout, records: Records, store: VersionStore, root_
     problems = report['problems']
 
     def save(tree: Path) -> None:
-        problems.extend(_add_seed_files(seed / 'work', tree))
+        problems.extend(_add_seed_files(seed, tree))
         store.commit(tree, MANUAL, 'What init found in work/ (put there by hand, or left by an earlier process), with '
                                     'the missing seed files added')
 
@@ -303,12 +310,6 @@ def _work(layout: Layout, records: Records, store: VersionStore, root_fd: int, c
     return settings
 
 
-def _inside(path: str, folder: Path) -> bool:
-    folder = os.path.realpath(folder)
-    return any(form == folder or form.startswith(folder + os.sep) for form in (os.path.abspath(path),
-                                                                              os.path.realpath(path)))
-
-
 def _env(layout: Layout, root_fd: int, envelope: dict, report: dict) -> None:
     """env/ by `<python> -I -m venv` when the entry is missing; never read or walked otherwise."""
     if kind('env', root_fd) is not None:
@@ -320,7 +321,7 @@ def _env(layout: Layout, root_fd: int, envelope: dict, report: dict) -> None:
         problems.append(f'rsi.python in owner/{ENVELOPE} must be the absolute path of an interpreter, but it is '
                         f'{python!r}; env/ was not made')
         return
-    if _inside(python, layout.root):
+    if inside(python, str(layout.root)):
         problems.append(f'{python} is inside the RSI folder, where agents can change it, so it cannot make env/')
         return
     if not (os.path.isfile(python) and os.access(python, os.X_OK)):
@@ -330,7 +331,7 @@ def _env(layout: Layout, root_fd: int, envelope: dict, report: dict) -> None:
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith('PYTHON') and key != '__PYVENV_LAUNCHER__'}
     try:
-        done = subprocess.run([python, '-I', '-m', 'venv', str(layout.env)], cwd='/', env=environment,
+        done = subprocess.run([python, '-I', '-m', 'venv', str(layout.env)], cwd=Path(python).anchor, env=environment,
                               stdin=subprocess.DEVNULL, capture_output=True, timeout=VENV_SECONDS)
     except (OSError, subprocess.SubprocessError) as error:
         problems.append(f'env/ could not be made ({type(error).__name__}: {error}); remove env/, then run rsi init '
@@ -346,21 +347,14 @@ def _env(layout: Layout, root_fd: int, envelope: dict, report: dict) -> None:
     report['env'] = 'created'
 
 
-def _kill_group(pid: int) -> None:
-    try:
-        os.killpg(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
 def signed_in(home: Path, root: Path) -> bool | None:
     """Whether `codex login status` (the validated Codex of the RSI root `root`), run with CODEX_HOME=home, exits 0;
     None when it cannot be run or does not end. Only the exit code is used: its output is discarded and no file of
     the home is read here."""
     try:
-        process = subprocess.Popen([codex_program(root), 'login', 'status'], stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                   env=codex_environment(home, secrets=False, root=root))
+        process = start_group([codex_program(root), 'login', 'status'], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              env=codex_environment(home, secrets=False, root=root))
     except (OSError, Refused):
         return None
     try:
@@ -368,7 +362,7 @@ def signed_in(home: Path, root: Path) -> bool | None:
     except subprocess.TimeoutExpired:
         code = None
     finally:
-        _kill_group(process.pid)
+        kill_group(process)
         process.wait()
     return None if code is None else code == 0
 
@@ -380,7 +374,7 @@ def init(layout: Layout, seed: Path) -> dict:
     if bad:
         raise Refused(f'The path of the RSI folder {str(layout.root)!r} holds {"".join(bad)!r}; the Codex sandbox '
                       'cannot handle such a path. Choose another path.')
-    if layout.root.is_symlink() or not layout.root.is_dir():
+    if is_link(layout.root) or not layout.root.is_dir():
         raise Refused(f'{layout.root} is not a folder')
     found = loaded_at_root(layout)
     if found:
@@ -400,7 +394,8 @@ def init(layout: Layout, seed: Path) -> dict:
             store.init()
             first = store.head() is None
         if first:
-            _first_versions(layout, records, store, root_fd, seed, context, report)
+            with windows_seed(seed / 'work', layout.staging) as native_seed:
+                _first_versions(layout, records, store, root_fd, native_seed, context, report)
         settings = _work(layout, records, store, root_fd, context, report)
         _env(layout, root_fd, envelope, report)
         write_home_config(layout, envelope, settings)
@@ -435,6 +430,10 @@ def _stop_group(records: Records, call_id: str) -> tuple[bool, bool]:
     own group), when that group is alive and the process with that pid started when the record says (to within
     SAME_PROCESS_SECONDS): SIGTERM, up to STOP_GRACE seconds for it to go, then SIGKILL. (whether it was signalled,
     whether it needed the SIGKILL). A pid that may have been reused is left alone."""
+    if os.name == 'nt':
+        # Every managed call belongs to a kill-on-close job. Recovery already
+        # owns the controller lock, and must never signal a PID from a prior run.
+        return False, False
     try:
         data = json.loads((records.call_dir(call_id) / PROCESS_FILE).read_bytes())
     except (OSError, ValueError, RecursionError):

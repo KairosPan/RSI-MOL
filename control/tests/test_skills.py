@@ -34,7 +34,7 @@ def files(folder: Path) -> list[str]:
     """Every entry under folder, relative, sorted (links not followed)."""
     if not os.path.lexists(folder):
         return []
-    return sorted(str(Path(top, name).relative_to(folder)) for top, dirs, names in os.walk(folder)
+    return sorted(Path(top, name).relative_to(folder).as_posix() for top, dirs, names in os.walk(folder)
                   for name in dirs + names)
 
 

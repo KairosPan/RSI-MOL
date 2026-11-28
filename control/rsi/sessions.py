@@ -7,7 +7,7 @@ no glob characters. Files are opened without following links and copied only whe
 """
 import glob
 import json
-import os
+from rsi import fs as os
 import shutil
 import stat
 from pathlib import Path

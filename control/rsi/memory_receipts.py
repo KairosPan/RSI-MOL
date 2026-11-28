@@ -1,14 +1,14 @@
 """Read the native completions in a finished Lab call and the originals those completions name."""
 import hashlib
 import json
-import os
+from rsi import fs as os
 import re
 import stat
 import subprocess
 import time
 import tomllib
 from contextlib import ExitStack, contextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.parse import urlsplit
 
 from rsi.memory_store import DIGEST, digest
@@ -86,22 +86,34 @@ def service_source(layout, call):
         args = server.get('args') or []
         if 'command' not in server or not args:
             return unknown
+        # Archived receipts retain the path syntax of the machine that produced them.
+        windows = PureWindowsPath(server['command']).name.casefold() == 'codex.exe'
+        paths = PureWindowsPath if windows else PurePosixPath
         command = call.get('command') or []
-        workspace = layout.work
+        workspace = paths(str(layout.work))
         if '-o' in command:
-            output = Path(command[command.index('-o') + 1])
+            output = paths(command[command.index('-o') + 1])
             if output.parts[-4:] == ('records', 'runs', call['id'], 'last-message.txt'):
                 workspace = output.parents[3] / 'work'  # the recorded installation can since have been moved
         custom = {**unknown, 'origin': 'custom', 'transport': 'stdio', 'entry_sha256': digest([server['command'], args])}
-        if Path(server['command']).name != 'codex' or not args or args[0] != 'sandbox' or '--' not in args:
+        executable = paths(server['command']).name.casefold()
+        if executable != ('codex.exe' if windows else 'codex') or args[0] != 'sandbox' or '--' not in args:
             return custom
         inner = args[args.index('--') + 1:]
-        if not inner or inner[0] != '/usr/bin/env':
-            return custom
-        end_env = 1
-        while end_env < len(inner) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', inner[end_env]):
-            end_env += 1
-        if inner[end_env:] != ['python3', '-B', str(workspace / 'tools/literature/server.py')]:
+        entry = str(workspace / 'tools/literature/server.py')
+        if windows:
+            from rsi.compose import WINDOWS_SERVER_START
+            if (len(inner) != 10 or inner[1:6] != ['-I', '-S', '-B', '-c', WINDOWS_SERVER_START]
+                    or not paths(inner[0]).is_absolute() or paths(inner[0]).name.lower() != 'python.exe'
+                    or inner[7:] != [str(workspace.parent / 'env/Scripts/python.exe'), '-B', entry]):
+                return custom
+        elif inner and inner[0] == '/usr/bin/env':
+            end_env = 1
+            while end_env < len(inner) and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', inner[end_env]):
+                end_env += 1
+            if inner[end_env:] != ['python3', '-B', entry]:
+                return custom
+        else:
             return custom
         store = VersionStore(layout.versions)
         before = store.resolve(call['version_before'])

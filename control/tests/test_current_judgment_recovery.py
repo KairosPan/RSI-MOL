@@ -1,7 +1,6 @@
 """Read new evidence on an empty ledger, then recover its evidence and judgment from the same sealed run."""
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import tempfile
@@ -12,6 +11,7 @@ from rsi import memory_ingest, memory_store
 from rsi.labrun import run_task, run_trial
 from rsi.mockmodel import run_js, say
 from rsi.paths import Layout
+from rsi.publication import publish_new
 from tests.support import Root, needs_codex
 from tests.test_judgment_lifecycle import RECALL, SEED, SOURCE
 
@@ -32,15 +32,13 @@ text(r.content[0].text);
 
 
 def stop_publishing_in(folder):
-    """Interrupt the final publication link after the complete private file has been written."""
-    link = os.link
-
-    def publish(source, target, **kwargs):
+    """Interrupt publication after the complete private file has been written."""
+    def publish(source, target):
         if Path(target).parent == folder:
             raise InterruptedError('injected publication interruption')
-        return link(source, target, **kwargs)
+        return publish_new(source, target)
 
-    return mock.patch('rsi.records.os.link', side_effect=publish)
+    return mock.patch('rsi.records.publish_new', side_effect=publish)
 
 
 def clone_inputs(layout, run, path):

@@ -24,7 +24,7 @@ the evidence shows an improvement is Meta's call, so a release record always say
 """
 import hashlib
 import json
-import os
+from rsi import fs as os
 import re
 import socket
 import tomllib
