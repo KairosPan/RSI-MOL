@@ -3,14 +3,47 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rsi.check import ALLOWED, BLOCKED, UNKNOWN, _result
 from rsi.paths import Layout
-from rsi import win_check
+from rsi import win_check, win_tool_checks
 
 
 class WindowsCheckTests(unittest.TestCase):
+    def test_exec_error_reaches_problem_summary_and_case_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = Layout(Path(directory))
+            layout.meta.mkdir()
+            call = layout.root / 'call'
+            call.mkdir()
+            (call / 'stderr.txt').write_text('unrelated startup warning\n', encoding='utf-8')
+            (call / 'events.jsonl').write_text(
+                'incomplete\n{"type":"turn.failed","error":{"message":"bad test configuration"}}\n'
+                '{"type":"item.completed","message":"ordinary tool output"}\n', encoding='utf-8')
+            problems = []
+            with patch.object(win_tool_checks, 'meta_config', return_value={}), \
+                    patch.object(win_tool_checks, 'ScriptedModel') as model, \
+                    patch.object(win_tool_checks, 'run_codex', return_value=SimpleNamespace(status='failed', exit_code=1)):
+                model.return_value.start.return_value = 'http://127.0.0.1:1'
+                model.return_value.requests = []
+                rows = win_tool_checks._exec_checks(layout, layout, 'meta', {}, 'codex', problems)
+            self.assertEqual(len(problems), 1)
+            self.assertIn('meta tool check', problems[0])
+            self.assertIn('bad test configuration', problems[0])
+            self.assertTrue(all(row['observed'] == UNKNOWN and 'bad test configuration' in row['detail']
+                                for row in rows))
+
+    def test_cli_startup_failure_without_events_retains_bounded_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / 'stderr.txt').write_text(
+                'old warning\n' + 'z' * 20000 + '\nError: invalid config\nCaused by: ' + 'q' * 2400, encoding='utf-8')
+            reason = win_tool_checks._failure_message(folder)
+            self.assertTrue(reason.startswith('Error: invalid config Caused by: '))
+            self.assertLessEqual(len(reason), 600)
+
     def test_expected_access_matches_role(self):
         self.assertEqual(win_check._expected('lab')['write_env'], ALLOWED)
         self.assertEqual(win_check._expected('trial')['read_env'], ALLOWED)

@@ -457,6 +457,9 @@ def lab_config(layout: Layout, envelope: dict, settings: Settings, *, trial: boo
     offline = windows_offline(envelope)
     config = {'approval_policy': envelope['approval_policy'] if interactive else 'never',
               'default_permissions': base + ('_net' if settings.network and not offline else '')}
+    if os.name == 'nt':
+        # The role's workspace is the project. Its enclosing RSI checkout has folders denied by MXC.
+        config['project_root_markers'] = []
     if settings.model is not None:
         config['model'] = settings.model
     if settings.effort is not None:

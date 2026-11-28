@@ -53,7 +53,37 @@ def _marker(path, token):
     return path.is_file() and path.read_text(encoding='utf-8-sig').strip() == token
 
 
-def _exec_checks(real, layout, role, envelope, codex):
+def _log_tail(path):
+    """Read only the last 16 KiB of the disposable local Codex check's log."""
+    try:
+        with path.open('rb') as stream:
+            end = stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, end - 16384))
+            return stream.read(16384).decode('utf-8', errors='replace')
+    except OSError:
+        return ''
+
+
+def _failure_message(folder):
+    for line in reversed(_log_tail(folder / 'events.jsonl').splitlines()):
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(event, dict) or event.get('type') not in ('error', 'turn.failed'):
+            continue
+        message = event.get('error') or event.get('message')
+        if isinstance(message, dict):
+            message = message.get('message')
+        if isinstance(message, str) and message.strip():
+            return ' '.join(message.split())[:600]
+    lines = _log_tail(folder / 'stderr.txt').splitlines()
+    # A Rust CLI error often begins with "Error:" followed by its cause on subsequent lines.
+    start = next((i for i in reversed(range(len(lines))) if lines[i].lstrip().lower().startswith('error:')), None)
+    return ' '.join(' '.join(lines[start:] if start is not None else lines[-4:]).split())[:600]
+
+
+def _exec_checks(real, layout, role, envelope, codex, problems):
     workspace = check._workspace(layout, role)
     token = 'rsi-' + secrets.token_hex(12)
     instructions = 'instructions-' + secrets.token_hex(12)
@@ -97,13 +127,19 @@ def _exec_checks(real, layout, role, envelope, codex):
     url = model.start()
     try:
         model.push(run_js(script), say('Windows role check complete'))
+        record_dir = layout.root / 'call'
         with check._scripted(url):
             result = run_codex(home=home, cwd=workspace, prompt='Run the local RSI acceptance checks.',
-                               config=config, record_dir=layout.root / 'call', timeout=check.EXEC_SECONDS,
+                               config=config, record_dir=record_dir, timeout=check.EXEC_SECONDS,
                                root=real.root)
         outputs = '\n'.join(model.tool_outputs())
         complete = result.status == 'finished' and check.DONE in outputs
         detail = f'Codex {result.status}, exit {result.exit_code}, {len(model.requests)} local model requests.'
+        if result.status != 'finished':
+            message = _failure_message(record_dir)
+            if message:
+                detail += ' ' + message
+            problems.append(f'{role} tool check: {detail}')
         rows = []
         for name, expected in _expectations(role, offline).items():
             if name in targets:
@@ -214,7 +250,7 @@ def _wrapper_checks(real, layout, role, envelope, codex):
     return rows
 
 
-def run_tool_checks(real_layout, scratch_dir, envelope, codex):
+def run_tool_checks(real_layout, scratch_dir, envelope, codex, problems):
     # The local scripted endpoint exercises the real CLI. Account-specific plugins do not participate.
     envelope = {**envelope, 'features': {**envelope.get('features', {}), 'apps': False, 'plugins': False},
                 'apps': {}, 'plugins': {}}
@@ -233,7 +269,7 @@ def run_tool_checks(real_layout, scratch_dir, envelope, codex):
                           'task_filter': None}
                 (workspace / 'memory/status.json').write_text(json.dumps(status), encoding='utf-8')
                 (workspace / '.tmp/memory-proposals').mkdir()
-            rows.extend(_exec_checks(real_layout, layout, role, envelope, codex))
+            rows.extend(_exec_checks(real_layout, layout, role, envelope, codex, problems))
             if role != 'meta':
                 rows.extend(_wrapper_checks(real_layout, layout, role, envelope, codex))
         except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError, check.Refused) as error:

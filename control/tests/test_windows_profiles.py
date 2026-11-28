@@ -51,6 +51,8 @@ class WindowsProfileTests(unittest.TestCase):
                                     trial=trial, codex=str(layout.root.parent / 'codex.exe'))
                 self.assertEqual(tomllib.loads(render_file(config)), config)
                 self.assertEqual(config['windows']['sandbox'], 'mxc')
+                self.assertEqual(config['project_root_markers'], [])
+                self.assertNotEqual(config.get('project_doc_max_bytes'), 0)
                 self.assertEqual(config['web_search'], 'disabled')
                 self.assertEqual(config['default_permissions'], role)
                 self.assertEqual(set(config['permissions']), {'lab', 'trial'})

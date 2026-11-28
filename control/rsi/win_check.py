@@ -206,7 +206,7 @@ def run_windows_cases(layout, envelope, problems, notes):
                     break
             else:
                 from rsi.win_tool_checks import run_tool_checks
-                results.extend(run_tool_checks(layout, scratch, envelope, codex))
+                results.extend(run_tool_checks(layout, scratch, envelope, codex, problems))
     except (OSError, ValueError, RuntimeError, Refused, subprocess.SubprocessError) as error:
         problems.append(f'Windows isolation check could not finish: {error}')
     finally:
