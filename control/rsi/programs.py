@@ -77,6 +77,15 @@ def temp_folders() -> list[str]:
     return out
 
 
+def windows_system_environment() -> dict[str, str]:
+    """Windows installation paths for commands and the native MXC launcher."""
+    system_root = os.environ['SYSTEMROOT']
+    drive = os.environ.get('SYSTEMDRIVE', '').strip() or Path(system_root).drive
+    if not drive:
+        raise Refused('MXC needs SystemDrive or a SystemRoot with an absolute drive path')
+    return {'SYSTEMROOT': system_root, 'SYSTEMDRIVE': drive}
+
+
 def _reachable(root: Path) -> list[str]:
     """What an agent or anyone may write: the RSI root and the shared temp folders."""
     return [str(root), *TEMP_FOLDERS, *temp_folders()]

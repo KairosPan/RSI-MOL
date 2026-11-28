@@ -5,7 +5,9 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from rsi.codexrun import codex_environment
 from rsi.compose import WINDOWS_SERVER_START, lab_config, meta_config, tool_server_problems
 from rsi.paths import Layout
 from rsi.settings import Settings
@@ -14,6 +16,26 @@ from rsi.tomlout import render_file
 
 @unittest.skipUnless(os.name == 'nt', 'native Windows profile and command-line conventions')
 class WindowsProfileTests(unittest.TestCase):
+    def test_mxc_host_environment_reaches_native_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = Layout(Path(directory).resolve())
+            system_root = os.environ['SYSTEMROOT']
+            expected = [os.environ.get('SYSTEMDRIVE') or Path(system_root).drive, os.environ['LOCALAPPDATA'], system_root]
+            settings = Settings(tool_servers={'memory': {'command': 'python3', 'args': [], 'network': False}})
+            for trial in (False, True):
+                config = lab_config(layout, {}, settings, trial=trial, codex=sys.executable)
+                host = codex_environment(layout.lab_home, secrets=False, root=layout.root)
+                for env in (host, {**host, **config['shell_environment_policy']['set']},
+                            config['mcp_servers']['memory']['env']):
+                    child = subprocess.run(
+                        [sys.executable, '-I', '-X', 'utf8', '-c', 'import os; '
+                         'print(*(os.getenv(k, "") for k in ("SystemDrive", "LOCALAPPDATA", "SystemRoot")), sep="\\n")'],
+                        env=env, capture_output=True, encoding='utf-8', check=True)
+                    self.assertEqual(child.stdout.splitlines(), expected)
+            with patch.dict(os.environ, SYSTEMDRIVE='', SYSTEMROOT=r'Q:\Windows'):
+                env = codex_environment(layout.meta_home, secrets=False, root=layout.root)
+                self.assertEqual(env['SYSTEMDRIVE'], 'Q:')
+
     def test_role_profiles_and_local_server_commands(self):
         with tempfile.TemporaryDirectory(prefix='RSI profile ') as directory:
             layout = Layout(Path(directory).resolve())

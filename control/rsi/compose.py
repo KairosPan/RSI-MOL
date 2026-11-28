@@ -209,7 +209,7 @@ def _shell(layout: Layout, workspace: Path) -> dict:
     if os.name == 'nt':
         temp = str(workspace / '.tmp')
         return {'inherit': 'core', 'set': {'TMP': temp, 'TEMP': temp, 'TMPDIR': temp, 'PATH': _path(layout),
-                                            'SystemRoot': os.environ['SystemRoot'],
+                                            **programs.windows_system_environment(),
                                             'NoDefaultCurrentDirectoryInExePath': '1', 'PYTHONNOUSERSITE': '1'}}
     return {'inherit': 'core', 'set': {'TMPDIR': str(workspace / '.tmp'), 'PATH': _path(layout),
                                        'TMPPREFIX': _tmpprefix(workspace)}}
@@ -268,7 +268,9 @@ def _local_server(layout: Layout, workspace: Path, profile: str, name: str, serv
     temp = str(workspace / '.tmp')
     env = {'CODEX_HOME': str(wrapper_home(layout)), 'TMPDIR': temp, 'PATH': WRAPPER_PATH}
     if os.name == 'nt':
-        env.update(TEMP=temp, TMP=temp, SystemRoot=os.environ['SystemRoot'], NoDefaultCurrentDirectoryInExePath='1')
+        env.update(programs.windows_system_environment(), TEMP=temp, TMP=temp, NoDefaultCurrentDirectoryInExePath='1')
+        if 'LOCALAPPDATA' in os.environ:
+            env['LOCALAPPDATA'] = os.environ['LOCALAPPDATA']
         # Set the agent's executable search path *after* entering the sandbox. A Windows cmd.exe wrapper would
         # reinterpret MCP arguments as shell text. The small Python trampoline keeps them as argument strings.
         in_sandbox = [sys._base_executable, '-I', '-S', '-B', '-c', WINDOWS_SERVER_START, _path(layout)]

@@ -14,7 +14,7 @@ from pathlib import Path
 from rsi.mockmodel import provider_config
 from rsi.paths import Refused, find_layout, safe_id
 from rsi.processes import kill_group as _kill_group, start_group, stop_group
-from rsi.programs import clean_path, native_codex
+from rsi.programs import clean_path, native_codex, windows_system_environment
 from rsi.tomlout import render_flags
 
 KILL_GRACE = 5  # seconds between SIGTERM and SIGKILL of a call's process group
@@ -27,7 +27,7 @@ PROXY_VARIABLES = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY', 'http_p
                    'no_proxy')
 KEPT_VARIABLES = ('PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'TERM', 'TMPDIR', *PROXY_VARIABLES)
 if os.name == 'nt':
-    KEPT_VARIABLES += ('SYSTEMROOT', 'WINDIR', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
+    KEPT_VARIABLES += ('WINDIR', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP',
                        'USERNAME', 'USERDOMAIN', 'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)',
                        'PROCESSOR_ARCHITECTURE', 'COMSPEC', 'PATHEXT')
 
@@ -63,6 +63,7 @@ def codex_environment(home: Path, *, secrets: bool = True, root: Path | None = N
     if 'PATH' in env:
         env['PATH'] = clean_path(_root(root), env['PATH'])
     if os.name == 'nt':
+        env.update(windows_system_environment())
         env['NoDefaultCurrentDirectoryInExePath'] = '1'
     env['CODEX_HOME'] = str(home)
     return env
